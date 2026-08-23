@@ -32,6 +32,7 @@ enum PendleEdge {
 #[derive(Clone)]
 pub struct PendleSwapEncoder {
     executor_address: Bytes,
+    native_token_address: Bytes,
 }
 
 impl PendleSwapEncoder {
@@ -104,7 +105,8 @@ impl SwapEncoder for PendleSwapEncoder {
                 "Pendle swaps are only supported on Ethereum".to_string(),
             ));
         }
-        Ok(Self { executor_address })
+        let native_token_address = chain.native_token().address;
+        Ok(Self { executor_address, native_token_address })
     }
 
     fn encode_swap(
@@ -114,6 +116,16 @@ impl SwapEncoder for PendleSwapEncoder {
     ) -> Result<Vec<u8>, EncodingError> {
         let token_in = &swap.token_in().address;
         let token_out = &swap.token_out().address;
+        // Some SYs mint from native ETH, which the indexer drops because it has no `decimals()`
+        // and so never classifies. Nothing downstream would catch a native leg that arrived
+        // anyway: the executor would hand `address(0)` to `SY.deposit` and revert.
+        for token in [token_in, token_out] {
+            if token == &self.native_token_address || token == &Bytes::zero(20) {
+                return Err(EncodingError::InvalidInput(
+                    "Pendle native ETH legs are not supported; wrap first".to_string(),
+                ));
+            }
+        }
         // The market edges are called on the market and the SY edges on the SY, and in both
         // cases that contract is the component itself.
         let target = Bytes::from_str(&swap.component().id).map_err(|_| {
@@ -293,5 +305,30 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, EncodingError::FatalError(_)));
+    }
+    #[test]
+    fn test_encode_rejects_native_eth() {
+        // SY-wstETH lists native ETH among its `tokensIn`; the integration quotes the wrapped
+        // legs only, so a native leg must be refused rather than encoded into a revert.
+        let native = Chain::Ethereum.native_token().address;
+        let swap = Swap::new(
+            sy_component(),
+            default_token(native.clone()),
+            default_token(Bytes::from_str(SY).unwrap()),
+            BigUint::ZERO,
+        );
+        let encoder = PendleSwapEncoder::new(Bytes::zero(20), Chain::Ethereum, None).unwrap();
+        let error = encoder
+            .encode_swap(
+                &swap,
+                &EncodingContext {
+                    router_address: Some(Bytes::zero(20)),
+                    group_token_in: native,
+                    group_token_out: Bytes::from_str(SY).unwrap(),
+                    origin: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, EncodingError::InvalidInput(_)));
     }
 }
