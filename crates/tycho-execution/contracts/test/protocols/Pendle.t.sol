@@ -29,11 +29,20 @@ contract PendleExecutorTest is Constants, TestUtils {
 
     PendleExecutorExposed pendleExposed;
 
-    // The per-leg gas the simulation quotes with (`pendle/state.rs`). Each edge is measured in
-    // its own test so it runs against a cold fork, which is the state a real swap meets.
-    uint256 constant PT_LEG_GAS = 320_000;
-    uint256 constant YT_LEG_GAS = 440_000;
-    uint256 constant SY_WRAP_GAS = 180_000;
+    // The per-edge gas the simulation quotes with (`pendle/state.rs`), one constant per
+    // direction: the exact-SY-in directions run the router's approximation loop on chain and
+    // cost ~30-40% more than their exact-PT counterparts. Each edge is measured in its own test
+    // so it runs against a cold fork, which is the state a real swap meets.
+    //
+    // The measurement covers the executor's `swap` call only. The router's `approve` is added
+    // separately by `PROTOCOLS_NEEDING_APPROVAL` in `gas_estimator.rs`, so it must not be here.
+    uint256 constant GAS_SY_FOR_PT = 330_000;
+    uint256 constant GAS_PT_FOR_SY = 235_000;
+    uint256 constant GAS_SY_FOR_YT = 425_000;
+    uint256 constant GAS_YT_FOR_SY = 335_000;
+    // The wstETH SY is `one_to_one`. An `index_rate` SY reads through to the wrapped protocol
+    // and is quoted at GAS_WRAP_INDEX_RATE = 180_000, which no test here measures.
+    uint256 constant GAS_WRAP_ONE_TO_ONE = 90_000;
 
     IERC20 sy = IERC20(PENDLE_WSTETH_SY);
     IERC20 pt = IERC20(PENDLE_WSTETH_PT);
@@ -157,7 +166,7 @@ contract PendleExecutorTest is Constants, TestUtils {
         );
 
         assertGt(pt.balanceOf(BOB), balanceBefore);
-        assertLe(gasUsed, PT_LEG_GAS);
+        assertLe(gasUsed, GAS_SY_FOR_PT);
     }
 
     function testSwapPtForSy() public {
@@ -172,7 +181,7 @@ contract PendleExecutorTest is Constants, TestUtils {
         );
 
         assertGt(sy.balanceOf(BOB), balanceBefore);
-        assertLe(gasUsed, PT_LEG_GAS);
+        assertLe(gasUsed, GAS_PT_FOR_SY);
     }
 
     function testSwapSyForYt() public {
@@ -187,7 +196,7 @@ contract PendleExecutorTest is Constants, TestUtils {
         );
 
         assertGt(yt.balanceOf(BOB), balanceBefore);
-        assertLe(gasUsed, YT_LEG_GAS);
+        assertLe(gasUsed, GAS_SY_FOR_YT);
     }
 
     function testSwapYtForSy() public {
@@ -202,7 +211,7 @@ contract PendleExecutorTest is Constants, TestUtils {
         );
 
         assertGt(sy.balanceOf(BOB), balanceBefore);
-        assertLe(gasUsed, YT_LEG_GAS);
+        assertLe(gasUsed, GAS_YT_FOR_SY);
     }
 
     function testSwapTokenForSy() public {
@@ -217,7 +226,7 @@ contract PendleExecutorTest is Constants, TestUtils {
         );
 
         assertGt(sy.balanceOf(BOB), balanceBefore);
-        assertLe(gasUsed, SY_WRAP_GAS);
+        assertLe(gasUsed, GAS_WRAP_ONE_TO_ONE);
     }
 
     function testSwapSyForToken() public {
@@ -232,7 +241,7 @@ contract PendleExecutorTest is Constants, TestUtils {
         );
 
         assertGt(wstETH.balanceOf(BOB), balanceBefore);
-        assertLe(gasUsed, SY_WRAP_GAS);
+        assertLe(gasUsed, GAS_WRAP_ONE_TO_ONE);
     }
 
     /// Funds the executor, runs one edge, and returns the gas the `swap` call itself consumed.
