@@ -43,6 +43,7 @@ pub enum Executor {
     AerodromeV1,
     LiquidityParty,
     LunarBase,
+    Pendle,
 }
 
 /// Return value of [Executor::get_transfer_data]
@@ -63,7 +64,7 @@ pub struct CallbackTransferData {
 
 impl Executor {
     /// Array containing all [Executor]s.
-    pub const VARIANTS: [Executor; 11] = [
+    pub const VARIANTS: [Executor; 12] = [
         Executor::Curve,
         Executor::ERC4626,
         Executor::FluidV1,
@@ -75,6 +76,7 @@ impl Executor {
         Executor::AerodromeV1,
         Executor::LiquidityParty,
         Executor::LunarBase,
+        Executor::Pendle,
     ];
 
     /// <https://github.com/propeller-heads/tycho-indexer/blob/d0a5db4ab55baf9ff87fb54cdfb59e015866b409/crates/tycho-execution/contracts/interfaces/IExecutor.sol#L41>
@@ -332,6 +334,45 @@ impl Executor {
                         ParamKey::ProtocolData { swap_index, start: 40, end: 60 },
                         Address::POSSIBLY_ERC20_AND_NATIVE,
                     )?,
+                    output_to_router: false,
+                })
+            }
+            // https://github.com/propeller-heads/tycho/blob/main/crates/tycho-execution/contracts/src/executors/PendleExecutor.sol
+            Self::Pendle => {
+                // The edge byte selects one of six edges; the only distinction that changes
+                // the transfer semantics is whether it is one of the four market edges.
+                let is_market_edge = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 0, end: 1 },
+                    [true, false],
+                )?;
+                let token_in = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 1, end: 21 },
+                    Address::POSSIBLY_ERC20_AND_NATIVE,
+                )?;
+                let token_out = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 21, end: 41 },
+                    Address::POSSIBLY_ERC20_AND_NATIVE,
+                )?;
+                let target = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 41, end: 61 },
+                    // trying more variants might find some very obscure bugs
+                    // in the future but slows down simulation a lot
+                    // and currently is ignored anyway
+                    Address::SENDER_CONTROLLED,
+                )?;
+
+                Ok(TransferData {
+                    transfer_type: TransferType::ProtocolWillDebit,
+                    // The market edges are pulled by Pendle Router V4, whose address is
+                    // immutable in the executor and so is not sender controlled. Only the SY
+                    // edges approve an address the calldata chose.
+                    receiver: if is_market_edge {
+                        Address::Named("pendle-router-v4")
+                    } else {
+                        target
+                    },
+                    token_in,
+                    token_out,
                     output_to_router: false,
                 })
             }
@@ -623,6 +664,37 @@ impl Executor {
                 // the actual swap logic doesn't matter
                 Ok(())
             }
+            // https://github.com/propeller-heads/tycho/blob/main/crates/tycho-execution/contracts/src/executors/PendleExecutor.sol
+            Self::Pendle => {
+                // The edge byte selects one of six edges; the only distinction that changes
+                // the transfer semantics is whether it is one of the four market edges.
+                let is_market_edge = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 0, end: 1 },
+                    [true, false],
+                )?;
+                if is_market_edge {
+                    return Err(Error::Ignore {
+                        reason: "pendle market edge calls the immutable Pendle Router V4, which the sender does not control. would require simulating the real router".into(),
+                    });
+                }
+
+                let sy = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 41, end: 61 },
+                    // trying more variants might find some very obscure bugs
+                    // in the future but slows down simulation a lot
+                    // and currently is ignored anyway
+                    Address::SENDER_CONTROLLED,
+                )?;
+                if sy.is_sender_controlled() {
+                    // if the sender controls the SY,
+                    // the actual mint or redeem logic doesn't matter
+                    Ok(())
+                } else {
+                    Err(Error::Ignore {
+                        reason: "pendle sy not sender controlled. not low hanging fruit. would require simulating real pool".into(),
+                    })
+                }
+            }
         }
     }
 
@@ -635,6 +707,7 @@ impl Executor {
         match self {
             Self::Curve => unimplemented!(),
             Self::ERC4626 => unimplemented!(),
+            Self::Pendle => unimplemented!(),
             // https://github.com/propeller-heads/tycho-indexer/blob/d0a5db4ab55baf9ff87fb54cdfb59e015866b409/crates/tycho-execution/contracts/src/executors/FluidV1Executor.sol#L159
             Self::FluidV1 => Ok(CallbackTransferData {
                 transfer_type: TransferType::Transfer,
@@ -665,6 +738,7 @@ impl Executor {
         match self {
             Self::Curve => unimplemented!("Curve doesn't use callbacks"),
             Self::ERC4626 => unimplemented!("ERC4626 doesn't use callbacks"),
+            Self::Pendle => unimplemented!("Pendle doesn't use callbacks"),
             // https://github.com/propeller-heads/tycho-indexer/blob/d0a5db4ab55baf9ff87fb54cdfb59e015866b409/crates/tycho-execution/contracts/src/executors/FluidV1Executor.sol#L117
             Self::FluidV1 => {
                 let dex: Address = state.tload("fluid_v1_current_dex")?;
@@ -703,6 +777,8 @@ impl Executor {
             Self::Curve => Address::Router,
             // https://github.com/propeller-heads/tycho-indexer/blob/d0a5db4ab55baf9ff87fb54cdfb59e015866b409/crates/tycho-execution/contracts/src/executors/ERC4626Executor.sol#L21
             Self::ERC4626 => Address::Router,
+            // https://github.com/propeller-heads/tycho/blob/main/crates/tycho-execution/contracts/src/executors/PendleExecutor.sol
+            Self::Pendle => Address::Router,
             // https://github.com/propeller-heads/tycho-indexer/blob/d0a5db4ab55baf9ff87fb54cdfb59e015866b409/crates/tycho-execution/contracts/src/executors/FluidV1Executor.sol#L50
             Self::FluidV1 => Address::Router,
             // https://github.com/propeller-heads/tycho-indexer/blob/d0a5db4ab55baf9ff87fb54cdfb59e015866b409/crates/tycho-execution/contracts/src/executors/MaverickV2Executor.sol#L18
