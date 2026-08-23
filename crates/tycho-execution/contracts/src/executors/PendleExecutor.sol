@@ -59,6 +59,7 @@ contract PendleExecutor is IExecutor {
             // Router V4 delegate to its on-chain approximation, which derives its own bounds
             // from live market state. Bounds computed at encoding time would be stale by the
             // time the executor runs against an amountIn that drifted.
+            // slither-disable-next-line unused-return
             IPendleRouterV4(router)
                 .swapExactSyForPt(
                     receiver,
@@ -69,11 +70,13 @@ contract PendleExecutor is IExecutor {
                     _emptyLimitOrderData()
                 );
         } else if (edge == PendleEdge.PtForSy) {
+            // slither-disable-next-line unused-return
             IPendleRouterV4(router)
                 .swapExactPtForSy(
                     receiver, target, amountIn, 0, _emptyLimitOrderData()
                 );
         } else if (edge == PendleEdge.SyForYt) {
+            // slither-disable-next-line unused-return
             IPendleRouterV4(router)
                 .swapExactSyForYt(
                     receiver,
@@ -84,6 +87,7 @@ contract PendleExecutor is IExecutor {
                     _emptyLimitOrderData()
                 );
         } else if (edge == PendleEdge.YtForSy) {
+            // slither-disable-next-line unused-return
             IPendleRouterV4(router)
                 .swapExactYtForSy(
                     receiver, target, amountIn, 0, _emptyLimitOrderData()
