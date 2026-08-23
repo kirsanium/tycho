@@ -89,6 +89,7 @@ EXECUTOR_FIXTURES=(
     "LiquidityParty|ethereum|vm:liquidityparty"
     "LunarBase|base|lunarbase"
     "RingSwapV2|ethereum|ring_swap_v2"
+    "Pendle|ethereum|pendle"
 )
 
 if [[ -z "${RPC_URL:-}" ]]; then

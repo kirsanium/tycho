@@ -14,6 +14,7 @@ const FEE_CALCULATOR_BYTECODE_JSON: &str = include_str!("../fixtures/FeeCalculat
 // Include all executor bytecode files at compile time
 const UNISWAP_V2_BYTECODE_JSON: &str = include_str!("../fixtures/UniswapV2.runtime.json");
 const RING_SWAP_V2_BYTECODE_JSON: &str = include_str!("../fixtures/RingSwapV2.runtime.json");
+const PENDLE_BYTECODE_JSON: &str = include_str!("../fixtures/Pendle.runtime.json");
 const UNISWAP_V3_BYTECODE_JSON: &str = include_str!("../fixtures/UniswapV3.runtime.json");
 const UNISWAP_V4_BYTECODE_JSON: &str = include_str!("../fixtures/UniswapV4.runtime.json");
 const UNISWAP_V4_ANGSTROM_BYTECODE_JSON: &str =
@@ -49,6 +50,7 @@ static EXECUTOR_MAPPING: LazyLock<HashMap<&'static str, &'static str>> = LazyLoc
     map.insert("ekubo_v3", EKUBO_V3_BYTECODE_JSON);
     map.insert("fluid_v1", FLUIDV1_BYTECODE_JSON);
     map.insert("vm:liquidityparty", LIQUIDITYPARTY_BYTECODE_JSON);
+    map.insert("pendle", PENDLE_BYTECODE_JSON);
     map
 });
 
