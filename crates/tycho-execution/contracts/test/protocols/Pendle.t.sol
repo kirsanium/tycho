@@ -29,6 +29,12 @@ contract PendleExecutorTest is Constants, TestUtils {
 
     PendleExecutorExposed pendleExposed;
 
+    // The per-leg gas the simulation quotes with (`pendle/state.rs`). Each edge is measured in
+    // its own test so it runs against a cold fork, which is the state a real swap meets.
+    uint256 constant PT_LEG_GAS = 320_000;
+    uint256 constant YT_LEG_GAS = 440_000;
+    uint256 constant SY_WRAP_GAS = 180_000;
+
     IERC20 sy = IERC20(PENDLE_WSTETH_SY);
     IERC20 pt = IERC20(PENDLE_WSTETH_PT);
     IERC20 yt = IERC20(PENDLE_WSTETH_YT);
@@ -140,118 +146,111 @@ contract PendleExecutorTest is Constants, TestUtils {
     }
 
     function testSwapSyForPt() public {
-        uint256 amountIn = 1e18;
-        _fund(PENDLE_WSTETH_SY, amountIn, PENDLE_ROUTER_V4);
-
         uint256 balanceBefore = pt.balanceOf(BOB);
-        pendleExposed.swap(
-            amountIn,
-            _data(
-                PendleEdge.SyForPt,
-                PENDLE_WSTETH_SY,
-                PENDLE_WSTETH_PT,
-                PENDLE_WSTETH_MARKET
-            ),
-            BOB
+
+        uint256 gasUsed = _measure(
+            PendleEdge.SyForPt,
+            PENDLE_WSTETH_SY,
+            PENDLE_WSTETH_PT,
+            PENDLE_WSTETH_MARKET,
+            PENDLE_ROUTER_V4
         );
 
         assertGt(pt.balanceOf(BOB), balanceBefore);
+        assertLe(gasUsed, PT_LEG_GAS);
     }
 
     function testSwapPtForSy() public {
-        uint256 amountIn = 1e18;
-        _fund(PENDLE_WSTETH_PT, amountIn, PENDLE_ROUTER_V4);
-
         uint256 balanceBefore = sy.balanceOf(BOB);
-        pendleExposed.swap(
-            amountIn,
-            _data(
-                PendleEdge.PtForSy,
-                PENDLE_WSTETH_PT,
-                PENDLE_WSTETH_SY,
-                PENDLE_WSTETH_MARKET
-            ),
-            BOB
+
+        uint256 gasUsed = _measure(
+            PendleEdge.PtForSy,
+            PENDLE_WSTETH_PT,
+            PENDLE_WSTETH_SY,
+            PENDLE_WSTETH_MARKET,
+            PENDLE_ROUTER_V4
         );
 
         assertGt(sy.balanceOf(BOB), balanceBefore);
+        assertLe(gasUsed, PT_LEG_GAS);
     }
 
     function testSwapSyForYt() public {
-        uint256 amountIn = 1e18;
-        _fund(PENDLE_WSTETH_SY, amountIn, PENDLE_ROUTER_V4);
-
         uint256 balanceBefore = yt.balanceOf(BOB);
-        pendleExposed.swap(
-            amountIn,
-            _data(
-                PendleEdge.SyForYt,
-                PENDLE_WSTETH_SY,
-                PENDLE_WSTETH_YT,
-                PENDLE_WSTETH_MARKET
-            ),
-            BOB
+
+        uint256 gasUsed = _measure(
+            PendleEdge.SyForYt,
+            PENDLE_WSTETH_SY,
+            PENDLE_WSTETH_YT,
+            PENDLE_WSTETH_MARKET,
+            PENDLE_ROUTER_V4
         );
 
         assertGt(yt.balanceOf(BOB), balanceBefore);
+        assertLe(gasUsed, YT_LEG_GAS);
     }
 
     function testSwapYtForSy() public {
-        uint256 amountIn = 1e18;
-        _fund(PENDLE_WSTETH_YT, amountIn, PENDLE_ROUTER_V4);
-
         uint256 balanceBefore = sy.balanceOf(BOB);
-        pendleExposed.swap(
-            amountIn,
-            _data(
-                PendleEdge.YtForSy,
-                PENDLE_WSTETH_YT,
-                PENDLE_WSTETH_SY,
-                PENDLE_WSTETH_MARKET
-            ),
-            BOB
+
+        uint256 gasUsed = _measure(
+            PendleEdge.YtForSy,
+            PENDLE_WSTETH_YT,
+            PENDLE_WSTETH_SY,
+            PENDLE_WSTETH_MARKET,
+            PENDLE_ROUTER_V4
         );
 
         assertGt(sy.balanceOf(BOB), balanceBefore);
+        assertLe(gasUsed, YT_LEG_GAS);
     }
 
     function testSwapTokenForSy() public {
-        uint256 amountIn = 1e18;
-        _fund(WSTETH_ADDR, amountIn, PENDLE_WSTETH_SY);
-
         uint256 balanceBefore = sy.balanceOf(BOB);
-        pendleExposed.swap(
-            amountIn,
-            _data(
-                PendleEdge.TokenForSy,
-                WSTETH_ADDR,
-                PENDLE_WSTETH_SY,
-                PENDLE_WSTETH_SY
-            ),
-            BOB
+
+        uint256 gasUsed = _measure(
+            PendleEdge.TokenForSy,
+            WSTETH_ADDR,
+            PENDLE_WSTETH_SY,
+            PENDLE_WSTETH_SY,
+            PENDLE_WSTETH_SY
         );
 
         assertGt(sy.balanceOf(BOB), balanceBefore);
+        assertLe(gasUsed, SY_WRAP_GAS);
     }
 
     function testSwapSyForToken() public {
-        uint256 amountIn = 1e18;
-        // `redeem` burns the shares the SY holds for the caller, so no allowance is needed.
-        deal(PENDLE_WSTETH_SY, address(pendleExposed), amountIn);
-
         uint256 balanceBefore = wstETH.balanceOf(BOB);
-        pendleExposed.swap(
-            amountIn,
-            _data(
-                PendleEdge.SyForToken,
-                PENDLE_WSTETH_SY,
-                WSTETH_ADDR,
-                PENDLE_WSTETH_SY
-            ),
-            BOB
+
+        uint256 gasUsed = _measure(
+            PendleEdge.SyForToken,
+            PENDLE_WSTETH_SY,
+            WSTETH_ADDR,
+            PENDLE_WSTETH_SY,
+            PENDLE_WSTETH_SY
         );
 
         assertGt(wstETH.balanceOf(BOB), balanceBefore);
+        assertLe(gasUsed, SY_WRAP_GAS);
+    }
+
+    /// Funds the executor, runs one edge, and returns the gas the `swap` call itself consumed.
+    function _measure(
+        PendleEdge edge,
+        address tokenIn,
+        address tokenOut,
+        address target,
+        address spender
+    ) internal returns (uint256 gasUsed) {
+        uint256 amountIn = 1e18;
+        _fund(tokenIn, amountIn, spender);
+        bytes memory data = _data(edge, tokenIn, tokenOut, target);
+
+        uint256 before = gasleft();
+        pendleExposed.swap(amountIn, data, BOB);
+        gasUsed = before - gasleft();
+        console.log("pendle edge gas", uint8(edge), gasUsed);
     }
 
     function testSwapTokenForSyRejectsMismatchedTarget() public {
