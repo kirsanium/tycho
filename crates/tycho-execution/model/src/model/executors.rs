@@ -43,6 +43,7 @@ pub enum Executor {
     AerodromeV1,
     LiquidityParty,
     LunarBase,
+    Pendle,
     PropAMM,
 }
 
@@ -64,7 +65,7 @@ pub struct CallbackTransferData {
 
 impl Executor {
     /// Array containing all [Executor]s.
-    pub const VARIANTS: [Executor; 12] = [
+    pub const VARIANTS: [Executor; 13] = [
         Executor::Curve,
         Executor::ERC4626,
         Executor::FluidV1,
@@ -76,6 +77,7 @@ impl Executor {
         Executor::AerodromeV1,
         Executor::LiquidityParty,
         Executor::LunarBase,
+        Executor::Pendle,
         Executor::PropAMM,
     ];
 
@@ -357,6 +359,45 @@ impl Executor {
                 )?,
                 output_to_router: false,
             }),
+            // https://github.com/propeller-heads/tycho/blob/main/crates/tycho-execution/contracts/src/executors/PendleExecutor.sol
+            Self::Pendle => {
+                // The edge byte selects one of six edges; the only distinction that changes
+                // the transfer semantics is whether it is one of the four market edges.
+                let is_market_edge = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 0, end: 1 },
+                    [true, false],
+                )?;
+                let token_in = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 1, end: 21 },
+                    Address::POSSIBLY_ERC20_AND_NATIVE,
+                )?;
+                let token_out = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 21, end: 41 },
+                    Address::POSSIBLY_ERC20_AND_NATIVE,
+                )?;
+                let target = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 41, end: 61 },
+                    // trying more variants might find some very obscure bugs
+                    // in the future but slows down simulation a lot
+                    // and currently is ignored anyway
+                    Address::SENDER_CONTROLLED,
+                )?;
+
+                Ok(TransferData {
+                    transfer_type: TransferType::ProtocolWillDebit,
+                    // The market edges are pulled by Pendle Router V4, whose address is
+                    // immutable in the executor and so is not sender controlled. Only the SY
+                    // edges approve an address the calldata chose.
+                    receiver: if is_market_edge {
+                        Address::Named("pendle-router-v4")
+                    } else {
+                        target
+                    },
+                    token_in,
+                    token_out,
+                    output_to_router: false,
+                })
+            }
         }
     }
 
@@ -664,6 +705,37 @@ impl Executor {
                     })
                 }
             }
+            // https://github.com/propeller-heads/tycho/blob/main/crates/tycho-execution/contracts/src/executors/PendleExecutor.sol
+            Self::Pendle => {
+                // The edge byte selects one of six edges; the only distinction that changes
+                // the transfer semantics is whether it is one of the four market edges.
+                let is_market_edge = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 0, end: 1 },
+                    [true, false],
+                )?;
+                if is_market_edge {
+                    return Err(Error::Ignore {
+                        reason: "pendle market edge calls the immutable Pendle Router V4, which the sender does not control. would require simulating the real router".into(),
+                    });
+                }
+
+                let sy = params.request(
+                    ParamKey::ProtocolData { swap_index, start: 41, end: 61 },
+                    // trying more variants might find some very obscure bugs
+                    // in the future but slows down simulation a lot
+                    // and currently is ignored anyway
+                    Address::SENDER_CONTROLLED,
+                )?;
+                if sy.is_sender_controlled() {
+                    // if the sender controls the SY,
+                    // the actual mint or redeem logic doesn't matter
+                    Ok(())
+                } else {
+                    Err(Error::Ignore {
+                        reason: "pendle sy not sender controlled. not low hanging fruit. would require simulating real pool".into(),
+                    })
+                }
+            }
         }
     }
 
@@ -700,6 +772,7 @@ impl Executor {
             Self::LiquidityParty => unimplemented!(),
             Self::LunarBase => unimplemented!(),
             Self::PropAMM => unimplemented!(),
+            Self::Pendle => unimplemented!(),
         }
     }
 
@@ -727,6 +800,7 @@ impl Executor {
             Self::AerodromeV1 => unimplemented!("AerodromeV1 doesn't use callbacks"),
             Self::LiquidityParty => unimplemented!("LiquidityParty doesn't use callbacks"),
             Self::LunarBase => unimplemented!("LunarBase doesn't use callbacks"),
+            Self::Pendle => unimplemented!("Pendle doesn't use callbacks"),
             Self::PropAMM => {
                 unimplemented!("PropAMM doesn't use callbacks")
             }
@@ -790,6 +864,7 @@ impl Executor {
             )?,
             // https://github.com/propeller-heads/tycho-indexer/blob/ae386ce3a9decbf8d73dab474e80a3d3785f02ef/crates/tycho-execution/contracts/src/executors/LunarBaseExecutor.sol#L37
             Self::LunarBase => Address::Router,
+            Self::Pendle => Address::Router,
             // https://github.com/propeller-heads/tycho/blob/main/crates/tycho-execution/contracts/src/executors/PropAMMExecutor.sol
             Self::PropAMM => params.request(
                 ParamKey::ProtocolData { swap_index, start: 0, end: 20 },
