@@ -51,6 +51,8 @@ pub const PROTOCOLS_NEEDING_APPROVAL: &[&str] = &[
     "rfq:liquorice",
     "rfq:metric",
     "erc4626",
+    // Router V4 and the SY both pull the input via `transferFrom`, so the router approves before
+    // swapping on every Pendle edge.
     "pendle",
     "ring_swap_v2",
 ];
