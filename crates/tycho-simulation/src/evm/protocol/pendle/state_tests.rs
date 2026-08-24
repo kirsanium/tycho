@@ -675,12 +675,22 @@ fn redeeming_is_bounded_by_holdings_and_depositing_is_not() {
         .unwrap();
     assert_eq!(wsteth_out, BigUint::from(546_768_952_998_816_380u64));
 
-    // Depositing is unbounded, and reported as the soft limit rather than a U256 sentinel that
-    // would overflow the first multiplication a router did with it.
+    // Depositing has no reserve behind it and no cap to read, so the bound is the stated
+    // convention: a million whole tokens, scaled by this token's own 18 decimals.
     let (deposit_in, _) = wsteth_sy()
         .get_limits(wsteth, sy)
         .unwrap();
-    assert_eq!(deposit_in, BigUint::from(u128::MAX));
+    assert_eq!(deposit_in, BigUint::from(1_000_000u64) * BigUint::from(10u64).pow(18));
+
+    // Whole tokens, so the bound follows the entry token's own decimals rather than the SY's. A
+    // 6-decimal token is a million units at 1e12, not at 1e24.
+    let (six_decimal_in, _) = six_decimal_asset_sy()
+        .get_limits(
+            Bytes::from_str(SIX_DECIMAL_TOKEN).unwrap(),
+            Bytes::from_str(SIX_DECIMAL_SY).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(six_decimal_in, BigUint::from(1_000_000u64) * BigUint::from(10u64).pow(6));
 }
 
 /// Both bounds on a wrap edge are only meaningful if the input they report actually produces the
