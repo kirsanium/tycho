@@ -22,6 +22,14 @@ tests:
   # 16032059 is that factory's deployment block; the first four markets are created between
   # 16032202 and 16032230. Pendle's first mainnet swap is at 16067529, and by 16072689 four
   # separate markets have traded, which is what makes the upper bound worth reaching.
+  #
+  # Execution is skipped for every component here. A swap is executed against a fork at the block
+  # it was quoted at, and `PendleExecutor` delegates to Pendle's router `0x88888888…`, which has no
+  # code until block 19759272 — a year and a half after this range. The range cannot be moved to
+  # reach it: this factory emits nothing at all after that block, so no window contains both one of
+  # its markets being created and a router to trade it through. The V6 range below carries the
+  # execution coverage for all six edges; this range is here for the original factory's indexing
+  # and simulation, both of which still run.
   - name: test_market_creation_and_swaps
     start_block: 16032059
     stop_block: 16072700
@@ -47,7 +55,6 @@ tests:
           asset_decimals: "0x12"
         creation_tx: "0x6edb7e8dd09fa0e9ccd4b7195d514d51e03d91e9c05147fac6e458cc6b63bf01"
         skip_simulation: false
-        # No executor yet: the swap encoder and PendleExecutor are PR 3.
         skip_execution: true
 
       # The SY of the market above. One token in and out, both one_to_one — the simplest wrap
@@ -145,8 +152,8 @@ tests:
           sy_decimals: "0x12"
           asset_decimals: "0x12"
         creation_tx: "0xdd5bb2843b595874435f1355050d543c35da13b4fbd9c4aeccc74256edba725e"
-        skip_simulation: true
-        skip_execution: true
+        skip_simulation: false
+        skip_execution: false
 
       # SY-sUSDe: it takes its accounting asset USDe at the index rate and sUSDe itself 1:1, but
       # redeems only to sUSDe — an SY whose entry and exit sets differ, which neither 2022 fixture
@@ -164,8 +171,8 @@ tests:
           token_in_class_0x9d39a5de30e57443bff2a8307a4256c8797a3497: "0x6f6e655f746f5f6f6e65"
           token_out_class_0x9d39a5de30e57443bff2a8307a4256c8797a3497: "0x6f6e655f746f5f6f6e65"
         creation_tx: "0xdd5bb2843b595874435f1355050d543c35da13b4fbd9c4aeccc74256edba725e"
-        skip_simulation: true
-        skip_execution: true
+        skip_simulation: false
+        skip_execution: false
 
       # A second V6 market that also trades in range, on a different SY.
       - id: "0x1f34887b270bfaf56cf7973572654874c8ed740e"
@@ -185,8 +192,8 @@ tests:
           sy_decimals: "0x12"
           asset_decimals: "0x12"
         creation_tx: "0x35c6a24f0c9214a3809d03b539eec5ad314617c5c812c1a53750bb13e1a45131"
-        skip_simulation: true
-        skip_execution: true
+        skip_simulation: false
+        skip_execution: false
 
       # This SY is the decimal-gap case the 2022 fixtures cannot produce: it quotes USDC, which
       # has 6 decimals, against an 18-decimal SY and an 18-decimal accounting asset. A conversion
@@ -208,8 +215,8 @@ tests:
           token_out_class_0xdbdc1ef57537e34680b898e1febd3d68c7389bcb: "0x6f6e655f746f5f6f6e65"
           token_out_class_0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48: "0x696e6465785f72617465"
         creation_tx: "0x35c6a24f0c9214a3809d03b539eec5ad314617c5c812c1a53750bb13e1a45131"
-        skip_simulation: true
-        skip_execution: true
+        skip_simulation: false
+        skip_execution: false
 
   # The brief's reference instance: the wstETH market expiring 30 Dec 2027, created by the
   # original factory at block 17363218 and still live today. Its first swaps land at 17379452 and
@@ -224,6 +231,11 @@ tests:
   # `lnFeeRateRoot = 499875041000000` has to be read back from `getMarketConfig`. That value lands
   # as state rather than a static attribute, so this fixture cannot assert it; `scripts/
   # verify_event_replay.py` covers the state side for this same market.
+  #
+  # Execution is skipped here for the reason the 2022 range gives: this market is created at
+  # 17363218 and the router the executor calls has no code until 19759272. The market itself is
+  # still live — it expires in December 2027 — but a range reaching the router would have to start
+  # after the creation this test is built on, and then nothing would create the component at all.
   - name: test_reference_market_creation_and_swaps
     start_block: 17363200
     stop_block: 17387000
@@ -245,7 +257,7 @@ tests:
           sy_decimals: "0x12"
           asset_decimals: "0x12"
         creation_tx: "0xf5022404495cff175a5b4c45864e372f0fa2344cc8aa14298987e4ccdf6e5daa"
-        skip_simulation: true
+        skip_simulation: false
         skip_execution: true
 
       # The same SY the 2022 range already covers, profiled 1.3M blocks later: stETH is still the
@@ -267,5 +279,5 @@ tests:
           token_out_class_0xae7ab96520de3a18e5e111b5eaab095312d7fe84: "0x696e6465785f72617465"
           token_out_class_0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0: "0x6f6e655f746f5f6f6e65"
         creation_tx: "0xf5022404495cff175a5b4c45864e372f0fa2344cc8aa14298987e4ccdf6e5daa"
-        skip_simulation: true
+        skip_simulation: false
         skip_execution: true
