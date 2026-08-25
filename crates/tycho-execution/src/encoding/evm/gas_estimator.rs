@@ -70,9 +70,6 @@ pub const PROTOCOLS_NEEDING_APPROVAL: &[&str] = &[
     "erc4626",
     "ring_swap_v2",
     "sky",
-    // Router V4 and the SY both pull the input via `transferFrom`, so the router approves before
-    // swapping on every Pendle edge.
-    "pendle",
 ];
 
 /// Whether the router must approve the protocol before swapping (see
