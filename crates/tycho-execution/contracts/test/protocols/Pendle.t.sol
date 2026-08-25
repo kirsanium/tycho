@@ -277,6 +277,28 @@ contract PendleExecutorTest is Constants, TestUtils {
             BOB
         );
     }
+
+    /// The exit direction carries the same check, against `tokenIn` rather than `tokenOut`.
+    function testSwapSyForTokenRejectsMismatchedTarget() public {
+        vm.expectRevert(PendleExecutor__InvalidTarget.selector);
+        pendleExposed.swap(
+            1e18,
+            _data(
+                PendleEdge.SyForToken,
+                PENDLE_WSTETH_SY,
+                WSTETH_ADDR,
+                PENDLE_WSTETH_MARKET
+            ),
+            BOB
+        );
+    }
+
+    /// The router is immutable, so a zero address would leave every market edge calling nothing
+    /// with no way to correct it.
+    function testConstructorRejectsZeroRouter() public {
+        vm.expectRevert(PendleExecutor__InvalidRouter.selector);
+        new PendleExecutor(address(0));
+    }
 }
 
 /// Runs the calldata the Rust encoder produced through the deployed router, for every edge.
