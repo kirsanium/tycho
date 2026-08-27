@@ -43,6 +43,7 @@ tests:
       # to trade on mainnet (block 16069013) and trades 40 more times before the range ends, so
       # the reserve replay, the implied rate and the balances are all exercised, not just creation.
       - id: "0x7b246b8dbc2a640bf2d8221890cee8327fc23917"
+        protocol_type_name: "pendle_market"
         tokens:
           - "0xd393d1ddd6b8811a86d925f5e14014282581bc04" # SY-aUSDC
           - "0x5fe30ac5cb1abb0e44cdffb2916c254aeb368650" # PT
@@ -66,6 +67,7 @@ tests:
       # edge, and the case where a silent 1:1 assumption would be indistinguishable from a correct
       # classification, so it pins the classifier's output shape.
       - id: "0xd393d1ddd6b8811a86d925f5e14014282581bc04"
+        protocol_type_name: "pendle_sy"
         tokens:
           - "0xd393d1ddd6b8811a86d925f5e14014282581bc04" # SY
           - "0x3175df0976dfa876431c2e9ee6bc45b65d3473cc" # the accounting asset
@@ -80,6 +82,7 @@ tests:
       # A second market, on a different SY, that also trades inside the range (16072670 onward).
       # Two markets with real swaps is what the brief asks the range to contain.
       - id: "0x54e28e62ea9e8d755dc6e74674eabe2abfdb004e"
+        protocol_type_name: "pendle_market"
         tokens:
           - "0xcbc72d92b2dc8187414f6734718563898740c0bc" # SY-wstETH
           - "0xcf44e8402a99db82d2acccc4d9354657be2121db" # PT
@@ -101,6 +104,7 @@ tests:
 
       # SY-wstETH: three quotable entry tokens across both classes.
       - id: "0xcbc72d92b2dc8187414f6734718563898740c0bc"
+        protocol_type_name: "pendle_sy"
         tokens:
           - "0xcbc72d92b2dc8187414f6734718563898740c0bc" # SY
           - "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" # WETH
@@ -133,6 +137,7 @@ tests:
       # field the original factory's event does not carry at all, so this is the only fixture that
       # pins the V3+ event layout.
       - id: "0x47ad2cd1dd15739a7a035b9d3b7828d916fef77e"
+        protocol_type_name: "pendle_market"
         tokens:
           - "0xbf98480425a29197e5d99d003017f63a1e595d02" # SY-sUSDe
           - "0xb195b618ea52b77cb2a58846f452f59f8dfa9390" # PT
@@ -156,6 +161,7 @@ tests:
       # redeems only to sUSDe — an SY whose entry and exit sets differ, which neither 2022 fixture
       # exercises.
       - id: "0xbf98480425a29197e5d99d003017f63a1e595d02"
+        protocol_type_name: "pendle_sy"
         tokens:
           - "0xbf98480425a29197e5d99d003017f63a1e595d02" # SY
           - "0x4c9edd5852cd905f086c759e8383e09bff1e68b3" # USDe, the accounting asset
@@ -170,6 +176,7 @@ tests:
 
       # A second V6 market that also trades in range, on a different SY.
       - id: "0x1f34887b270bfaf56cf7973572654874c8ed740e"
+        protocol_type_name: "pendle_market"
         tokens:
           - "0x9f30507c264cc6eb5be35b18ff9ad7b4539aa920" # SY
           - "0xe3cdf5b8d7aedfc9f768dbdcc334146fae989188" # PT
@@ -193,6 +200,7 @@ tests:
       # has 6 decimals, against an 18-decimal SY and an 18-decimal accounting asset. A conversion
       # that dropped the rescale would still look right on every 18/18 component above.
       - id: "0x9f30507c264cc6eb5be35b18ff9ad7b4539aa920"
+        protocol_type_name: "pendle_sy"
         tokens:
           - "0x9f30507c264cc6eb5be35b18ff9ad7b4539aa920" # SY
           - "0x48f9e38f3070ad8945dfeae3fa70987722e3d89c" # the accounting asset
@@ -228,6 +236,7 @@ tests:
     stop_block: 17387000
     expected_components:
       - id: "0x34280882267ffa6383b363e278b027be083bbe3b"
+        protocol_type_name: "pendle_market"
         tokens:
           - "0xcbc72d92b2dc8187414f6734718563898740c0bc" # SY-wstETH
           - "0xb253eff1104802b97ac7e3ac9fdd73aece295a2c" # PT
@@ -251,6 +260,7 @@ tests:
       # accounting asset and the three entry tokens still classify the same way. A classification
       # that drifted with the exchange rate would show up as a diff here and nowhere else.
       - id: "0xcbc72d92b2dc8187414f6734718563898740c0bc"
+        protocol_type_name: "pendle_sy"
         tokens:
           - "0xcbc72d92b2dc8187414f6734718563898740c0bc" # SY
           - "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" # WETH
