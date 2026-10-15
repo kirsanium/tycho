@@ -136,8 +136,8 @@ modules:
       type: proto:tycho.evm.v1.BlockChanges
 
 # sy_rate_refresh_blocks: how often SY.exchangeRate() is re-read. Live indexing wants 1. A
-# backfill from the 2023 genesis block issues one batched eth_call per refresh block, which is
-# the dominant cost of a historical sync, so raise it there — one refresh per ~50 blocks (~10
+# backfill from initialBlock (November 2022) issues one batched eth_call per refresh block, which
+# is the dominant cost of a historical sync, so raise it there — one refresh per ~50 blocks (~10
 # minutes) bounds the index error to well under the swap fee.
 params:
   map_protocol_changes: "sy_rate_refresh_blocks=1"

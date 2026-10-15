@@ -6,8 +6,8 @@
 //! market, in one batched `eth_call`.
 //!
 //! That read also fires for every historical block during a backfill, which is the expensive
-//! part: Pendle's first Ethereum market dates to 2023. `sy_rate_refresh_blocks` exists to make
-//! the backfill interval a config change rather than a code change.
+//! part: Pendle's first Ethereum market dates to November 2022. `sy_rate_refresh_blocks` exists
+//! to make the backfill interval a config change rather than a code change.
 //!
 //! Two clocks are published alongside it, and they are not the same clock. `rate_sampled_at`
 //! dates the rate: it is the block the rate was read at, and it stops advancing the moment a read

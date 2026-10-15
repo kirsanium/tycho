@@ -9,7 +9,7 @@
 //! One line per market, `;`-separated by `StoreAppend`, fields `|`-separated:
 //! `<market component id>|<SY component id>|<expiry>|<factory address>|<creation fee rate>`. At
 //! ~140 bytes per line
-//! and 484 markets created on Ethereum since 2023, the whole registry is under 60 KB.
+//! and 484 markets created on Ethereum since November 2022, the whole registry is under 60 KB.
 //!
 //! The factory is here because the fee events fan out by factory: the original factory's
 //! `NewMarketConfig` changes the fee for every market it ever deployed, and V3+'s

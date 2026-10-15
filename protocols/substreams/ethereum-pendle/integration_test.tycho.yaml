@@ -13,8 +13,9 @@ protocol_system: "pendle"
 # live market it finds in the registry, and the registry only ever holds markets the range itself
 # created, so it can never emit state for a component this test's fresh database has not seen.
 #
-# Two ranges, because Pendle has two incompatible factory generations and each is only reachable in
-# its own era: the original factory in 2022, the current one in 2026.
+# Three ranges. Pendle has two incompatible factory generations and each is only reachable in its
+# own era: the original factory in 2022, the current one in 2026. The third covers the reference
+# market the brief names, created in 2023.
 tests:
   # The original factory (`0x27b1dacd…`), whose `CreateNewMarket` carries no `lnFeeRateRoot` and
   # whose fee config is keyed by router alone.
@@ -121,8 +122,8 @@ tests:
   # 25745800) and closes after both listed markets have traded: `0x47ad2cd1…` from block 25734488
   # onwards, `0x1f34887b…` at 25752719 and 25754469.
   #
-  # Every value below is re-derived from chain by `scripts/expected_components.py`, which reads
-  # the creation log and the SY at the creation block exactly as `map_market_components` does.
+  # Every value below was re-derived from chain, reading the creation log and the SY at the
+  # creation block exactly as `map_market_components` does.
   - name: test_v6_market_creation_and_swaps
     start_block: 25722400
     stop_block: 25755000
@@ -224,8 +225,7 @@ tests:
   # It is also the case where the fee cannot come from the creation event — the original factory
   # emits none, so `ln_fee_rate_root_at_creation` is zero here and the brief's
   # `lnFeeRateRoot = 499875041000000` has to be read back from `getMarketConfig`. That value lands
-  # as state rather than a static attribute, so this fixture cannot assert it; `scripts/
-  # verify_event_replay.py` covers the state side for this same market.
+  # as state rather than a static attribute, so this fixture cannot assert it.
   - name: test_reference_market_creation_and_swaps
     start_block: 17363200
     stop_block: 17387000
