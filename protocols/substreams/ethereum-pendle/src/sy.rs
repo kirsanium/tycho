@@ -247,6 +247,34 @@ mod tests {
         );
     }
 
+    /// The tolerance is the widest entry haircut a quotable SY may take, because the simulation
+    /// quotes the closed form and so over-quotes such a deposit by the haircut. The widest the
+    /// sweep found is 1e-6; this pins that a haircut at 1e-6 still classifies and anything wider,
+    /// 5e-6 included, is left out rather than quoted five times worse.
+    #[test]
+    fn an_entry_haircut_classifies_up_to_one_in_a_million() {
+        let one_to_one = BigInt::from(1_000_000_000_000_000_000u64);
+        let classify_at = |observed: BigInt| {
+            classify_deposit(
+                &observed,
+                wsteth_sy::SY_DECIMALS,
+                wsteth_sy::ASSET_DECIMALS,
+                &BigInt::from(wsteth_sy::EXCHANGE_RATE),
+            )
+        };
+        let one_in_a_million = BigInt::from(1_000_000_000_000u64);
+
+        assert_eq!(
+            classify_at(one_to_one.clone() - one_in_a_million.clone()),
+            Some(TokenClass::OneToOne)
+        );
+        assert_eq!(
+            classify_at(one_to_one.clone() - one_in_a_million.clone() - BigInt::from(1)),
+            None
+        );
+        assert_eq!(classify_at(one_to_one - one_in_a_million * BigInt::from(5)), None);
+    }
+
     /// A real exit that neither closed form explains -- this SY redeems ~0.5% below the rate.
     /// It must be excluded, not rounded into the nearer class.
     #[test]
