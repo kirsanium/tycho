@@ -88,6 +88,18 @@ modules:
     output:
       type: proto:tycho.evm.v1.BlockBalanceDeltas
 
+  # SY classes and pause: from creation and from Paused / Unpaused / Upgraded events, so nothing
+  # here is read per block.
+  - name: map_sy_state
+    kind: map
+    initialBlock: 16032059
+    inputs:
+      - source: sf.ethereum.type.v2.Block
+      - map: map_protocol_components
+      - store: store_protocol_components
+    output:
+      type: proto:tycho.evm.v1.BlockChanges
+
   # pyIndexStored per market: seeded by an eth_call at creation, then advanced by the yield
   # token's NewInterestIndex. It has to be carried, since refresh blocks have no such event.
   - name: store_py_index
@@ -134,6 +146,7 @@ modules:
       - store: store_protocol_components
       - store: store_market_registry
       - store: store_py_index
+      - map: map_sy_state
     output:
       type: proto:tycho.evm.v1.BlockChanges
 

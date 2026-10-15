@@ -19,7 +19,7 @@ use crate::{
         TOTAL_SY,
     },
     registry::{expired_markets, live_markets, sy_components, MarketEntry},
-    sy::{is_creation_seed, SY_TOTAL_SUPPLY},
+    sy::{is_class_attribute, is_creation_seed, SY_TOTAL_SUPPLY},
     sy_rates::{
         encode_timestamp, py_index_current, RefreshParams, BLOCK_TIMESTAMP, PY_INDEX_CURRENT,
         RATE_SAMPLED_AT, SY_EXCHANGE_RATE,
@@ -39,6 +39,7 @@ pub fn map_protocol_changes(
     components_store: StoreGetRaw,
     registry_store: StoreGetString,
     py_index_store: StoreGetBigInt,
+    sy_state: BlockChanges,
 ) -> Result<BlockChanges, substreams::errors::Error> {
     let refresh = RefreshParams::parse(&params)?;
     let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
@@ -52,7 +53,7 @@ pub fn map_protocol_changes(
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(tx));
         for component in &tx_components.components {
-            builder.add_protocol_component(&without_creation_seeds(component));
+            builder.add_protocol_component(&as_emitted(component));
             // The creation-time `pyIndexStored()` read lands here rather than in the component's
             // static attributes: it is state, and it changes on the yield token's next interest
             // event.
@@ -62,6 +63,20 @@ pub fn map_protocol_changes(
                     attributes: vec![state_attribute(PY_INDEX_STORED, index.to_signed_bytes_be())],
                 });
             }
+        }
+    }
+
+    // A new SY's classes and pause flag, and every later pause, unpause and re-classification.
+    // They follow the component creation of the same transaction, which they describe.
+    for tx_changes in sy_state.changes {
+        let tx = tx_changes
+            .tx
+            .expect("SY state change without a transaction");
+        let builder = transaction_changes
+            .entry(tx.index)
+            .or_insert_with(|| TransactionChangesBuilder::new(&tx));
+        for change in &tx_changes.entity_changes {
+            builder.add_entity_change(change);
         }
     }
 
@@ -590,12 +605,13 @@ fn market_sy_pt(store: &StoreGetRaw, component_id: &str) -> Option<(Vec<u8>, Vec
     Some((sy.clone(), pt.clone()))
 }
 
-/// The component as it is emitted: without the creation seeds, which only seed the stores.
-fn without_creation_seeds(component: &ProtocolComponent) -> ProtocolComponent {
+/// The component as it is emitted: without the creation seeds, which only seed the stores, and
+/// without the token classes, which `map_sy_state` emits as state so an upgrade can change them.
+fn as_emitted(component: &ProtocolComponent) -> ProtocolComponent {
     let mut emitted = component.clone();
-    emitted
-        .static_att
-        .retain(|attribute| !is_creation_seed(&attribute.name));
+    emitted.static_att.retain(|attribute| {
+        !is_creation_seed(&attribute.name) && !is_class_attribute(&attribute.name)
+    });
     emitted
 }
 
@@ -607,16 +623,21 @@ fn state_attribute(name: &str, value: Vec<u8>) -> Attribute {
 mod tests {
     use super::*;
 
-    /// The seeds feed the stores; the emitted component carries everything else unchanged.
+    /// The seeds feed the stores and the classes are state; everything else is emitted unchanged.
     #[test]
-    fn the_emitted_component_drops_only_the_creation_seeds() {
+    fn the_emitted_component_drops_the_seeds_and_the_classes() {
         let component = ProtocolComponent::new("0xcbc72d92b2dc8187414f6734718563898740c0bc")
             .with_attributes(&[
                 ("sy_decimals", vec![18u8]),
                 (crate::sy::CREATION_TOTAL_SUPPLY, vec![1u8]),
                 ("creation_balance_0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0", vec![2u8]),
+                (
+                    "token_out_class_0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",
+                    b"one_to_one".to_vec(),
+                ),
+                (crate::sy::CREATION_PAUSED, vec![0u8]),
             ]);
-        let names: Vec<String> = without_creation_seeds(&component)
+        let names: Vec<String> = as_emitted(&component)
             .static_att
             .into_iter()
             .map(|attribute| attribute.name)

@@ -64,8 +64,6 @@ tests:
           asset_address: "0x3175df0976dfa876431c2e9ee6bc45b65d3473cc"
           asset_decimals: "0x12"
           sy_decimals: "0x12"
-          token_in_class_0x3175df0976dfa876431c2e9ee6bc45b65d3473cc: "0x6f6e655f746f5f6f6e65"
-          token_out_class_0x3175df0976dfa876431c2e9ee6bc45b65d3473cc: "0x6f6e655f746f5f6f6e65"
         creation_tx: "0x6edb7e8dd09fa0e9ccd4b7195d514d51e03d91e9c05147fac6e458cc6b63bf01"
         skip_simulation: true
         skip_execution: true
@@ -105,11 +103,6 @@ tests:
           asset_address: "0xae7ab96520de3a18e5e111b5eaab095312d7fe84"
           asset_decimals: "0x12"
           sy_decimals: "0x12"
-          token_in_class_0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2: "0x696e6465785f72617465"
-          token_in_class_0xae7ab96520de3a18e5e111b5eaab095312d7fe84: "0x696e6465785f72617465"
-          token_in_class_0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0: "0x6f6e655f746f5f6f6e65"
-          token_out_class_0xae7ab96520de3a18e5e111b5eaab095312d7fe84: "0x696e6465785f72617465"
-          token_out_class_0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0: "0x6f6e655f746f5f6f6e65"
         creation_tx: "0x952d4c25142e16032afd36d6be525aeed374517ec0942a7e879221db6ef3e032"
         skip_simulation: true
         skip_execution: true
@@ -163,9 +156,6 @@ tests:
           asset_address: "0x4c9edd5852cd905f086c759e8383e09bff1e68b3"
           asset_decimals: "0x12"
           sy_decimals: "0x12"
-          token_in_class_0x4c9edd5852cd905f086c759e8383e09bff1e68b3: "0x696e6465785f72617465"
-          token_in_class_0x9d39a5de30e57443bff2a8307a4256c8797a3497: "0x6f6e655f746f5f6f6e65"
-          token_out_class_0x9d39a5de30e57443bff2a8307a4256c8797a3497: "0x6f6e655f746f5f6f6e65"
         creation_tx: "0xdd5bb2843b595874435f1355050d543c35da13b4fbd9c4aeccc74256edba725e"
         skip_simulation: true
         skip_execution: true
@@ -204,12 +194,6 @@ tests:
           asset_address: "0x48f9e38f3070ad8945dfeae3fa70987722e3d89c"
           asset_decimals: "0x12"
           sy_decimals: "0x12"
-          token_in_class_0x48f9e38f3070ad8945dfeae3fa70987722e3d89c: "0x696e6465785f72617465"
-          token_in_class_0xdbdc1ef57537e34680b898e1febd3d68c7389bcb: "0x6f6e655f746f5f6f6e65"
-          token_in_class_0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48: "0x696e6465785f72617465"
-          token_out_class_0x48f9e38f3070ad8945dfeae3fa70987722e3d89c: "0x696e6465785f72617465"
-          token_out_class_0xdbdc1ef57537e34680b898e1febd3d68c7389bcb: "0x6f6e655f746f5f6f6e65"
-          token_out_class_0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48: "0x696e6465785f72617465"
         creation_tx: "0x35c6a24f0c9214a3809d03b539eec5ad314617c5c812c1a53750bb13e1a45131"
         skip_simulation: true
         skip_execution: true
@@ -263,11 +247,6 @@ tests:
           asset_address: "0xae7ab96520de3a18e5e111b5eaab095312d7fe84"
           asset_decimals: "0x12"
           sy_decimals: "0x12"
-          token_in_class_0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2: "0x696e6465785f72617465"
-          token_in_class_0xae7ab96520de3a18e5e111b5eaab095312d7fe84: "0x696e6465785f72617465"
-          token_in_class_0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0: "0x6f6e655f746f5f6f6e65"
-          token_out_class_0xae7ab96520de3a18e5e111b5eaab095312d7fe84: "0x696e6465785f72617465"
-          token_out_class_0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0: "0x6f6e655f746f5f6f6e65"
         creation_tx: "0xf5022404495cff175a5b4c45864e372f0fa2344cc8aa14298987e4ccdf6e5daa"
         skip_simulation: true
         skip_execution: true

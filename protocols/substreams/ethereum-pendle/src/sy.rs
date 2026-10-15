@@ -143,6 +143,8 @@ pub(crate) struct SyProfile {
     /// The SY's `balanceOf` in each of its component tokens at the creation block, the seeds its
     /// balances are accumulated from. A token whose read failed is absent and starts at zero.
     pub(crate) holdings: Vec<(Vec<u8>, BigInt)>,
+    /// `paused()` at the creation block; `Paused` / `Unpaused` move it afterwards.
+    pub(crate) paused: bool,
 }
 
 /// State attribute carrying an SY's share supply, which bounds every redemption from it.
@@ -156,9 +158,48 @@ pub const CREATION_TOTAL_SUPPLY: &str = "creation_total_supply";
 /// component is emitted.
 pub const CREATION_BALANCE_PREFIX: &str = "creation_balance_0x";
 
+/// Static attribute carrying whether an SY was paused at creation. Consumed by `map_sy_state` and
+/// stripped before the component is emitted.
+pub const CREATION_PAUSED: &str = "creation_paused";
+/// State attribute: whether the SY is paused, which refuses every quote against it.
+pub const PAUSED: &str = "paused";
+/// Prefixes of the per-token class attributes, followed by the token's hex address. Emitted as
+/// state, since an upgrade can change how a token converts.
+pub const TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
+pub const TOKEN_OUT_CLASS_PREFIX: &str = "token_out_class_0x";
+
 /// Whether a static attribute is a creation seed, which only seeds the stores and is never emitted.
 pub fn is_creation_seed(name: &str) -> bool {
-    name == CREATION_TOTAL_SUPPLY || name.starts_with(CREATION_BALANCE_PREFIX)
+    name == CREATION_TOTAL_SUPPLY ||
+        name == CREATION_PAUSED ||
+        name.starts_with(CREATION_BALANCE_PREFIX)
+}
+
+/// Whether an attribute is a token class.
+pub fn is_class_attribute(name: &str) -> bool {
+    name.starts_with(TOKEN_IN_CLASS_PREFIX) || name.starts_with(TOKEN_OUT_CLASS_PREFIX)
+}
+
+/// One class attribute per quotable token and direction: an entry token and an exit token can
+/// convert differently on the same SY, so the class is recorded per direction.
+pub fn class_attributes(
+    tokens_in: &[(Vec<u8>, TokenClass)],
+    tokens_out: &[(Vec<u8>, TokenClass)],
+) -> Vec<(String, Vec<u8>)> {
+    let mut attributes = Vec::new();
+    for (token, class) in tokens_in {
+        attributes.push((
+            format!("{TOKEN_IN_CLASS_PREFIX}{}", hex::encode(token)),
+            class.as_str().as_bytes().to_vec(),
+        ));
+    }
+    for (token, class) in tokens_out {
+        attributes.push((
+            format!("{TOKEN_OUT_CLASS_PREFIX}{}", hex::encode(token)),
+            class.as_str().as_bytes().to_vec(),
+        ));
+    }
+    attributes
 }
 
 /// The SY's supply at creation, from its seed attribute.
@@ -193,26 +234,15 @@ impl SyProfile {
     pub(crate) fn into_component(self) -> ProtocolComponent {
         let tokens = self.component_tokens();
 
-        // An entry token and an exit token can convert differently on the same SY, so the class
-        // is recorded per direction rather than once per token.
+        // The classes ride here only as far as `map_protocol_changes`, which moves them to state
+        // so an upgrade can change them.
         let mut attributes = vec![
             ("asset_address".to_string(), self.asset.clone()),
             ("asset_decimals".to_string(), BigInt::from(self.asset_decimals).to_signed_bytes_be()),
             ("sy_decimals".to_string(), BigInt::from(self.decimals).to_signed_bytes_be()),
         ];
-        for (token, class) in &self.tokens_in {
-            attributes.push((
-                format!("token_in_class_0x{}", hex::encode(token)),
-                class.as_str().as_bytes().to_vec(),
-            ));
-        }
-        for (token, class) in &self.tokens_out {
-            attributes.push((
-                format!("token_out_class_0x{}", hex::encode(token)),
-                class.as_str().as_bytes().to_vec(),
-            ));
-        }
-
+        attributes.extend(class_attributes(&self.tokens_in, &self.tokens_out));
+        attributes.push((CREATION_PAUSED.to_string(), vec![u8::from(self.paused)]));
         attributes
             .push((CREATION_TOTAL_SUPPLY.to_string(), self.total_supply.to_signed_bytes_be()));
         for (token, balance) in &self.holdings {
@@ -230,6 +260,42 @@ impl SyProfile {
 }
 
 pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
+    let Classification { decimals, asset, asset_decimals, tokens_in, tokens_out } =
+        classify_sy(sy_address)?;
+
+    let tokens = component_tokens(sy_address, &tokens_in, &tokens_out);
+    let Some(Seeds { total_supply, holdings, paused }) = read_seeds(sy_address, &tokens) else {
+        log::info!("SY 0x{} did not answer totalSupply()", hex::encode(sy_address));
+        return None;
+    };
+
+    Some(SyProfile {
+        address: sy_address.to_vec(),
+        decimals,
+        asset,
+        asset_decimals,
+        tokens_in,
+        tokens_out,
+        total_supply,
+        holdings,
+        paused,
+    })
+}
+
+/// What a classification of an SY's tokens found: its units, and each quotable token's class.
+pub(crate) struct Classification {
+    pub(crate) decimals: u32,
+    pub(crate) asset: Vec<u8>,
+    pub(crate) asset_decimals: u32,
+    /// Quotable entry tokens and the conversion each uses.
+    pub(crate) tokens_in: Vec<(Vec<u8>, TokenClass)>,
+    /// Quotable exit tokens and the conversion each uses.
+    pub(crate) tokens_out: Vec<(Vec<u8>, TokenClass)>,
+}
+
+/// Classifies each token the SY lists by probing `previewDeposit` / `previewRedeem` against the
+/// two closed forms, at the current block. `None` when the SY's units do not resolve.
+pub(crate) fn classify_sy(sy_address: &[u8]) -> Option<Classification> {
     let responses = RpcBatch::new()
         .add(pendle_sy::functions::Decimals {}, sy_address.to_vec())
         .add(pendle_sy::functions::AssetInfo {}, sy_address.to_vec())
@@ -281,21 +347,12 @@ pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
         quotable_out.push((token, class));
     }
 
-    let tokens = component_tokens(sy_address, &quotable_in, &quotable_out);
-    let Some(Seeds { total_supply, holdings }) = read_seeds(sy_address, &tokens) else {
-        log::info!("SY 0x{} did not answer totalSupply()", hex::encode(sy_address));
-        return None;
-    };
-
-    Some(SyProfile {
-        address: sy_address.to_vec(),
+    Some(Classification {
         decimals,
         asset,
         asset_decimals,
         tokens_in: quotable_in,
         tokens_out: quotable_out,
-        total_supply,
-        holdings,
     })
 }
 
@@ -324,10 +381,13 @@ fn component_tokens(
 struct Seeds {
     total_supply: BigInt,
     holdings: Vec<(Vec<u8>, BigInt)>,
+    paused: bool,
 }
 
 fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
-    let mut batch = RpcBatch::new().add(erc20::functions::TotalSupply {}, sy_address.to_vec());
+    let mut batch = RpcBatch::new()
+        .add(erc20::functions::TotalSupply {}, sy_address.to_vec())
+        .add(pendle_sy::functions::Paused {}, sy_address.to_vec());
     for token in tokens {
         batch =
             batch.add(erc20::functions::BalanceOf { owner: sy_address.to_vec() }, token.clone());
@@ -338,10 +398,15 @@ fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
         .unwrap_or_default();
 
     let total_supply = RpcBatch::decode::<_, erc20::functions::TotalSupply>(responses.first()?)?;
+    // Five SYs have no `paused()` at all; they cannot be paused, which is what `false` says.
+    let paused = responses
+        .get(1)
+        .and_then(RpcBatch::decode::<_, pendle_sy::functions::Paused>)
+        .unwrap_or(false);
     let mut holdings = Vec::new();
     for (token, response) in tokens
         .iter()
-        .zip(responses.iter().skip(1))
+        .zip(responses.iter().skip(2))
     {
         let Some(balance) = RpcBatch::decode::<_, erc20::functions::BalanceOf>(response) else {
             log::info!(
@@ -353,7 +418,7 @@ fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
         };
         holdings.push((token.clone(), balance));
     }
-    Some(Seeds { total_supply, holdings })
+    Some(Seeds { total_supply, holdings, paused })
 }
 
 fn decode_decimals(response: &RpcResponse) -> Option<u32> {

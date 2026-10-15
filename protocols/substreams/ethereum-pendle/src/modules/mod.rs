@@ -26,6 +26,8 @@ mod store_protocol_components;
 mod map_relative_component_balance;
 #[path = "5_map_reserve_deltas.rs"]
 mod map_reserve_deltas;
+#[path = "5_map_sy_state.rs"]
+mod map_sy_state;
 #[path = "5_store_py_index.rs"]
 mod store_py_index;
 
@@ -44,6 +46,7 @@ pub use map_protocol_changes::map_protocol_changes;
 pub use map_protocol_components::map_protocol_components;
 pub use map_relative_component_balance::map_relative_component_balance;
 pub use map_reserve_deltas::map_reserve_deltas;
+pub use map_sy_state::map_sy_state;
 pub use store_balances::store_balances;
 pub use store_market_registry::store_market_registry;
 pub use store_market_reserves::store_market_reserves;
