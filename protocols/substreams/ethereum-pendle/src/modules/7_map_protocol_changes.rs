@@ -12,7 +12,6 @@ use tycho_substreams::{abi::erc20, balances::aggregate_balances_changes, prelude
 
 use crate::{
     abi::pendle_sy,
-    consts::PENDLE_SY,
     fees::{fan_out, fee_scope, read_market_fees, LN_FEE_RATE_ROOT, RESERVE_FEE_PERCENT},
     keys::{contract_id, market_by_yt_key, market_tokens_key, py_index_key, MARKET_REGISTRY},
     market_state::{
@@ -20,11 +19,11 @@ use crate::{
         TOTAL_SY,
     },
     registry::{expired_markets, live_markets, sy_components, MarketEntry},
+    sy::{is_creation_seed, SY_TOTAL_SUPPLY},
     sy_rates::{
         encode_timestamp, py_index_current, RefreshParams, BLOCK_TIMESTAMP, PY_INDEX_CURRENT,
         RATE_SAMPLED_AT, SY_EXCHANGE_RATE,
     },
-    transfers::{component_transfers, is_market},
 };
 
 /// Joins new components, market state and balance changes into the per-transaction output.
@@ -42,7 +41,6 @@ pub fn map_protocol_changes(
     py_index_store: StoreGetBigInt,
 ) -> Result<BlockChanges, substreams::errors::Error> {
     let refresh = RefreshParams::parse(&params)?;
-    let to_read = sy_holdings_to_read(&block, &new_components, &components_store);
     let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
 
     for tx_components in &new_components.tx_components {
@@ -54,7 +52,7 @@ pub fn map_protocol_changes(
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(tx));
         for component in &tx_components.components {
-            builder.add_protocol_component(component);
+            builder.add_protocol_component(&without_creation_seeds(component));
             // The creation-time `pyIndexStored()` read lands here rather than in the component's
             // static attributes: it is state, and it changes on the yield token's next interest
             // event.
@@ -73,7 +71,24 @@ pub fn map_protocol_changes(
         for (component_id, token_balances) in &balances {
             let component_id = String::from_utf8(component_id.clone())
                 .expect("reserve component id is not valid utf-8");
-            let Some((sy, pt)) = market_sy_pt(&components_store, &component_id) else { continue };
+            let Some((sy, pt)) = market_sy_pt(&components_store, &component_id) else {
+                // Not a market, so an SY, whose one reserve is its own supply.
+                let own_address = hex::decode(component_id.trim_start_matches("0x"))
+                    .expect("SY component id is not hex");
+                if let Some(change) = token_balances.get(&own_address) {
+                    transaction_changes
+                        .entry(tx.index)
+                        .or_insert_with(|| TransactionChangesBuilder::new(&tx))
+                        .add_entity_change(&EntityChanges {
+                            component_id,
+                            attributes: vec![state_attribute(
+                                SY_TOTAL_SUPPLY,
+                                change.balance.clone(),
+                            )],
+                        });
+                }
+                continue;
+            };
 
             let attributes = token_balances
                 .values()
@@ -137,8 +152,7 @@ pub fn map_protocol_changes(
         }
     }
 
-    for (tx, change) in sy_balances(&block, &refresh, &to_read, &registry_store, &components_store)
-    {
+    for (tx, change) in sy_balances(&block, &refresh, &registry_store, &components_store) {
         transaction_changes
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(&tx))
@@ -200,41 +214,23 @@ fn absolute_state_changes(
     changes
 }
 
-/// Reads each SY component's real token balances. This is the only source of an SY's balances:
-/// the transfer path covers markets alone.
+/// Re-reads each SY component's token balances on refresh blocks, correcting rebases.
 ///
-/// Transfers cannot be replayed for an SY. It is created with its first market, usually long
-/// after it first held anything, so replaying from the creation block starts from zero. And a
-/// share-based token moves a holder's balance on rebase without emitting `Transfer`: the wstETH SY
-/// holds stETH. Markets stay on the transfer path. A market custodies only SY shares and PT,
-/// neither of which rebases, it holds nothing before it is created, and transfers cost no RPC.
+/// An SY's balances are otherwise seeded at its creation and moved by transfers (see
+/// `map_relative_component_balance`), which a share-based token defeats: it moves a holder's
+/// balance on rebase without a `Transfer`, and the wstETH SY holds stETH. No quote reads a holding,
+/// so this keeps the reported balances exact rather than any price.
 ///
-/// Every SY component is read, not only those behind a live market: an SY has no maturity, so its
-/// holdings go on moving after the last market that priced against it has expired, and a wrapper
-/// quoting depth from frozen balances would report limits it cannot honour.
+/// A read that fails leaves the accumulated balance in place.
 ///
-/// # Which holdings are read
-///
-/// Every holding on a refresh block, which is what catches a rebase. Off a refresh block, the
-/// holdings in `to_read` (see [`sy_holdings_to_read`]), so a balance is current on any block it
-/// changed by a transfer, whatever `sy_rate_refresh_blocks` is set to. That costs one `balanceOf`
-/// per moved holding on a block that already had activity, so it scales with transfer volume
-/// rather than with block count and adds nothing to a backfill's per-block cost.
-///
-/// A read that fails leaves the last read balance in place.
-///
-/// Costs one `balanceOf` per (SY component, declared token) per refresh block, plus one per moved
-/// holding otherwise. The refresh half grows with the number of SYs ever created, and
-/// `sy_rate_refresh_blocks` throttles it.
+/// Costs one `balanceOf` per (SY component, token) per refresh block.
 fn sy_balances(
     block: &eth::Block,
     params: &RefreshParams,
-    to_read: &HashSet<(String, Vec<u8>)>,
     registry_store: &StoreGetString,
     components_store: &StoreGetRaw,
 ) -> Vec<(Transaction, BalanceChange)> {
-    let refreshing = params.should_refresh(block.number);
-    if !refreshing && to_read.is_empty() {
+    if !params.should_refresh(block.number) {
         return vec![];
     }
     let Some(registry) = registry_store.get_last(MARKET_REGISTRY) else { return vec![] };
@@ -249,9 +245,6 @@ fn sy_balances(
         let address = hex::decode(sy.trim_start_matches("0x"))
             .expect("registry holds a non-hex SY component id");
         for token in tokens {
-            if !is_read(refreshing, to_read, &sy, &token) {
-                continue;
-            }
             holdings.push((sy.clone(), address.clone(), token));
         }
     }
@@ -494,13 +487,6 @@ fn refresh_live_state(
     changes
 }
 
-/// Whether one SY holding has its balance read this block.
-///
-/// A refresh block reads everything; any other block reads what moved. See [`sy_balances`].
-fn is_read(refreshing: bool, to_read: &HashSet<(String, Vec<u8>)>, sy: &str, token: &[u8]) -> bool {
-    refreshing || to_read.contains(&(sy.to_string(), token.to_vec()))
-}
-
 /// The components refreshed this block whether or not it is a refresh block.
 ///
 /// Every component created this block, which has no rate yet: with `sy_rate_refresh_blocks` above
@@ -530,39 +516,6 @@ fn forced_refresh(
         }
     }
     forced
-}
-
-/// The `(SY, token)` holdings read this block whether or not it is a refresh block: those a
-/// `Transfer` moved, and every holding of an SY created this block, which has no balance yet.
-fn sy_holdings_to_read(
-    block: &eth::Block,
-    new_components: &BlockTransactionProtocolComponents,
-    components_store: &StoreGetRaw,
-) -> HashSet<(String, Vec<u8>)> {
-    let mut holdings = HashSet::new();
-    for transfer in component_transfers(block, components_store) {
-        if is_market(components_store, &transfer.component_id) {
-            continue;
-        }
-        holdings.insert((transfer.component_id, transfer.log.address.clone()));
-    }
-    for component in new_components
-        .tx_components
-        .iter()
-        .flat_map(|tx| &tx.components)
-    {
-        let is_sy = component
-            .protocol_type
-            .as_ref()
-            .is_some_and(|t| t.name == PENDLE_SY);
-        if !is_sy {
-            continue;
-        }
-        for token in &component.tokens {
-            holdings.insert((component.id.clone(), token.clone()));
-        }
-    }
-    holdings
 }
 
 /// The SYs whose `exchangeRate()` is read this block.
@@ -637,6 +590,15 @@ fn market_sy_pt(store: &StoreGetRaw, component_id: &str) -> Option<(Vec<u8>, Vec
     Some((sy.clone(), pt.clone()))
 }
 
+/// The component as it is emitted: without the creation seeds, which only seed the stores.
+fn without_creation_seeds(component: &ProtocolComponent) -> ProtocolComponent {
+    let mut emitted = component.clone();
+    emitted
+        .static_att
+        .retain(|attribute| !is_creation_seed(&attribute.name));
+    emitted
+}
+
 fn state_attribute(name: &str, value: Vec<u8>) -> Attribute {
     Attribute { name: name.to_string(), value, change: ChangeType::Update.into() }
 }
@@ -645,44 +607,20 @@ fn state_attribute(name: &str, value: Vec<u8>) -> Attribute {
 mod tests {
     use super::*;
 
-    const SY: &str = "0xcbc72d92b2dc8187414f6734718563898740c0bc";
-    const STETH: [u8; 20] = [0xae; 20];
-    const WSTETH: [u8; 20] = [0x7f; 20];
-
-    fn holdings(entries: &[(&str, [u8; 20])]) -> HashSet<(String, Vec<u8>)> {
-        entries
-            .iter()
-            .map(|(id, token)| (id.to_string(), token.to_vec()))
-            .collect()
-    }
-
+    /// The seeds feed the stores; the emitted component carries everything else unchanged.
     #[test]
-    fn a_refresh_block_reads_every_holding() {
-        let to_read = HashSet::new();
-        assert!(is_read(true, &to_read, SY, &STETH));
-        assert!(is_read(true, &to_read, SY, &WSTETH));
-    }
-
-    /// Off a refresh block, a holding a transfer moved is read, so its balance is current on the
-    /// block it changed.
-    #[test]
-    fn a_holding_to_read_is_read_off_a_refresh_block() {
-        assert!(is_read(false, &holdings(&[(SY, STETH)]), SY, &STETH));
-    }
-
-    /// A holding nothing touched cannot have moved without a rebase, and a rebase is what the
-    /// refresh is for. Reading it here would cost an RPC call for a balance that did not change.
-    #[test]
-    fn an_untouched_holding_is_left_alone_off_a_refresh_block() {
-        assert!(!is_read(false, &holdings(&[(SY, STETH)]), SY, &WSTETH));
-    }
-
-    /// Two components can hold the same token, so the pair is the key, not the token.
-    #[test]
-    fn a_holding_is_keyed_by_component_and_token_together() {
-        let other = "0x9f30507c264cc6eb5be35b18ff9ad7b4539aa920";
-        let to_read = holdings(&[(other, STETH)]);
-        assert!(is_read(false, &to_read, other, &STETH));
-        assert!(!is_read(false, &to_read, SY, &STETH));
+    fn the_emitted_component_drops_only_the_creation_seeds() {
+        let component = ProtocolComponent::new("0xcbc72d92b2dc8187414f6734718563898740c0bc")
+            .with_attributes(&[
+                ("sy_decimals", vec![18u8]),
+                (crate::sy::CREATION_TOTAL_SUPPLY, vec![1u8]),
+                ("creation_balance_0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0", vec![2u8]),
+            ]);
+        let names: Vec<String> = without_creation_seeds(&component)
+            .static_att
+            .into_iter()
+            .map(|attribute| attribute.name)
+            .collect();
+        assert_eq!(names, vec!["sy_decimals".to_string()]);
     }
 }

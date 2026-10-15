@@ -73,6 +73,7 @@ modules:
     initialBlock: 16032059
     inputs:
       - source: sf.ethereum.type.v2.Block
+      - map: map_protocol_components
       - store: store_protocol_components
     output:
       type: proto:tycho.evm.v1.BlockBalanceDeltas
@@ -82,6 +83,7 @@ modules:
     initialBlock: 16032059
     inputs:
       - source: sf.ethereum.type.v2.Block
+      - map: map_protocol_components
       - store: store_protocol_components
     output:
       type: proto:tycho.evm.v1.BlockBalanceDeltas

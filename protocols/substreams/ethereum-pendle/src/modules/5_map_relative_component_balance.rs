@@ -1,11 +1,19 @@
+use std::collections::HashSet;
+
 use anyhow::Result;
-use substreams::store::{StoreGet, StoreGetRaw};
+use substreams::{
+    scalar::BigInt,
+    store::{StoreGet, StoreGetRaw},
+};
 use substreams_ethereum::pb::eth::v2 as eth;
 use tycho_substreams::prelude::*;
 
-use crate::transfers::{component_transfers, is_market};
+use crate::{
+    sy::balance_seeds,
+    transfers::{component_transfers, new_sy_components},
+};
 
-/// Tracks the ERC-20 balances the markets actually custody, from `Transfer` events.
+/// Tracks the ERC-20 balances the components actually custody, from `Transfer` events.
 ///
 /// These are deliberately not the market's `totalPt` / `totalSy` — those are reserves, they live
 /// in `map_reserve_deltas`, and they differ, because `totalSy` excludes donated excess that
@@ -17,17 +25,26 @@ use crate::transfers::{component_transfers, is_market};
 /// token, so it emits `Transfer` from its own address: those are ignored because the LP token is
 /// not in the market's token list.
 ///
-/// SYs are left out. Their balances are read with `balanceOf` in `map_protocol_changes`, because
-/// an SY can hold a rebasing token, and because it is usually created long after it first held
-/// anything: replaying its transfers from the creation block would start from zero.
+/// An SY usually held tokens long before it became a component with its first market, so its
+/// balances are seeded from the `balanceOf` reads taken at its creation and moved by transfers
+/// afterwards. The seed is read at the end of the creation block, so that block's transfers are
+/// already in it and are skipped. A rebasing token moves without a `Transfer`; the refresh
+/// re-reads the holdings of SYs with a live market, and no quote reads a holding.
 #[substreams::handlers::map]
 pub fn map_relative_component_balance(
     block: eth::Block,
+    new_components: BlockTransactionProtocolComponents,
     store: StoreGetRaw,
 ) -> Result<BlockBalanceDeltas> {
+    let created = new_sy_components(&new_components);
+    let seeded: HashSet<&str> = created
+        .iter()
+        .map(|(_, component)| component.id.as_str())
+        .collect();
+
     let mut balance_deltas = Vec::new();
     for transfer in component_transfers(&block, &store) {
-        if !is_market(&store, &transfer.component_id) {
+        if seeded.contains(transfer.component_id.as_str()) {
             continue;
         }
         balance_deltas.push(BalanceDelta {
@@ -37,6 +54,22 @@ pub fn map_relative_component_balance(
             delta: transfer.amount.to_signed_bytes_be(),
             component_id: transfer.component_id.into_bytes(),
         });
+    }
+    for (tx, component) in created {
+        for (token, balance) in balance_seeds(component) {
+            // A zero seed adds nothing, and the aggregation pairs store deltas with these one
+            // to one, so it is left out rather than written as an empty change.
+            if balance == BigInt::zero() {
+                continue;
+            }
+            balance_deltas.push(BalanceDelta {
+                ord: 0,
+                tx: Some(tx.clone()),
+                token,
+                delta: balance.to_signed_bytes_be(),
+                component_id: component.id.clone().into_bytes(),
+            });
+        }
     }
     Ok(BlockBalanceDeltas { balance_deltas })
 }

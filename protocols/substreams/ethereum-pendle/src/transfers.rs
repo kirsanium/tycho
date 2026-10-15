@@ -5,9 +5,12 @@ use substreams::{
     store::{StoreGet, StoreGetRaw},
 };
 use substreams_ethereum::{pb::eth::v2 as eth, Event};
-use tycho_substreams::abi::erc20;
+use tycho_substreams::{abi::erc20, prelude::*};
 
-use crate::keys::{contract_id, market_tokens_key};
+use crate::{
+    consts::PENDLE_SY,
+    keys::{contract_id, market_tokens_key},
+};
 
 /// One component's side of a `Transfer` of a token it declares.
 pub struct ComponentTransfer<'a> {
@@ -47,6 +50,72 @@ pub fn component_transfers<'a>(
 /// stored.
 pub fn is_market(components_store: &StoreGetRaw, component_id: &str) -> bool {
     components_store.has_last(market_tokens_key(component_id))
+}
+
+/// One change to an SY's supply: a mint or a burn of its shares.
+pub struct SupplyChange<'a> {
+    pub tx: &'a eth::TransactionTrace,
+    pub log: &'a eth::Log,
+    pub sy_id: String,
+    /// Signed: positive for a mint, negative for a burn.
+    pub amount: BigInt,
+}
+
+/// Every mint and burn of an SY component's shares in `block`: a `Transfer` the SY itself emits
+/// from or to the zero address.
+pub fn supply_changes<'a>(
+    block: &'a eth::Block,
+    components_store: &StoreGetRaw,
+) -> Vec<SupplyChange<'a>> {
+    let mut changes = Vec::new();
+    for tx in block.transactions() {
+        for log in tx.logs_with_calls().map(|(log, _)| log) {
+            let Some(transfer) = erc20::events::Transfer::match_and_decode(log) else { continue };
+            let Some(amount) = supply_delta(&transfer) else { continue };
+            let sy_id = contract_id(&log.address);
+            if !components_store.has_last(&sy_id) || is_market(components_store, &sy_id) {
+                continue;
+            }
+            changes.push(SupplyChange { tx, log, sy_id, amount });
+        }
+    }
+    changes
+}
+
+/// The supply change a transfer makes: its value for a mint, minus its value for a burn, `None`
+/// for a transfer between holders or of nothing.
+fn supply_delta(transfer: &erc20::events::Transfer) -> Option<BigInt> {
+    if transfer.value == BigInt::zero() {
+        return None;
+    }
+    match (is_zero_address(&transfer.from), is_zero_address(&transfer.to)) {
+        (true, false) => Some(transfer.value.clone()),
+        (false, true) => Some(transfer.value.neg()),
+        (true, true) | (false, false) => None,
+    }
+}
+
+/// Every SY component created in `components`, with the transaction that created it.
+pub fn new_sy_components(
+    components: &BlockTransactionProtocolComponents,
+) -> Vec<(&Transaction, &ProtocolComponent)> {
+    let mut created = Vec::new();
+    for tx_components in &components.tx_components {
+        let tx = tx_components
+            .tx
+            .as_ref()
+            .expect("component batch without a transaction");
+        for component in &tx_components.components {
+            let is_sy = component
+                .protocol_type
+                .as_ref()
+                .is_some_and(|t| t.name == PENDLE_SY);
+            if is_sy {
+                created.push((tx, component));
+            }
+        }
+    }
+    created
 }
 
 /// Splits a transfer into the signed change it makes to each side's balance.
@@ -146,5 +215,17 @@ mod tests {
             holders.dedup();
             assert_eq!(holders.len(), count, "duplicate holder for a transfer {from:?} -> {to:?}");
         }
+    }
+
+    #[test]
+    fn a_mint_raises_supply_and_a_burn_lowers_it() {
+        assert_eq!(supply_delta(&transfer(ZERO, MARKET, 100)), Some(BigInt::from(100)));
+        assert_eq!(supply_delta(&transfer(MARKET, ZERO, 100)), Some(BigInt::from(-100)));
+    }
+
+    #[test]
+    fn a_transfer_between_holders_leaves_supply_alone() {
+        assert_eq!(supply_delta(&transfer(SY, MARKET, 100)), None);
+        assert_eq!(supply_delta(&transfer(ZERO, MARKET, 0)), None);
     }
 }

@@ -9,7 +9,7 @@
 //! Classification is per `(SY, token)` pair, not per SY: wrappers commonly accept their base
 //! token 1:1 *and* the accounting asset at the index rate.
 
-use substreams::scalar::BigInt;
+use substreams::{log, scalar::BigInt};
 use substreams_ethereum::{pb::eth::rpc::RpcResponse, rpc::RpcBatch};
 use tycho_substreams::{abi::erc20, prelude::*};
 
@@ -138,20 +138,60 @@ pub(crate) struct SyProfile {
     pub(crate) tokens_in: Vec<(Vec<u8>, TokenClass)>,
     /// Quotable exit tokens and the conversion each uses.
     pub(crate) tokens_out: Vec<(Vec<u8>, TokenClass)>,
+    /// `totalSupply()` at the creation block, the seed supply is accumulated from.
+    pub(crate) total_supply: BigInt,
+    /// The SY's `balanceOf` in each of its component tokens at the creation block, the seeds its
+    /// balances are accumulated from. A token whose read failed is absent and starts at zero.
+    pub(crate) holdings: Vec<(Vec<u8>, BigInt)>,
+}
+
+/// State attribute carrying an SY's share supply, which bounds every redemption from it.
+pub const SY_TOTAL_SUPPLY: &str = "sy_total_supply";
+
+/// Static attribute carrying an SY's `totalSupply()` at creation. Consumed by
+/// `map_reserve_deltas` and stripped before the component is emitted.
+pub const CREATION_TOTAL_SUPPLY: &str = "creation_total_supply";
+/// Prefix of the static attributes carrying an SY's holding of each token at creation, followed by
+/// the token's hex address. Consumed by `map_relative_component_balance` and stripped before the
+/// component is emitted.
+pub const CREATION_BALANCE_PREFIX: &str = "creation_balance_0x";
+
+/// Whether a static attribute is a creation seed, which only seeds the stores and is never emitted.
+pub fn is_creation_seed(name: &str) -> bool {
+    name == CREATION_TOTAL_SUPPLY || name.starts_with(CREATION_BALANCE_PREFIX)
+}
+
+/// The SY's supply at creation, from its seed attribute.
+pub fn supply_seed(component: &ProtocolComponent) -> Option<BigInt> {
+    component
+        .get_attribute_value(CREATION_TOTAL_SUPPLY)
+        .map(|raw| BigInt::from_signed_bytes_be(&raw))
+}
+
+/// The SY's holding of each token at creation, from its seed attributes.
+pub fn balance_seeds(component: &ProtocolComponent) -> Vec<(Vec<u8>, BigInt)> {
+    let mut seeds = Vec::new();
+    for attribute in &component.static_att {
+        let Some(token) = attribute
+            .name
+            .strip_prefix(CREATION_BALANCE_PREFIX)
+        else {
+            continue;
+        };
+        let token = hex::decode(token).expect("creation balance attribute names a non-hex token");
+        seeds.push((token, BigInt::from_signed_bytes_be(&attribute.value)));
+    }
+    seeds
 }
 
 impl SyProfile {
+    /// The component's tokens: the SY itself, then every quotable token once.
+    fn component_tokens(&self) -> Vec<Vec<u8>> {
+        component_tokens(&self.address, &self.tokens_in, &self.tokens_out)
+    }
+
     pub(crate) fn into_component(self) -> ProtocolComponent {
-        let mut tokens = vec![self.address.clone()];
-        for (token, _) in self
-            .tokens_in
-            .iter()
-            .chain(self.tokens_out.iter())
-        {
-            if !tokens.contains(token) {
-                tokens.push(token.clone());
-            }
-        }
+        let tokens = self.component_tokens();
 
         // An entry token and an exit token can convert differently on the same SY, so the class
         // is recorded per direction rather than once per token.
@@ -170,6 +210,15 @@ impl SyProfile {
             attributes.push((
                 format!("token_out_class_0x{}", hex::encode(token)),
                 class.as_str().as_bytes().to_vec(),
+            ));
+        }
+
+        attributes
+            .push((CREATION_TOTAL_SUPPLY.to_string(), self.total_supply.to_signed_bytes_be()));
+        for (token, balance) in &self.holdings {
+            attributes.push((
+                format!("{CREATION_BALANCE_PREFIX}{}", hex::encode(token)),
+                balance.to_signed_bytes_be(),
             ));
         }
 
@@ -232,6 +281,12 @@ pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
         quotable_out.push((token, class));
     }
 
+    let tokens = component_tokens(sy_address, &quotable_in, &quotable_out);
+    let Some(Seeds { total_supply, holdings }) = read_seeds(sy_address, &tokens) else {
+        log::info!("SY 0x{} did not answer totalSupply()", hex::encode(sy_address));
+        return None;
+    };
+
     Some(SyProfile {
         address: sy_address.to_vec(),
         decimals,
@@ -239,7 +294,66 @@ pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
         asset_decimals,
         tokens_in: quotable_in,
         tokens_out: quotable_out,
+        total_supply,
+        holdings,
     })
+}
+
+fn component_tokens(
+    sy_address: &[u8],
+    tokens_in: &[(Vec<u8>, TokenClass)],
+    tokens_out: &[(Vec<u8>, TokenClass)],
+) -> Vec<Vec<u8>> {
+    let mut tokens = vec![sy_address.to_vec()];
+    for (token, _) in tokens_in
+        .iter()
+        .chain(tokens_out.iter())
+    {
+        if !tokens.contains(token) {
+            tokens.push(token.clone());
+        }
+    }
+    tokens
+}
+
+/// Reads the SY's supply and its holding of each token in one batch, at the creation block.
+///
+/// These are the only reads its supply and balances ever need: afterwards both are accumulated
+/// from events. `None` when the supply does not resolve, since a component without one could not
+/// bound a redemption.
+struct Seeds {
+    total_supply: BigInt,
+    holdings: Vec<(Vec<u8>, BigInt)>,
+}
+
+fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
+    let mut batch = RpcBatch::new().add(erc20::functions::TotalSupply {}, sy_address.to_vec());
+    for token in tokens {
+        batch =
+            batch.add(erc20::functions::BalanceOf { owner: sy_address.to_vec() }, token.clone());
+    }
+    let responses = batch
+        .execute()
+        .map(|r| r.responses)
+        .unwrap_or_default();
+
+    let total_supply = RpcBatch::decode::<_, erc20::functions::TotalSupply>(responses.first()?)?;
+    let mut holdings = Vec::new();
+    for (token, response) in tokens
+        .iter()
+        .zip(responses.iter().skip(1))
+    {
+        let Some(balance) = RpcBatch::decode::<_, erc20::functions::BalanceOf>(response) else {
+            log::info!(
+                "SY 0x{} did not answer balanceOf for 0x{}, its balance starts at zero",
+                hex::encode(sy_address),
+                hex::encode(token)
+            );
+            continue;
+        };
+        holdings.push((token.clone(), balance));
+    }
+    Some(Seeds { total_supply, holdings })
 }
 
 fn decode_decimals(response: &RpcResponse) -> Option<u32> {
