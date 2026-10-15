@@ -929,86 +929,67 @@ fn wsteth_market_at_block_25_800_000() -> PendleState {
     })
 }
 
-/// What each edge delivered on a mainnet fork at block 25 800 000, swapping through
-/// `PendleExecutor` and Router V4 with the zero `ApproxParams` the executor sends. One row per
-/// `(edge, amount in, amount out)`, each from the unmodified fork state. The amounts are irregular
-/// on purpose: whole-unit inputs hide the one-wei rounding differences between the two ways of
-/// splitting a redemption.
-const EXECUTED_AT_BLOCK_25_800_000: [(&str, &str, &str); 39] = [
-    ("yt_for_sy", "1000003", "21914"),
-    ("sy_for_yt", "1000003", "43520129"),
-    ("pt_for_sy", "1000003", "782103"),
-    ("sy_for_pt", "1000003", "1276865"),
-    ("yt_for_sy", "123456789012345677", "2703288105385623"),
-    ("sy_for_yt", "123456789012345677", "5208483711632458842"),
-    ("pt_for_sy", "123456789012345677", "96553572751240226"),
-    ("sy_for_pt", "123456789012345677", "157629900593855092"),
-    ("yt_for_sy", "999999999999999999", "21770141148458769"),
-    ("sy_for_yt", "999999999999999999", "36536075805370490827"),
-    ("pt_for_sy", "999999999999999999", "781959205515422197"),
-    ("sy_for_pt", "999999999999999999", "1276552648088633755"),
-    ("yt_for_sy", "3141592653589793238", "67405138389133308"),
-    ("sy_for_yt", "3141592653589793238", "96848851507347221012"),
-    ("pt_for_sy", "3141592653589793238", "2455655601278921170"),
-    ("sy_for_pt", "3141592653589793238", "4008252392973808731"),
-    ("yt_for_sy", "2718281828459045235", "58493312789323308"),
-    ("sy_for_yt", "2718281828459045235", "85895279972030534024"),
-    ("pt_for_sy", "2718281828459045235", "2124930243066260750"),
-    ("sy_for_pt", "2718281828459045235", "3468503534871788498"),
-    ("yt_for_sy", "7777777777777777777", "161367827323049332"),
-    ("sy_for_yt", "7777777777777777777", "202364425602726806635"),
-    ("pt_for_sy", "7777777777777777777", "6074705765947486258"),
-    ("sy_for_pt", "7777777777777777777", "9911758995650751965"),
-    ("yt_for_sy", "12345678901234567891", "247017906494229954"),
-    ("sy_for_yt", "12345678901234567891", "292490678495871391123"),
-    ("pt_for_sy", "12345678901234567891", "9635128072750843417"),
-    ("sy_for_pt", "12345678901234567891", "15713694610384744100"),
-    ("yt_for_sy", "31415926535897932384", "513645109115127862"),
-    ("sy_for_yt", "31415926535897932384", "607634309311793673175"),
-    ("pt_for_sy", "31415926535897932384", "24449216663889075029"),
-    ("sy_for_pt", "31415926535897932384", "39729719318131590744"),
-    ("yt_for_sy", "42424242424242424243", "577864840381007279"),
-    ("sy_for_yt", "42424242424242424243", "763838659317390163843"),
-    ("pt_for_sy", "42424242424242424243", "32968803208510748109"),
-    ("sy_for_pt", "42424242424242424243", "53368023809931934869"),
-    ("yt_for_sy", "60000000000000000007", "446459024695113364"),
-    ("sy_for_yt", "60000000000000000007", "986515844760779650608"),
-    ("pt_for_sy", "60000000000000000007", "46530452264210778224"),
-];
+/// Swaps executed on a mainnet fork at block 25 800 000, shared with the executor's fork test.
+#[derive(serde::Deserialize)]
+struct ExecutedSwaps {
+    executed: Vec<ExecutedSwap>,
+    rejected: Vec<RejectedSwap>,
+}
 
-#[test]
-fn every_market_edge_quotes_what_the_chain_executed() {
-    let state = wsteth_market_at_block_25_800_000();
+#[derive(serde::Deserialize)]
+struct ExecutedSwap {
+    edge: String,
+    amount_in: String,
+    amount_out: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RejectedSwap {
+    edge: String,
+    amount_in: String,
+}
+
+fn executed_swaps() -> ExecutedSwaps {
+    serde_json::from_str(include_str!("tests/fixtures/executed_swaps.json")).unwrap()
+}
+
+/// The tokens an edge name such as `sy_for_pt` trades, in and out.
+fn edge_tokens(edge: &str) -> (Token, Token) {
     let address = |name: &str| match name {
         "sy" => SY,
         "pt" => PT,
         "yt" => YT,
         other => panic!("no token {other}"),
     };
-    for (edge, amount_in, executed) in EXECUTED_AT_BLOCK_25_800_000 {
-        let (token_in, token_out) = edge.split_once("_for_").unwrap();
+    let (token_in, token_out) = edge.split_once("_for_").unwrap();
+    (token(address(token_in), 18), token(address(token_out), 18))
+}
+
+#[test]
+fn every_market_edge_quotes_what_the_chain_executed() {
+    let state = wsteth_market_at_block_25_800_000();
+    let swaps = executed_swaps().executed;
+    assert_eq!(swaps.len(), 39);
+    for swap in swaps {
+        let (token_in, token_out) = edge_tokens(&swap.edge);
         let quote = state
-            .get_amount_out(
-                BigUint::from_str(amount_in).unwrap(),
-                &token(address(token_in), 18),
-                &token(address(token_out), 18),
-            )
-            .unwrap_or_else(|e| panic!("{edge} {amount_in}: {e}"));
-        assert_eq!(quote.amount.to_string(), executed, "{edge} {amount_in}");
+            .get_amount_out(BigUint::from_str(&swap.amount_in).unwrap(), &token_in, &token_out)
+            .unwrap_or_else(|e| panic!("{} {}: {e}", swap.edge, swap.amount_in));
+        assert_eq!(quote.amount.to_string(), swap.amount_out, "{} {}", swap.edge, swap.amount_in);
     }
 }
 
-/// The router's search runs out of range on this input at that block, so the swap reverts.
+/// The router's search runs out of range on these inputs at that block, so the swap reverts.
 #[test]
 fn a_trade_the_chain_rejects_is_rejected() {
-    let error = wsteth_market_at_block_25_800_000()
-        .get_amount_out(
-            BigUint::from_str("60000000000000000007").unwrap(),
-            &token(SY, 18),
-            &token(PT, 18),
-        )
-        .unwrap_err();
-    assert!(matches!(error, SimulationError::InvalidInput(_, None)), "{error:?}");
+    let state = wsteth_market_at_block_25_800_000();
+    for swap in executed_swaps().rejected {
+        let (token_in, token_out) = edge_tokens(&swap.edge);
+        let error = state
+            .get_amount_out(BigUint::from_str(&swap.amount_in).unwrap(), &token_in, &token_out)
+            .unwrap_err();
+        assert!(matches!(error, SimulationError::InvalidInput(_, None)), "{error:?}");
+    }
 }
 
 /// The indexer writes unsigned values with `to_signed_bytes_be`, so one at or above 2^255 carries
