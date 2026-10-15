@@ -50,7 +50,9 @@ params:
 `sy_rate_refresh_blocks=1` reads every block and is what live indexing wants. A backfill from
 `initialBlock` (16032059, the original factory's deployment) issues one batched `eth_call` per
 refresh block and is dominated by that cost, so raise it there — the trade is index freshness for
-backfill time. `0` is rejected rather than reinterpreted.
+backfill time. `0` is rejected rather than reinterpreted. Whatever the interval, a component is
+refreshed on the block it is created, and a market on any block its yield token emits
+`NewInterestIndex`, so neither waits for the next refresh to be quotable.
 
 The trade is freshness only. SY balances are read off chain on any block a `Transfer` moved one,
 not only on refresh blocks, so a coarse interval leaves the PY index stale without leaving balances

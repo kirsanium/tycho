@@ -104,9 +104,15 @@ pub fn map_protocol_changes(
             .add_entity_change(&change);
     }
 
-    for (tx, change) in
-        refresh_live_state(&block, &refresh, &registry_store, &py_index_store, &components_store)
-    {
+    let forced = forced_refresh(&block, &new_components, &components_store);
+    for (tx, change) in refresh_live_state(
+        &block,
+        &refresh,
+        &forced,
+        &registry_store,
+        &py_index_store,
+        &components_store,
+    ) {
         transaction_changes
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(&tx))
@@ -407,6 +413,8 @@ fn fee_changes(
 /// further is needed. No rate is read for those markets themselves — an expired market has no
 /// curve left to price — though their SY is still read, on its own account.
 ///
+/// Off a refresh block, only the components in `forced` are refreshed (see [`forced_refresh`]).
+///
 /// The changes are anchored to the block's last transaction. Every `EntityChanges` reaches the
 /// indexer inside a `TransactionChanges`, but a refresh has no transaction that caused it, and a
 /// fabricated hash would be persisted as though it were real. The last transaction is a genuine
@@ -414,17 +422,28 @@ fn fee_changes(
 fn refresh_live_state(
     block: &eth::Block,
     params: &RefreshParams,
+    forced: &HashSet<String>,
     registry_store: &StoreGetString,
     py_index_store: &StoreGetBigInt,
     components_store: &StoreGetRaw,
 ) -> Vec<(Transaction, EntityChanges)> {
-    if !params.should_refresh(block.number) {
+    let refreshing = params.should_refresh(block.number);
+    if !refreshing && forced.is_empty() {
         return vec![];
     }
+    let in_scope = |id: &str| refreshing || forced.contains(id);
     let Some(registry) = registry_store.get_last(MARKET_REGISTRY) else { return vec![] };
-    let markets = live_markets(&registry, block.timestamp_seconds());
-    let expired = expired_markets(&registry, block.timestamp_seconds());
-    if markets.is_empty() && expired.is_empty() {
+    let markets: Vec<MarketEntry> = live_markets(&registry, block.timestamp_seconds())
+        .into_iter()
+        .filter(|market| in_scope(&market.id))
+        .collect();
+    let expired: Vec<MarketEntry> = expired_markets(&registry, block.timestamp_seconds())
+        .into_iter()
+        .filter(|market| in_scope(&market.id))
+        .collect();
+    let targets = rate_targets(&registry, &markets, components_store, in_scope);
+    // An SY has no expiry, so it is refreshed even when no market is live.
+    if markets.is_empty() && expired.is_empty() && targets.is_empty() {
         return vec![];
     }
     let Some(anchor) = block.transactions().last() else {
@@ -433,7 +452,7 @@ fn refresh_live_state(
     };
     let anchor: Transaction = anchor.into();
 
-    let rates = read_exchange_rates(&rate_targets(&registry, &markets, components_store));
+    let rates = read_exchange_rates(&targets);
     let timestamp = encode_timestamp(block.timestamp_seconds());
     let mut changes = Vec::new();
 
@@ -482,6 +501,37 @@ fn is_read(refreshing: bool, to_read: &HashSet<(String, Vec<u8>)>, sy: &str, tok
     refreshing || to_read.contains(&(sy.to_string(), token.to_vec()))
 }
 
+/// The components refreshed this block whether or not it is a refresh block.
+///
+/// Every component created this block, which has no rate yet: with `sy_rate_refresh_blocks` above
+/// one, it would otherwise go unquotable until the next refresh. And every market whose yield
+/// token emitted `NewInterestIndex`, since `py_index_current` is at least the new stored index and
+/// would otherwise sit below it until the next refresh.
+fn forced_refresh(
+    block: &eth::Block,
+    new_components: &BlockTransactionProtocolComponents,
+    components_store: &StoreGetRaw,
+) -> HashSet<String> {
+    let mut forced: HashSet<String> = new_components
+        .tx_components
+        .iter()
+        .flat_map(|tx| &tx.components)
+        .map(|component| component.id.clone())
+        .collect();
+    for tx in block.transactions() {
+        for log in tx.logs_with_calls().map(|(log, _)| log) {
+            if py_index_stored(log).is_none() {
+                continue;
+            }
+            let Some(market) = components_store.get_last(market_by_yt_key(&log.address)) else {
+                continue;
+            };
+            forced.insert(String::from_utf8(market).expect("market id is not valid utf-8"));
+        }
+    }
+    forced
+}
+
 /// The `(SY, token)` holdings read this block whether or not it is a refresh block: those a
 /// `Transfer` moved, and every holding of an SY created this block, which has no balance yet.
 fn sy_holdings_to_read(
@@ -517,7 +567,7 @@ fn sy_holdings_to_read(
 
 /// The SYs whose `exchangeRate()` is read this block.
 ///
-/// Every SY that is a component, plus the SY of every live market. The two sets overlap almost
+/// Every SY component in scope, plus the SY of every market in `live`. The two sets overlap almost
 /// entirely but neither contains the other: an SY the classifier could not read in either
 /// direction is not a component, yet a live market still needs its rate to price the curve; and
 /// an SY whose markets have all expired is still a wrapper that trades, so it is still refreshed.
@@ -525,10 +575,11 @@ fn rate_targets(
     registry: &str,
     live: &[MarketEntry],
     components_store: &StoreGetRaw,
+    in_scope: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let mut targets: Vec<String> = sy_components(registry)
         .into_iter()
-        .filter(|sy| components_store.has_last(sy))
+        .filter(|sy| in_scope(sy) && components_store.has_last(sy))
         .collect();
     for market in live {
         if !targets.contains(&market.sy) {
