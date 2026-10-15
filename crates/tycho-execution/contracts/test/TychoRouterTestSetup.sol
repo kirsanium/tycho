@@ -308,8 +308,8 @@ contract TychoRouterTestSetup is
         );
         propAMMFallbackExecutor =
             new PropAMMFallbackExecutor(address(propAMMFallbackRouter));
-        // Last, per the note above: Lido V4 is only configured on mainnet, where both Sky and
-        // Native always deploy, so appending it shifts no address before it.
+        // Appended per the note above: Lido V4 is only configured on mainnet, where both Sky and
+        // Native always deploy, so it shifts no address before it.
         lidoV4Executor = new LidoV4Executor(STETH_ADDR, WSTETH_ADDR);
         // PancakeSwap Infinity (Base and BNB share these addresses). The constructor only
         // stores immutables, so it deploys on every fork.
