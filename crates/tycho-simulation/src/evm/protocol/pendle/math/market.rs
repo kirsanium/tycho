@@ -170,8 +170,10 @@ pub fn calc_trade(
         .checked_mul(reserve_fee_percent)
         .ok_or(PendleError::Overflow { operation: "calcTrade reserve" })? /
         percentage_decimals();
-    let net_asset_to_account = pmath::sub_no_neg(pre_fee_asset_to_account, fee)
-        .or_else(|_| Ok::<I256, PendleError>(pre_fee_asset_to_account - fee))?;
+    // A plain subtraction in the contract: negative is the buying direction, not a failure.
+    let net_asset_to_account = pre_fee_asset_to_account
+        .checked_sub(fee)
+        .ok_or(PendleError::Overflow { operation: "calcTrade netAssetToAccount" })?;
 
     // The trader's side rounds against them and the protocol's side rounds toward it, which is
     // why these three conversions do not all use the same helper.
