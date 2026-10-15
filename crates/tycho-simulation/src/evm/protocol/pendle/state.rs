@@ -467,7 +467,7 @@ impl ProtocolSim for PendleState {
                     TokenClass::IndexRate => GAS_WRAP_INDEX_RATE,
                 };
                 let out = state.convert(amount, class, direction, token_decimals)?;
-                let after = state.after(direction, &token_out.address, out);
+                let after = state.after(direction, class, &token_out.address, amount, out)?;
                 (out, gas, PendleState::Sy(after))
             }
         };
@@ -560,8 +560,7 @@ impl ProtocolSim for PendleState {
                 let Some(token_decimals) = state.token_decimals.get(token).copied() else {
                     return Ok(no_depth());
                 };
-                // Redeeming is capped by what the SY holds of the token being paid out, so that
-                // bound lives on the output side and is converted back into an input amount.
+                // Redeeming is capped by the holding the SY pays out of (see `max_redeem_sy`).
                 // Depositing has no reserve behind it at all.
                 match direction {
                     Direction::Deposit => {
@@ -570,8 +569,7 @@ impl ProtocolSim for PendleState {
                         Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
                     }
                     Direction::Redeem => {
-                        let max_in =
-                            state.sy_for_exit(state.held(&buy_token), class, token_decimals)?;
+                        let max_in = state.max_redeem_sy(&buy_token, class, token_decimals)?;
                         // Re-quoted from the input rather than reported as the holding itself.
                         // Both conversions floor, so inverting the holding and converting back can
                         // land a wei short — and a bound whose input does not produce its output
@@ -704,7 +702,7 @@ impl PendleSyState {
         Ok(())
     }
 
-    /// What the SY holds of `token`, which is all it can pay out when redeeming.
+    /// What the SY holds of `token`.
     ///
     /// An unknown balance falls back to the soft limit rather than to zero: reporting no depth for
     /// a token the SY genuinely wraps would hide a real edge, whereas an optimistic bound only
@@ -716,24 +714,89 @@ impl PendleSyState {
             .unwrap_or_else(unbounded_soft_limit)
     }
 
+    /// The `one_to_one` exit token the SY holds the most of, in SY units, with its decimals.
+    ///
+    /// That holding is what an `index_rate` exit is paid from: the SY unwraps it into the exit
+    /// token rather than keeping the exit token itself. SY-wstETH holds wstETH and pays stETH by
+    /// unwrapping it, while its own stETH balance is dust. Only a token whose decimals are known
+    /// can be converted, so one without them is not a backing.
+    fn backing(&self) -> Option<(&Bytes, u32)> {
+        let mut best: Option<(&Bytes, u32, U256)> = None;
+        for (token, class) in &self.tokens_out {
+            if *class != TokenClass::OneToOne {
+                continue;
+            }
+            let Some(decimals) = self.token_decimals.get(token).copied() else { continue };
+            // A holding too large to rescale cannot be the smaller of two candidates, and the
+            // soft limit `held` reports for an unknown balance is far below that.
+            let as_sy = rescale(self.held(token), decimals, self.sy_decimals).unwrap_or(U256::MAX);
+            if best.is_none_or(|(_, _, most)| as_sy > most) {
+                best = Some((token, decimals, as_sy));
+            }
+        }
+        best.map(|(token, decimals, _)| (token, decimals))
+    }
+
+    /// The most SY a redemption into `exit` can take.
+    ///
+    /// A `one_to_one` exit is paid from the SY's own holding of that token. An `index_rate` exit
+    /// is paid by unwrapping the [backing](Self::backing), one SY per backing token, and only
+    /// falls back to the SY's holding of the exit token when it has no backing to unwrap.
+    fn max_redeem_sy(
+        &self,
+        exit: &Bytes,
+        class: TokenClass,
+        exit_decimals: u32,
+    ) -> Result<U256, PendleError> {
+        if class == TokenClass::IndexRate {
+            if let Some((backing, backing_decimals)) = self.backing() {
+                return self.sy_for_exit(self.held(backing), TokenClass::OneToOne, backing_decimals);
+            }
+        }
+        self.sy_for_exit(self.held(exit), class, exit_decimals)
+    }
+
     /// The same wrapper with what a conversion took out of it.
     ///
-    /// Only a redemption moves anything this component tracks: it pays `amount_out` of the exit
-    /// token out of what the SY custodies, which is exactly the bound `get_limits` reports. A
-    /// deposit is not credited back — an `index_rate` SY forwards the token into whatever it
-    /// wraps rather than holding it, so crediting it would invent depth no redemption can draw on.
+    /// Only a redemption moves anything this component tracks, and it draws down the holding that
+    /// [`Self::max_redeem_sy`] bounds it by: the exit token itself, or for an `index_rate` exit
+    /// the backing it unwraps, by `amount_in` SY. A deposit is not credited back. An `index_rate`
+    /// SY forwards the token into whatever it wraps rather than holding it, so crediting it would
+    /// invent depth no redemption can draw on.
     ///
     /// A token with no recorded balance stays absent rather than being written in: `held` reads an
     /// absent balance as the soft limit, and inserting one would turn a missing figure into a
     /// hard, and wrong, bound.
-    fn after(&self, direction: Direction, token_out: &Bytes, amount_out: U256) -> Self {
+    fn after(
+        &self,
+        direction: Direction,
+        class: TokenClass,
+        token_out: &Bytes,
+        amount_in: U256,
+        amount_out: U256,
+    ) -> Result<Self, PendleError> {
         let mut next = self.clone();
-        if direction == Direction::Redeem {
-            if let Some(balance) = next.token_balances.get_mut(token_out) {
-                *balance = balance.saturating_sub(amount_out);
-            }
+        if direction == Direction::Deposit {
+            return Ok(next);
         }
-        next
+        let backing = match class {
+            TokenClass::IndexRate => self.backing(),
+            TokenClass::OneToOne => None,
+        };
+        let (drawn_token, drawn) = match backing {
+            // `amount_in` SY unwraps that many backing tokens, rescaled to their decimals.
+            Some((backing, decimals)) => {
+                (backing.clone(), rescale(amount_in, self.sy_decimals, decimals)?)
+            }
+            None => (token_out.clone(), amount_out),
+        };
+        if let Some(balance) = next
+            .token_balances
+            .get_mut(&drawn_token)
+        {
+            *balance = balance.saturating_sub(drawn);
+        }
+        Ok(next)
     }
 
     /// How much SY it takes to redeem `exit_amount` of an exit token — the inverse of `convert`.

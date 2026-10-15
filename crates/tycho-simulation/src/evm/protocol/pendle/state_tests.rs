@@ -79,10 +79,11 @@ fn wsteth_sy() -> PendleState {
             (Bytes::from_str(WSTETH).unwrap(), TokenClass::OneToOne),
             (Bytes::from_str(STETH).unwrap(), TokenClass::IndexRate),
         ]),
-        // What the SY actually custodies, which is all it can redeem.
+        // `balanceOf(SY)` at block 25 800 000. The wstETH backs the SY's whole supply; the stETH is
+        // dust, since the SY pays stETH out by unwrapping wstETH rather than holding it.
         token_balances: HashMap::from([
-            (Bytes::from_str(WSTETH).unwrap(), u("546768952998816380")),
-            (Bytes::from_str(STETH).unwrap(), u("4")),
+            (Bytes::from_str(WSTETH).unwrap(), u("3248104475002927520625")),
+            (Bytes::from_str(STETH).unwrap(), u("1856")),
         ]),
         token_decimals: HashMap::from([
             (Bytes::from_str(WSTETH).unwrap(), 18),
@@ -657,23 +658,31 @@ fn gas_reflects_the_direction_and_the_wrap_class() {
 /// Redeeming is capped by what the SY holds; depositing is not.
 ///
 /// The two directions of a wrap edge are not symmetric. An SY mints new shares against whatever it
-/// forwards on, so a deposit has no reserve to exhaust — but it can only pay out what it has. The
-/// wstETH SY holds 4 wei of stETH at the indexed block, and that is the whole redeem depth.
+/// forwards on, so a deposit has no reserve to exhaust — but it can only pay out what it has. For
+/// wstETH that is its wstETH holding. For stETH it is the same holding, unwrapped: the SY's own
+/// 1856 wei of stETH is not what pays a stETH redemption.
 #[test]
-fn redeeming_is_bounded_by_holdings_and_depositing_is_not() {
+fn redeeming_is_bounded_by_the_backing_and_depositing_is_not() {
     let sy = Bytes::from_str(SY).unwrap();
     let wsteth = Bytes::from_str(WSTETH).unwrap();
     let steth = Bytes::from_str(STETH).unwrap();
+    let backing = u("3248104475002927520625");
 
-    let (_, redeem_out) = wsteth_sy()
-        .get_limits(sy.clone(), steth.clone())
-        .unwrap();
-    assert_eq!(redeem_out, BigUint::from(4u32), "redeem depth is the SY's own stETH balance");
-
-    let (_, wsteth_out) = wsteth_sy()
+    let (wsteth_in, wsteth_out) = wsteth_sy()
         .get_limits(sy.clone(), wsteth.clone())
         .unwrap();
-    assert_eq!(wsteth_out, BigUint::from(546_768_952_998_816_380u64));
+    assert_eq!(wsteth_in, u256_to_biguint(backing));
+    assert_eq!(wsteth_out, u256_to_biguint(backing));
+
+    let (steth_in, steth_out) = wsteth_sy()
+        .get_limits(sy.clone(), steth.clone())
+        .unwrap();
+    assert_eq!(steth_in, u256_to_biguint(backing), "every SY the wstETH backs can exit as stETH");
+    let quoted = wsteth_sy()
+        .get_amount_out(steth_in, &token(SY, 18), &token(STETH, 18))
+        .unwrap();
+    assert_eq!(steth_out, quoted.amount);
+    assert!(steth_out > u256_to_biguint(backing), "one wstETH unwraps to more than one stETH");
 
     // Depositing is unbounded, and reported as the soft limit rather than a U256 sentinel that
     // would overflow the first multiplication a router did with it.
@@ -681,6 +690,27 @@ fn redeeming_is_bounded_by_holdings_and_depositing_is_not() {
         .get_limits(wsteth, sy)
         .unwrap();
     assert_eq!(deposit_in, BigUint::from(u128::MAX));
+}
+
+/// A stETH redemption unwraps wstETH, so it draws down the wstETH it was paid from — one per SY
+/// redeemed — and leaves the SY's stETH dust where it was.
+#[test]
+fn an_index_rate_redemption_draws_down_the_backing() {
+    let state = wsteth_sy();
+    let wsteth = Bytes::from_str(WSTETH).unwrap();
+    let steth = Bytes::from_str(STETH).unwrap();
+    let PendleState::Sy(before) = &state else { unreachable!() };
+
+    let amount = u("100000000000000000000");
+    let redeemed = quote_after(&state, u256_to_biguint(amount), &token(SY, 18), &token(STETH, 18));
+    let PendleState::Sy(redeemed) = &redeemed else { unreachable!() };
+
+    assert_eq!(redeemed.token_balances[&wsteth], before.token_balances[&wsteth] - amount);
+    assert_eq!(redeemed.token_balances[&steth], before.token_balances[&steth]);
+    let (max_in, _) = PendleState::Sy(redeemed.clone())
+        .get_limits(Bytes::from_str(SY).unwrap(), steth)
+        .unwrap();
+    assert_eq!(max_in, u256_to_biguint(redeemed.token_balances[&wsteth]));
 }
 
 /// Both bounds on a wrap edge are only meaningful if the input they report actually produces the
