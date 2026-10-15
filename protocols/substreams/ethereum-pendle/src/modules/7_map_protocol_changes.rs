@@ -1,11 +1,11 @@
 use anyhow::Result;
 use itertools::Itertools;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use substreams::{
     log,
     pb::substreams::StoreDeltas,
     scalar::BigInt,
-    store::{StoreGet, StoreGetBigInt, StoreGetRaw, StoreGetString},
+    store::{StoreGet, StoreGetBigInt, StoreGetInt64, StoreGetRaw, StoreGetString},
 };
 use substreams_ethereum::{pb::eth::v2 as eth, rpc::RpcBatch};
 use tycho_substreams::{abi::erc20, balances::aggregate_balances_changes, prelude::*};
@@ -13,7 +13,10 @@ use tycho_substreams::{abi::erc20, balances::aggregate_balances_changes, prelude
 use crate::{
     abi::pendle_sy,
     fees::{fan_out, fee_scope, read_market_fees, LN_FEE_RATE_ROOT, RESERVE_FEE_PERCENT},
-    keys::{contract_id, market_by_yt_key, market_tokens_key, py_index_key, MARKET_REGISTRY},
+    keys::{
+        contract_id, market_by_yt_key, market_tokens_key, py_index_key, sy_rate_needed_key,
+        MARKET_REGISTRY,
+    },
     market_state::{
         last_ln_implied_rate, py_index_stored, LAST_LN_IMPLIED_RATE, PY_INDEX_STORED, TOTAL_PT,
         TOTAL_SY,
@@ -40,6 +43,7 @@ pub fn map_protocol_changes(
     registry_store: StoreGetString,
     py_index_store: StoreGetBigInt,
     sy_state: BlockChanges,
+    rate_needed_store: StoreGetInt64,
 ) -> Result<BlockChanges, substreams::errors::Error> {
     let refresh = RefreshParams::parse(&params)?;
     let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
@@ -142,6 +146,7 @@ pub fn map_protocol_changes(
         &registry_store,
         &py_index_store,
         &components_store,
+        &rate_needed_store,
     ) {
         transaction_changes
             .entry(tx.index)
@@ -238,7 +243,11 @@ fn absolute_state_changes(
 ///
 /// A read that fails leaves the accumulated balance in place.
 ///
-/// Costs one `balanceOf` per (SY component, token) per refresh block.
+/// Only SYs behind a live or just-expired market are re-read: that is where the range test checks
+/// balances to the wei. Elsewhere a rebasing token's reported balance drifts until the next
+/// `Transfer` moves it, which no quote notices.
+///
+/// Costs one `balanceOf` per (SY component, token) of those SYs per refresh block.
 fn sy_balances(
     block: &eth::Block,
     params: &RefreshParams,
@@ -252,8 +261,14 @@ fn sy_balances(
     let Some(anchor) = block.transactions().last() else { return vec![] };
     let anchor: Transaction = anchor.into();
 
+    let now = block.timestamp_seconds();
+    let behind_a_market: BTreeSet<String> = live_markets(&registry, now)
+        .into_iter()
+        .chain(expired_markets(&registry, now))
+        .map(|market| market.sy)
+        .collect();
     let mut holdings: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
-    for sy in sy_components(&registry) {
+    for sy in behind_a_market {
         let Some(tokens) = components_store.get_last(&sy) else { continue };
         let tokens: Vec<Vec<u8>> = serde_sibor::from_bytes(&tokens)
             .expect("deserializing component tokens from the component store");
@@ -402,7 +417,8 @@ fn fee_changes(
 ///
 /// Expiry is a market's property, never its SY's: an ERC-5115 wrapper has no maturity and goes on
 /// wrapping after every market that priced against it has died. So the two are refreshed on
-/// different rules — a market's state stops at its expiry, an SY's does not stop at all.
+/// different rules — a market's state stops at its expiry, and an SY's rate is read for as long as
+/// a quote needs it (see [`rate_targets`]).
 ///
 /// The clocks ride along because the curve depends on time through `rateScalar`, `rateAnchor` and
 /// `feeRate` — a quote is only valid for the timestamp it was computed for, and a market that has
@@ -434,6 +450,7 @@ fn refresh_live_state(
     registry_store: &StoreGetString,
     py_index_store: &StoreGetBigInt,
     components_store: &StoreGetRaw,
+    rate_needed_store: &StoreGetInt64,
 ) -> Vec<(Transaction, EntityChanges)> {
     let refreshing = params.should_refresh(block.number);
     if !refreshing && forced.is_empty() {
@@ -449,7 +466,7 @@ fn refresh_live_state(
         .into_iter()
         .filter(|market| in_scope(&market.id))
         .collect();
-    let targets = rate_targets(&registry, &markets, components_store, in_scope);
+    let targets = rate_targets(&registry, &markets, components_store, rate_needed_store, in_scope);
     // An SY has no expiry, so it is refreshed even when no market is live.
     if markets.is_empty() && expired.is_empty() && targets.is_empty() {
         return vec![];
@@ -535,19 +552,27 @@ fn forced_refresh(
 
 /// The SYs whose `exchangeRate()` is read this block.
 ///
-/// Every SY component in scope, plus the SY of every market in `live`. The two sets overlap almost
-/// entirely but neither contains the other: an SY the classifier could not read in either
-/// direction is not a component, yet a live market still needs its rate to price the curve; and
-/// an SY whose markets have all expired is still a wrapper that trades, so it is still refreshed.
+/// The SY of every market in `live`, whose curve prices off the rate, plus every SY component in
+/// scope that has a rate-converted token. A `one_to_one` conversion never looks at the rate, so an
+/// SY whose tokens are all `one_to_one` and whose markets have all expired is not read at all.
+/// The SY of a live market may not be a component (the classifier could not read it in either
+/// direction), yet the market still needs its rate.
 fn rate_targets(
     registry: &str,
     live: &[MarketEntry],
     components_store: &StoreGetRaw,
+    rate_needed_store: &StoreGetInt64,
     in_scope: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let mut targets: Vec<String> = sy_components(registry)
         .into_iter()
-        .filter(|sy| in_scope(sy) && components_store.has_last(sy))
+        .filter(|sy| {
+            in_scope(sy) &&
+                components_store.has_last(sy) &&
+                rate_needed_store
+                    .get_last(sy_rate_needed_key(sy))
+                    .is_some_and(|needed| needed != 0)
+        })
         .collect();
     for market in live {
         if !targets.contains(&market.sy) {

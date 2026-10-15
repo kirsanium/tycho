@@ -36,6 +36,8 @@ mod store_py_index;
 mod store_balances;
 #[path = "6_store_market_reserves.rs"]
 mod store_market_reserves;
+#[path = "6_store_sy_rate_needed.rs"]
+mod store_sy_rate_needed;
 
 // Stage 7
 #[path = "7_map_protocol_changes.rs"]
@@ -52,4 +54,5 @@ pub use store_market_registry::store_market_registry;
 pub use store_market_reserves::store_market_reserves;
 pub use store_protocol_components::store_protocol_components;
 pub use store_py_index::store_py_index;
+pub use store_sy_rate_needed::store_sy_rate_needed;
 pub use store_sy_seen::store_sy_seen;

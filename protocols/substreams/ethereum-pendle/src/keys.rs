@@ -29,3 +29,8 @@ pub const MARKET_REGISTRY: &str = "markets";
 pub fn py_index_key(component_id: &str) -> String {
     format!("py_index:{component_id}")
 }
+
+/// Whether an SY has a token converted at its exchange rate, and so needs that rate read.
+pub fn sy_rate_needed_key(sy_id: &str) -> String {
+    format!("rate_needed:{sy_id}")
+}
