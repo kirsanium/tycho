@@ -23,7 +23,7 @@
 //! the implied rate the next trade is anchored on — so a caller sizing or splitting a trade prices
 //! each leg against the depth the one before it left.
 
-use std::{any::Any, collections::HashMap, fmt::Debug};
+use std::{any::Any, collections::HashMap, fmt, fmt::Debug};
 
 use alloy::primitives::{I256, U256};
 use num_bigint::BigUint;
@@ -419,18 +419,20 @@ impl ProtocolSim for PendleState {
     /// Priced off a real trade rather than a closed form, so the number agrees with what a caller
     /// would actually get, fee included. One whole unit of `quote` is small against every live
     /// market's depth.
+    /// The price of `base` in `quote`, from the buying side as the trait defines it: what a small
+    /// trade of `quote` into `base` pays per unit.
+    ///
+    /// Not every component trades both ways. An SY can accept a token it never pays out, and a
+    /// redemption the SY holds nothing for has no depth, while the other direction trades. When
+    /// buying `base` does not quote, the price comes from selling it instead, as `quote` received
+    /// per unit of `base`. A wrap edge charges no fee, so the two sides give the same price.
     fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
-        let one_quote = BigUint::from(10u32).pow(quote.decimals);
-        let bought = self.get_amount_out(one_quote, quote, base)?;
-        let base_out = biguint_to_f64(&bought.amount) / 10f64.powi(base.decimals as i32);
-        if base_out == 0.0 {
-            return Err(SimulationError::FatalError(format!(
-                "one unit of {} buys no {}, so there is no spot price",
-                quote.address, base.address
-            )));
+        match self.marginal_rate(quote, base) {
+            Ok(base_per_quote) => Ok(1.0 / base_per_quote),
+            Err(buying) => self
+                .marginal_rate(base, quote)
+                .map_err(|_| buying),
         }
-        // One unit of quote bought `base_out` base, so one base costs `1 / base_out` quote.
-        Ok(1.0 / base_out)
     }
 
     fn get_amount_out(
@@ -441,6 +443,12 @@ impl ProtocolSim for PendleState {
     ) -> Result<GetAmountOutResult, SimulationError> {
         if amount_in == BigUint::from(0u32) {
             return Err(SimulationError::InvalidInput("amount_in is zero".to_string(), None));
+        }
+        if amount_in.bits() > 256 {
+            return Err(SimulationError::InvalidInput(
+                format!("amount_in {amount_in} does not fit in 256 bits"),
+                None,
+            ));
         }
         let amount = biguint_to_u256(&amount_in);
 
@@ -616,9 +624,10 @@ impl ProtocolSim for PendleState {
                     .get(&state.component_id)
                 {
                     for (token, balance) in held {
+                        let balance = u256_from_be(balance, &format!("balance of {token}"))?;
                         state
                             .token_balances
-                            .insert(token.clone(), U256::from_be_slice(balance));
+                            .insert(token.clone(), balance);
                     }
                 }
                 state.apply(&delta)
@@ -650,6 +659,32 @@ impl ProtocolSim for PendleState {
         params: &tycho_common::simulation::protocol_sim::QueryPoolSwapParams,
     ) -> Result<tycho_common::simulation::protocol_sim::PoolSwap, SimulationError> {
         crate::evm::query_pool_swap::query_pool_swap(self, params)
+    }
+}
+
+impl PendleState {
+    /// Units of `token_out` a small trade returns per unit of `token_in`.
+    ///
+    /// Probes with a thousandth of the depth, capped at one unit: small enough to stay inside the
+    /// limit on a shallow market and to leave out most of the price impact, large enough that the
+    /// output is not lost to rounding. A direction reporting no depth is probed with one unit and
+    /// answers if the quote does: an SY's conversion rate exists even when it holds nothing to pay.
+    fn marginal_rate(&self, token_in: &Token, token_out: &Token) -> Result<f64, SimulationError> {
+        let one_unit = BigUint::from(10u32).pow(token_in.decimals);
+        let (max_in, _) = self.get_limits(token_in.address.clone(), token_out.address.clone())?;
+        let within_depth = max_in / 1000u32;
+        let probe =
+            if within_depth == BigUint::from(0u32) { one_unit } else { one_unit.min(within_depth) };
+        let quoted = self.get_amount_out(probe.clone(), token_in, token_out)?;
+        let amount_in = biguint_to_f64(&probe) / 10f64.powi(token_in.decimals as i32);
+        let amount_out = biguint_to_f64(&quoted.amount) / 10f64.powi(token_out.decimals as i32);
+        if amount_out == 0.0 {
+            return Err(SimulationError::FatalError(format!(
+                "{probe} of {} returns no {}, so there is no rate",
+                token_in.address, token_out.address
+            )));
+        }
+        Ok(amount_out / amount_in)
     }
 }
 
@@ -873,10 +908,47 @@ fn no_depth() -> (BigUint, BigUint) {
 }
 
 /// Reads an attribute as a big-endian unsigned integer.
-pub(super) fn attribute_u256(attributes: &HashMap<String, Bytes>, name: &str) -> Option<U256> {
+pub(super) fn attribute_u256(
+    attributes: &HashMap<String, Bytes>,
+    name: &str,
+) -> Result<Option<U256>, ValueTooWide> {
     attributes
         .get(name)
-        .map(|raw| U256::from_be_slice(raw))
+        .map(|raw| u256_from_be(raw, name))
+        .transpose()
+}
+
+/// A big-endian value that does not fit in 256 bits.
+#[derive(Debug)]
+pub(super) struct ValueTooWide {
+    name: String,
+    len: usize,
+}
+
+impl fmt::Display for ValueTooWide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} is {} bytes, more than a 256-bit value holds", self.name, self.len)
+    }
+}
+
+impl From<ValueTooWide> for TransitionError {
+    fn from(error: ValueTooWide) -> Self {
+        TransitionError::DecodeError(error.to_string())
+    }
+}
+
+/// Reads a big-endian unsigned value, which may carry leading zero bytes past 32: the indexer
+/// writes unsigned values with `to_signed_bytes_be`, so anything at or above 2^255 arrives as 33
+/// bytes with a leading zero.
+pub(super) fn u256_from_be(raw: &[u8], name: &str) -> Result<U256, ValueTooWide> {
+    let significant = &raw[raw
+        .iter()
+        .take_while(|byte| **byte == 0)
+        .count()..];
+    if significant.len() > 32 {
+        return Err(ValueTooWide { name: name.to_string(), len: raw.len() });
+    }
+    Ok(U256::from_be_slice(significant))
 }
 
 /// Reads an attribute as a big-endian signed integer.
@@ -907,26 +979,26 @@ impl PendleMarketState {
         if let Some(value) = attribute_i256(attributes, "total_sy") {
             self.market.total_sy = value;
         }
-        if let Some(value) = attribute_u256(attributes, "last_ln_implied_rate") {
+        if let Some(value) = attribute_u256(attributes, "last_ln_implied_rate")? {
             self.market.last_ln_implied_rate = value;
         }
-        if let Some(value) = attribute_u256(attributes, "ln_fee_rate_root") {
+        if let Some(value) = attribute_u256(attributes, "ln_fee_rate_root")? {
             self.market.ln_fee_rate_root = value;
         }
-        if let Some(value) = attribute_u256(attributes, "reserve_fee_percent") {
+        if let Some(value) = attribute_u256(attributes, "reserve_fee_percent")? {
             self.market.reserve_fee_percent = value;
         }
-        if let Some(value) = attribute_u256(attributes, "py_index_current") {
+        if let Some(value) = attribute_u256(attributes, "py_index_current")? {
             self.py_index = value;
         }
-        if let Some(value) = attribute_u256(attributes, "rate_sampled_at") {
+        if let Some(value) = attribute_u256(attributes, "rate_sampled_at")? {
             self.rate_sampled_at = value.saturating_to();
         }
         // The Substreams refresh emits this on every refresh block whether or not the rate
         // resolved, which is what lets a delta move the head at all — a `ProtocolStateDelta`
         // carries no header. It therefore advances only as often as `sy_rate_refresh_blocks`
         // allows, so the staleness guard under-fires between refreshes at any coarser setting.
-        if let Some(value) = attribute_u256(attributes, "block_timestamp") {
+        if let Some(value) = attribute_u256(attributes, "block_timestamp")? {
             self.head_timestamp = value.saturating_to();
         }
         Ok(())
@@ -940,13 +1012,20 @@ mod tests;
 impl PendleSyState {
     fn apply(&mut self, delta: &ProtocolStateDelta) -> Result<(), TransitionError> {
         let attributes = &delta.updated_attributes;
-        if let Some(value) = attribute_u256(attributes, "sy_exchange_rate") {
+        if let Some(value) = attribute_u256(attributes, "sy_exchange_rate")? {
+            // The decoder rejects a zero rate too. Every conversion divides by it.
+            if value.is_zero() {
+                return Err(TransitionError::DecodeError(format!(
+                    "SY {} reported an exchange rate of zero",
+                    self.sy_address
+                )));
+            }
             self.exchange_rate = value;
         }
-        if let Some(value) = attribute_u256(attributes, "rate_sampled_at") {
+        if let Some(value) = attribute_u256(attributes, "rate_sampled_at")? {
             self.rate_sampled_at = value.saturating_to();
         }
-        if let Some(value) = attribute_u256(attributes, "block_timestamp") {
+        if let Some(value) = attribute_u256(attributes, "block_timestamp")? {
             self.head_timestamp = value.saturating_to();
         }
         Ok(())

@@ -607,6 +607,10 @@ fn a_deposit_only_token_still_prices() {
             .tokens_in
             .insert(weth.address.clone(), TokenClass::IndexRate);
         inner.tokens_out.remove(&weth.address);
+        // The decoder records the decimals of every token the stream carries.
+        inner
+            .token_decimals
+            .insert(weth.address.clone(), 18);
     }
 
     let price = state.spot_price(&sy, &weth).unwrap();
@@ -1005,4 +1009,105 @@ fn a_trade_the_chain_rejects_is_rejected() {
         )
         .unwrap_err();
     assert!(matches!(error, SimulationError::InvalidInput(_, None)), "{error:?}");
+}
+
+/// The indexer writes unsigned values with `to_signed_bytes_be`, so one at or above 2^255 carries
+/// a leading zero byte and is 33 bytes long. Only a value with more than 32 significant bytes is
+/// malformed.
+#[test]
+fn a_value_is_read_past_its_sign_byte_but_not_past_256_bits() {
+    let mut top_bit = vec![0u8, 0x80];
+    top_bit.extend([0u8; 31]);
+    assert_eq!(u256_from_be(&top_bit, "rate").unwrap(), U256::from(1u8) << 255);
+
+    let mut too_wide = vec![1u8];
+    too_wide.extend([0u8; 32]);
+    assert!(u256_from_be(&too_wide, "rate").is_err());
+}
+
+#[test]
+fn an_amount_wider_than_256_bits_is_invalid_input() {
+    let error = wsteth_market(1_700_000_000)
+        .get_amount_out(BigUint::from(1u8) << 256, &token(SY, 18), &token(PT, 18))
+        .unwrap_err();
+    assert!(matches!(error, SimulationError::InvalidInput(_, None)), "{error:?}");
+}
+
+#[test]
+fn a_delta_with_a_zero_exchange_rate_is_rejected() {
+    let mut state = wsteth_sy();
+    let delta = ProtocolStateDelta {
+        component_id: SY.to_string(),
+        updated_attributes: HashMap::from([("sy_exchange_rate".to_string(), Bytes::from(vec![0]))]),
+        ..Default::default()
+    };
+    let error = state
+        .delta_transition(delta, &HashMap::new(), &Balances::default())
+        .unwrap_err();
+    assert!(matches!(error, TransitionError::DecodeError(_)), "{error:?}");
+}
+
+/// On a market too shallow to fill a whole unit, the price is still answered, from a probe inside
+/// the depth.
+#[test]
+fn a_shallow_market_still_has_a_spot_price() {
+    let PendleState::Market(mut shallow) = wsteth_market(1_700_000_000) else { unreachable!() };
+    shallow.market.total_pt /= I256::try_from(1_000_000).unwrap();
+    shallow.market.total_sy /= I256::try_from(1_000_000).unwrap();
+    let state = PendleState::Market(shallow);
+    let one = BigUint::from(1_000_000_000_000_000_000u64);
+    assert!(state
+        .get_amount_out(one, &token(SY, 18), &token(YT, 18))
+        .is_err());
+
+    let price = state
+        .spot_price(&token(YT, 18), &token(SY, 18))
+        .unwrap();
+    let deep = wsteth_market(1_700_000_000)
+        .spot_price(&token(YT, 18), &token(SY, 18))
+        .unwrap();
+    assert!((price - deep).abs() / deep < 0.01, "shallow {price} against deep {deep}");
+}
+
+/// A redemption the SY holds nothing for has no depth, but its conversion rate is still a price.
+#[test]
+fn a_direction_without_depth_still_has_a_spot_price() {
+    let mut state = wsteth_sy();
+    if let PendleState::Sy(inner) = &mut state {
+        inner
+            .token_balances
+            .insert(Bytes::from_str(WSTETH).unwrap(), U256::ZERO);
+    }
+    let (max_in, _) = state
+        .get_limits(Bytes::from_str(SY).unwrap(), Bytes::from_str(WSTETH).unwrap())
+        .unwrap();
+    assert_eq!(max_in, BigUint::ZERO);
+
+    let price = state
+        .spot_price(&token(WSTETH, 18), &token(SY, 18))
+        .unwrap();
+    assert!((price - 1.0).abs() < 1e-9, "{price}");
+}
+
+/// A token the SY accepts but never pays out still prices in the direction that trades, which is
+/// every direction a caller enumerates and finds depth in.
+#[test]
+fn a_deposit_only_token_prices_in_the_direction_it_trades() {
+    let weth = token("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", 18);
+    let sy = token(SY, 18);
+    let mut state = wsteth_sy();
+    if let PendleState::Sy(inner) = &mut state {
+        inner
+            .tokens_in
+            .insert(weth.address.clone(), TokenClass::IndexRate);
+        inner.tokens_out.remove(&weth.address);
+        inner
+            .token_decimals
+            .insert(weth.address.clone(), 18);
+    }
+
+    // WETH -> SY trades, SY -> WETH does not.
+    let price = state.spot_price(&weth, &sy).unwrap();
+    // One WETH wraps into 1 / exchange_rate SY.
+    assert!((price - 1.0 / 1.241884).abs() < 1e-6, "{price}");
 }

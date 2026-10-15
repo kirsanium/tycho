@@ -25,7 +25,8 @@ use super::{
     clock::NEVER_SAMPLED,
     math::market::MarketState,
     state::{
-        attribute_i256, attribute_u256, PendleMarketState, PendleState, PendleSyState, TokenClass,
+        attribute_i256, attribute_u256, u256_from_be, PendleMarketState, PendleState,
+        PendleSyState, TokenClass, ValueTooWide,
     },
 };
 use crate::protocol::{
@@ -53,6 +54,12 @@ const ATTR_ASSET_DECIMALS: &str = "asset_decimals";
 const ATTR_SY_EXCHANGE_RATE: &str = "sy_exchange_rate";
 const ATTR_TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
 const ATTR_TOKEN_OUT_CLASS_PREFIX: &str = "token_out_class_0x";
+
+impl From<ValueTooWide> for InvalidSnapshotError {
+    fn from(error: ValueTooWide) -> Self {
+        InvalidSnapshotError::ValueError(error.to_string())
+    }
+}
 
 fn missing(name: &str) -> InvalidSnapshotError {
     InvalidSnapshotError::MissingAttribute(name.to_string())
@@ -101,7 +108,7 @@ fn decode_market(
 
     let scalar_root =
         attribute_i256(statics, ATTR_SCALAR_ROOT).ok_or_else(|| missing(ATTR_SCALAR_ROOT))?;
-    let expiry = attribute_u256(statics, ATTR_EXPIRY)
+    let expiry = attribute_u256(statics, ATTR_EXPIRY)?
         .ok_or_else(|| missing(ATTR_EXPIRY))?
         .saturating_to::<u64>();
 
@@ -110,10 +117,10 @@ fn decode_market(
     let total_pt = attribute_i256(state, ATTR_TOTAL_PT).unwrap_or(I256::ZERO);
     let total_sy = attribute_i256(state, ATTR_TOTAL_SY).unwrap_or(I256::ZERO);
     let last_ln_implied_rate =
-        attribute_u256(state, ATTR_LAST_LN_IMPLIED_RATE).unwrap_or(U256::ZERO);
-    let ln_fee_rate_root = attribute_u256(state, ATTR_LN_FEE_RATE_ROOT)
+        attribute_u256(state, ATTR_LAST_LN_IMPLIED_RATE)?.unwrap_or(U256::ZERO);
+    let ln_fee_rate_root = attribute_u256(state, ATTR_LN_FEE_RATE_ROOT)?
         .ok_or_else(|| missing(ATTR_LN_FEE_RATE_ROOT))?;
-    let reserve_fee_percent = attribute_u256(state, ATTR_RESERVE_FEE_PERCENT)
+    let reserve_fee_percent = attribute_u256(state, ATTR_RESERVE_FEE_PERCENT)?
         .ok_or_else(|| missing(ATTR_RESERVE_FEE_PERCENT))?;
 
     // The live index, not the stored one. `py_index_stored` is a floor that drifts below the rate
@@ -166,10 +173,10 @@ fn decode_sy(
         InvalidSnapshotError::ValueError(format!("SY component id is not an address: {e}"))
     })?;
 
-    let sy_decimals = attribute_u256(statics, ATTR_SY_DECIMALS)
+    let sy_decimals = attribute_u256(statics, ATTR_SY_DECIMALS)?
         .ok_or_else(|| missing(ATTR_SY_DECIMALS))?
         .saturating_to::<u32>();
-    let asset_decimals = attribute_u256(statics, ATTR_ASSET_DECIMALS)
+    let asset_decimals = attribute_u256(statics, ATTR_ASSET_DECIMALS)?
         .ok_or_else(|| missing(ATTR_ASSET_DECIMALS))?
         .saturating_to::<u32>();
 
@@ -196,8 +203,11 @@ fn decode_sy(
         .state
         .balances
         .iter()
-        .map(|(token, balance)| (token.clone(), U256::from_be_slice(balance)))
-        .collect();
+        .map(|(token, balance)| {
+            u256_from_be(balance, &format!("balance of {token}"))
+                .map(|value| (token.clone(), value))
+        })
+        .collect::<Result<_, _>>()?;
 
     // Every bound on a wrap edge converts between a token amount and an SY amount, so the token's
     // own decimals are state the quote depends on. Taken from the stream's token set rather than
@@ -238,10 +248,10 @@ fn rate_reading(
     state: &HashMap<String, Bytes>,
     rate_name: &str,
 ) -> Result<(U256, u64), InvalidSnapshotError> {
-    let Some(rate) = attribute_u256(state, rate_name) else {
+    let Some(rate) = attribute_u256(state, rate_name)? else {
         return Ok((U256::ZERO, NEVER_SAMPLED));
     };
-    let rate_sampled_at = attribute_u256(state, ATTR_RATE_SAMPLED_AT)
+    let rate_sampled_at = attribute_u256(state, ATTR_RATE_SAMPLED_AT)?
         .ok_or_else(|| missing(ATTR_RATE_SAMPLED_AT))?
         .saturating_to::<u64>();
     Ok((rate, rate_sampled_at))
