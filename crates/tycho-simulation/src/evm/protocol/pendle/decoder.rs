@@ -25,8 +25,8 @@ use super::{
     clock::NEVER_SAMPLED,
     math::market::MarketState,
     state::{
-        attribute_i256, attribute_u256, u256_from_be, PendleMarketState, PendleState,
-        PendleSyState, TokenClass, ValueTooWide,
+        attribute_i256, attribute_u256, PendleMarketState, PendleState, PendleSyState, TokenClass,
+        ValueTooWide, PAUSED, SY_TOTAL_SUPPLY, TOKEN_IN_CLASS_PREFIX, TOKEN_OUT_CLASS_PREFIX,
     },
 };
 use crate::protocol::{
@@ -52,8 +52,6 @@ const ATTR_RATE_SAMPLED_AT: &str = "rate_sampled_at";
 const ATTR_SY_DECIMALS: &str = "sy_decimals";
 const ATTR_ASSET_DECIMALS: &str = "asset_decimals";
 const ATTR_SY_EXCHANGE_RATE: &str = "sy_exchange_rate";
-const ATTR_TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
-const ATTR_TOKEN_OUT_CLASS_PREFIX: &str = "token_out_class_0x";
 
 impl From<ValueTooWide> for InvalidSnapshotError {
     fn from(error: ValueTooWide) -> Self {
@@ -187,35 +185,34 @@ fn decode_sy(
         )));
     }
 
-    // One attribute per quotable token, named for the direction and the token. A token the indexer
-    // could not classify has no attribute here and is simply not quotable.
-    let tokens_in = token_classes(statics, ATTR_TOKEN_IN_CLASS_PREFIX)?;
-    let tokens_out = token_classes(statics, ATTR_TOKEN_OUT_CLASS_PREFIX)?;
+    // One state attribute per quotable token, named for the direction and the token. A token the
+    // indexer could not classify has no attribute here and is simply not quotable. They are state
+    // because an upgrade can change them.
+    let tokens_in = token_classes(state, TOKEN_IN_CLASS_PREFIX)?;
+    let tokens_out = token_classes(state, TOKEN_OUT_CLASS_PREFIX)?;
     if tokens_in.is_empty() && tokens_out.is_empty() {
         return Err(InvalidSnapshotError::ValueError(format!(
             "SY {sy_address} declares no quotable tokens in either direction"
         )));
     }
 
-    // What the SY holds is what it can pay out when redeeming, so the balances are state the
-    // quote depends on, not bookkeeping.
-    let token_balances = snapshot
-        .state
-        .balances
-        .iter()
-        .map(|(token, balance)| {
-            u256_from_be(balance, &format!("balance of {token}"))
-                .map(|value| (token.clone(), value))
-        })
-        .collect::<Result<_, _>>()?;
+    // Supply bounds every redemption, and is emitted with the SY at creation.
+    let total_supply =
+        attribute_u256(state, SY_TOTAL_SUPPLY)?.ok_or_else(|| missing(SY_TOTAL_SUPPLY))?;
+    let paused = !attribute_u256(state, PAUSED)?
+        .ok_or_else(|| missing(PAUSED))?
+        .is_zero();
 
     // Every bound on a wrap edge converts between a token amount and an SY amount, so the token's
     // own decimals are state the quote depends on. Taken from the stream's token set rather than
     // from an attribute: the indexer does not publish them, and a token it does not carry is not
-    // routable anyway — such a token is simply absent here and its edges report no depth.
-    let token_decimals = tokens_in
-        .keys()
-        .chain(tokens_out.keys())
+    // routable anyway — such a token is simply absent here and its edges report no depth. Every
+    // listed token is looked up, not only today's classified ones, since an upgrade can classify
+    // another.
+    let token_decimals = snapshot
+        .component
+        .tokens
+        .iter()
         .filter_map(|token| {
             all_tokens
                 .get(token)
@@ -225,9 +222,9 @@ fn decode_sy(
 
     Ok(PendleSyState {
         sy_address,
-        token_balances,
+        total_supply,
+        paused,
         token_decimals,
-        component_id: snapshot.component.id.clone(),
         exchange_rate,
         rate_sampled_at,
         head_timestamp: block.timestamp,
@@ -300,6 +297,7 @@ mod tests {
     const PT: &str = "0xb253eff1104802b97ac7e3ac9fdd73aece295a2c";
     const YT: &str = "0x04b7fa1e727d7290d6e24fa9b426d0c940283a95";
     const WSTETH: &str = "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0";
+    const STETH: &str = "0xae7ab96520de3a18e5e111b5eaab095312d7fe84";
     const HEAD: u64 = 1_800_000_000;
 
     fn word(value: u128) -> Bytes {
@@ -365,24 +363,43 @@ mod tests {
         )
     }
 
+    /// An SY as the indexer emits it at creation: its classes, supply and pause flag are state.
     fn created_sy() -> ComponentWithState {
-        snapshot(
+        let mut sy = snapshot(
             SY,
             SY_TYPE,
             HashMap::from([
                 (ATTR_SY_DECIMALS.to_string(), word(18)),
                 (ATTR_ASSET_DECIMALS.to_string(), word(18)),
-                (
-                    format!("{ATTR_TOKEN_IN_CLASS_PREFIX}{}", &WSTETH[2..]),
-                    Bytes::from(b"one_to_one".to_vec()),
-                ),
-                (
-                    format!("{ATTR_TOKEN_OUT_CLASS_PREFIX}{}", &WSTETH[2..]),
-                    Bytes::from(b"one_to_one".to_vec()),
-                ),
             ]),
-            HashMap::new(),
-        )
+            HashMap::from([
+                (
+                    format!("{TOKEN_IN_CLASS_PREFIX}{}", &WSTETH[2..]),
+                    Bytes::from(b"one_to_one".to_vec()),
+                ),
+                (
+                    format!("{TOKEN_OUT_CLASS_PREFIX}{}", &WSTETH[2..]),
+                    Bytes::from(b"one_to_one".to_vec()),
+                ),
+                (SY_TOTAL_SUPPLY.to_string(), word(1_000_000_000_000_000_000_000)),
+                (PAUSED.to_string(), Bytes::from(vec![0])),
+            ]),
+        );
+        sy.component.tokens = vec![address_bytes(SY), address_bytes(WSTETH)];
+        sy
+    }
+
+    /// Supply bounds every redemption, so an SY without it cannot be decoded.
+    #[tokio::test]
+    async fn an_sy_without_its_supply_is_rejected() {
+        let mut sy = created_sy();
+        sy.state
+            .attributes
+            .remove(SY_TOTAL_SUPPLY);
+        assert!(matches!(
+            decode(sy).await,
+            Err(InvalidSnapshotError::MissingAttribute(name)) if name == SY_TOTAL_SUPPLY
+        ));
     }
 
     async fn decode(snapshot: ComponentWithState) -> Result<PendleState, InvalidSnapshotError> {
@@ -487,15 +504,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_sy_whose_rate_was_never_read_decodes_and_waits_for_it() {
-        let mut state = decode(created_sy()).await.unwrap();
+    async fn an_sy_whose_rate_was_never_read_quotes_only_its_one_to_one_edges() {
+        let mut sy = created_sy();
+        sy.state.attributes.insert(
+            format!("{TOKEN_IN_CLASS_PREFIX}{}", &STETH[2..]),
+            Bytes::from(b"index_rate".to_vec()),
+        );
+        sy.component
+            .tokens
+            .push(address_bytes(STETH));
+        let mut state = decode(sy).await.unwrap();
+
+        // A `one_to_one` wrap is a decimal rescale and never reads the rate.
+        let quote = state
+            .get_amount_out(one(), &token(WSTETH), &token(SY))
+            .unwrap();
+        assert_eq!(quote.amount, one(), "wstETH wraps one to one");
 
         let (max_in, _) = state
-            .get_limits(address_bytes(WSTETH), address_bytes(SY))
+            .get_limits(address_bytes(STETH), address_bytes(SY))
             .unwrap();
         assert_eq!(max_in, BigUint::ZERO);
         assert!(matches!(
-            state.get_amount_out(one(), &token(WSTETH), &token(SY)),
+            state.get_amount_out(one(), &token(STETH), &token(SY)),
             Err(SimulationError::RecoverableError(_))
         ));
 
@@ -513,10 +544,9 @@ mod tests {
                 &Balances::default(),
             )
             .unwrap();
-        let quote = state
-            .get_amount_out(one(), &token(WSTETH), &token(SY))
-            .unwrap();
-        assert_eq!(quote.amount, one(), "wstETH wraps one to one");
+        assert!(state
+            .get_amount_out(one(), &token(STETH), &token(SY))
+            .is_ok());
     }
 
     /// The refresh emits the two together, so one without the other is a broken stream rather

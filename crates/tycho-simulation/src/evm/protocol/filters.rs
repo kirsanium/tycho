@@ -252,8 +252,8 @@ fn has_unsupported_asset_type(attrs: &HashMap<String, Bytes>) -> bool {
 /// Drops Pendle SY components with no quotable conversion in either direction.
 ///
 /// An SY the indexer could not classify contributes no wrap edges at all, so it would decode and
-/// then fail on every call. Whether a token is quotable is fixed at component creation, which is
-/// what makes it a filter rather than a runtime check.
+/// then fail on every call. The classes are state, since an upgrade can change them; this looks
+/// at them as the snapshot holds them.
 ///
 /// Expired markets are deliberately **not** filtered here. Expiry is state, not configuration: it
 /// depends on the block being quoted, and a filter only sees the component. Testing it against
@@ -265,8 +265,8 @@ pub fn pendle_filter(component: &ComponentWithState) -> bool {
         return true;
     }
     component
-        .component
-        .static_attributes
+        .state
+        .attributes
         .keys()
         .any(|name| name.starts_with("token_in_class_") || name.starts_with("token_out_class_"))
 }
