@@ -68,6 +68,7 @@ use crate::evm::protocol::u256_num::{biguint_to_u256, u256_to_biguint, u256_to_f
 /// | SY to YT | 385,413 | 425,000 |
 /// | YT to SY | 304,325 | 335,000 |
 /// | wrap, `one_to_one` | 80,206 / 77,603 | 90,000 |
+/// | wrap, `index_rate` (stETH in / out) | 164,709 / 152,414 | 180,000 |
 const GAS_SY_FOR_PT: u64 = 330_000;
 const GAS_PT_FOR_SY: u64 = 235_000;
 const GAS_SY_FOR_YT: u64 = 425_000;
@@ -78,10 +79,9 @@ const GAS_YT_FOR_SY: u64 = 335_000;
 const GAS_WRAP_ONE_TO_ONE: u64 = 90_000;
 
 /// An `index_rate` wrap reads through to whatever protocol the SY wraps — an ERC-4626 vault, a
-/// staking contract — and costs whatever that costs. **No `index_rate` SY has been measured**, so
-/// this keeps the original conservative figure rather than extrapolating from the wrapper case.
-/// The class is known at quote time, so the two are charged separately instead of averaging a
-/// measured number with a guess.
+/// staking contract — and costs whatever that costs. Measured on the wstETH SY's stETH legs, which
+/// wrap and unwrap through wstETH; another wrapped protocol can cost more or less. The class is
+/// known at quote time, so the two classes are charged separately.
 const GAS_WRAP_INDEX_RATE: u64 = 180_000;
 
 /// How an SY converts a given token, as classified at component creation.
