@@ -438,6 +438,99 @@ contract PendleExecutorTest is Constants, TestUtils {
         );
     }
 
+    string constant EXECUTED_SWAPS =
+        "../../tycho-simulation/src/evm/protocol/pendle/tests/fixtures/executed_swaps.json";
+
+    /// The edge and tokens an edge name from the fixture, such as `sy_for_pt`, stands for.
+    function _fixtureEdge(string memory name)
+        internal
+        view
+        returns (PendleEdge edge, address tokenIn, address tokenOut)
+    {
+        bytes32 key = keccak256(bytes(name));
+        address syAddr = PENDLE_WSTETH_SY;
+        if (key == keccak256("sy_for_pt")) {
+            return (PendleEdge.SyForPt, syAddr, PENDLE_WSTETH_PT);
+        }
+        if (key == keccak256("pt_for_sy")) {
+            return (PendleEdge.PtForSy, PENDLE_WSTETH_PT, syAddr);
+        }
+        if (key == keccak256("sy_for_yt")) {
+            return (PendleEdge.SyForYt, syAddr, PENDLE_WSTETH_YT);
+        }
+        if (key == keccak256("yt_for_sy")) {
+            return (PendleEdge.YtForSy, PENDLE_WSTETH_YT, syAddr);
+        }
+        revert(string.concat("unknown edge ", name));
+    }
+
+    /// Runs one market edge from the unmodified fork state and returns what the receiver got.
+    function _executeFromForkState(
+        PendleEdge edge,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) internal returns (uint256 amountOut) {
+        uint256 snapshot = vm.snapshotState();
+        _fund(tokenIn, amountIn, PENDLE_ROUTER_V4);
+        uint256 before = IERC20(tokenOut).balanceOf(BOB);
+        pendleExposed.swap(
+            amountIn, _data(edge, tokenIn, tokenOut, PENDLE_WSTETH_MARKET), BOB
+        );
+        amountOut = IERC20(tokenOut).balanceOf(BOB) - before;
+        vm.revertToState(snapshot);
+    }
+
+    /// Every swap the simulation's parity test quotes delivers, here, exactly the amount it
+    /// quotes. Both read the same fixture, so a drift on either side fails its own test.
+    function testMarketEdgesDeliverWhatTheSimulationQuotes() public {
+        string memory json = vm.readFile(EXECUTED_SWAPS);
+        uint256 count;
+        for (uint256 i = 0;; i++) {
+            string memory row = string.concat(".executed[", vm.toString(i), "]");
+            if (!vm.keyExistsJson(json, row)) break;
+            (PendleEdge edge, address tokenIn, address tokenOut) = _fixtureEdge(
+                vm.parseJsonString(json, string.concat(row, ".edge"))
+            );
+            uint256 amountIn = vm.parseUint(
+                vm.parseJsonString(json, string.concat(row, ".amount_in"))
+            );
+            uint256 expected = vm.parseUint(
+                vm.parseJsonString(json, string.concat(row, ".amount_out"))
+            );
+
+            assertEq(
+                _executeFromForkState(edge, tokenIn, tokenOut, amountIn),
+                expected,
+                row
+            );
+            count++;
+        }
+        assertEq(count, 39);
+    }
+
+    function testMarketEdgesRejectWhatTheSimulationRejects() public {
+        string memory json = vm.readFile(EXECUTED_SWAPS);
+        for (uint256 i = 0;; i++) {
+            string memory row = string.concat(".rejected[", vm.toString(i), "]");
+            if (!vm.keyExistsJson(json, row)) break;
+            (PendleEdge edge, address tokenIn, address tokenOut) = _fixtureEdge(
+                vm.parseJsonString(json, string.concat(row, ".edge"))
+            );
+            uint256 amountIn = vm.parseUint(
+                vm.parseJsonString(json, string.concat(row, ".amount_in"))
+            );
+
+            _fund(tokenIn, amountIn, PENDLE_ROUTER_V4);
+            vm.expectRevert();
+            pendleExposed.swap(
+                amountIn,
+                _data(edge, tokenIn, tokenOut, PENDLE_WSTETH_MARKET),
+                BOB
+            );
+        }
+    }
+
     /// The router is immutable, so a zero address would leave every market edge calling nothing
     /// with no way to correct it.
     function testConstructorRejectsZeroRouter() public {
