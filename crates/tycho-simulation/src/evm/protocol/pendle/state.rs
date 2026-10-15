@@ -211,18 +211,22 @@ impl PendleMarketState {
             self.quote_time(),
         )?;
         // Buying the PT back costs this much SY.
-        let sy_to_repay = pmath::to_u256(-executed.trade.net_sy_to_account)?;
-        // Redeeming PT+YT returns the asset value of the position, converted at the index.
-        let redeemed = sy_utils::asset_to_sy(self.py_index, yt_in)?;
-        if redeemed < sy_to_repay {
+        let sy_owed = pmath::to_u256(-executed.trade.net_sy_to_account)?;
+        // The router's callback redeems in two parts, as the contract does: just enough PY,
+        // rounded up, to pay the market what it is owed, and the rest to the trader. Redeeming
+        // the whole position at once and subtracting the debt after floors only once, and lands
+        // a wei above what the trader receives.
+        let py_to_repay = sy_utils::sy_to_asset_up(self.py_index, sy_owed)?;
+        if yt_in < py_to_repay {
             return Err(PendleError::NegativeResult {
-                a: redeemed.to_string(),
-                b: sy_to_repay.to_string(),
+                a: yt_in.to_string(),
+                b: py_to_repay.to_string(),
             });
         }
+        let sy_out = sy_utils::asset_to_sy(self.py_index, yt_in - py_to_repay)?;
         // Only the borrowed PT leg touches the market. Tokenizing and redeeming PY happens on the
         // YT contract, against reserves this component does not hold.
-        Ok((redeemed - sy_to_repay, executed.market))
+        Ok((sy_out, executed.market))
     }
 
     /// One market edge, quoted: the output, its gas, and the reserves the trade leaves behind.
@@ -257,7 +261,15 @@ impl PendleMarketState {
                     amount_in,
                     self.quote_time(),
                 )?;
-                (filled.amount_out, GAS_SY_FOR_YT, filled.market_after)
+                // The search only picks how much PT to sell back. The router's callback then
+                // mints PY from every SY the YT contract holds, the input plus what the PT sale
+                // paid out, so the trader gets at least the guess and usually a little more.
+                let net_sy_out = pmath::to_u256(filled.net_sy_to_account)?;
+                let sy_to_tokenize = amount_in
+                    .checked_add(net_sy_out)
+                    .ok_or(PendleError::Overflow { operation: "SY to tokenize" })?;
+                let yt_out = sy_utils::sy_to_asset(self.py_index, sy_to_tokenize)?;
+                (yt_out, GAS_SY_FOR_YT, filled.market_after)
             }
             _ => unreachable!("unsupported pair is rejected before reaching here"),
         };
@@ -518,8 +530,17 @@ impl ProtocolSim for PendleState {
                     (MarketToken::Sy, MarketToken::Pt) => {
                         approx::max_sy_in_for_pt(&state.market, state.py_index, state.quote_time())?
                     }
+                    // The bound picks the input. The output is the quote at that input, since
+                    // the YT minted is not the PT sold back but everything the SY tokenizes into.
                     (MarketToken::Sy, MarketToken::Yt) => {
-                        approx::max_sy_in_for_yt(&state.market, state.py_index, state.quote_time())?
+                        let (max_sy_in, _) = approx::max_sy_in_for_yt(
+                            &state.market,
+                            state.py_index,
+                            state.quote_time(),
+                        )?;
+                        let filled =
+                            state.amount_out(max_sy_in, MarketToken::Sy, MarketToken::Yt)?;
+                        (max_sy_in, filled.amount_out)
                     }
                     // Selling PT hands PT *to* the market, so the 96% proportion cap binds.
                     (MarketToken::Pt, MarketToken::Sy) => {

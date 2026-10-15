@@ -164,8 +164,11 @@ impl ApproxState {
 /// What an approximated swap resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApproxResult {
+    /// The accepted guess: PT bought for SY→PT, PT sold back to the market for SY→YT.
     pub amount_out: U256,
     pub net_sy_fee: U256,
+    /// SY the accepted trade pays the account, negative when the account pays the market.
+    pub net_sy_to_account: I256,
     /// How many times the loop ran. Carried because it pins the search *route*, not just its
     /// destination.
     pub iterations: usize,
@@ -339,6 +342,7 @@ pub fn approx_swap_exact_sy_for_pt(
                 return Ok(ApproxResult {
                     amount_out: guess,
                     net_sy_fee: pmath::to_u256(trade.net_sy_fee)?,
+                    net_sy_to_account: trade.net_sy_to_account,
                     iterations: iteration,
                     market_after,
                 });
@@ -402,6 +406,7 @@ pub fn approx_swap_exact_sy_for_yt(
                 return Ok(ApproxResult {
                     amount_out: guess,
                     net_sy_fee: pmath::to_u256(trade.net_sy_fee)?,
+                    net_sy_to_account: trade.net_sy_to_account,
                     iterations: iteration,
                     market_after,
                 });
