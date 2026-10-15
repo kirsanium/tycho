@@ -100,50 +100,58 @@ fn build_components(creation: &MarketCreation) -> Vec<ProtocolComponent> {
         return vec![];
     };
 
-    let Some(sy) = profile_sy(&sy_address) else {
-        log::info!(
-            "Skipping market {}: SY {} did not resolve",
-            market_hex,
-            hex::encode(&sy_address)
-        );
-        return vec![];
-    };
+    let sy = profile_sy(&sy_address);
 
     // `new` rather than `at_contract`: the latter also lists the address in the component's
     // `contracts`, which makes the indexer resolve it to a stored Account. Pendle is a native
     // integration and never emits contract changes, so no such Account is ever written — and an
     // SY typically predates the market that first references it, so it is not created inside any
     // sane indexing range either. The id is identical between the two constructors.
+    let mut attributes = vec![
+        (
+            "scalar_root",
+            creation
+                .scalar_root
+                .to_signed_bytes_be(),
+        ),
+        (
+            "initial_anchor",
+            creation
+                .initial_anchor
+                .to_signed_bytes_be(),
+        ),
+        ("expiry", expiry.to_signed_bytes_be()),
+        ("factory", creation.factory.clone()),
+        (
+            "ln_fee_rate_root_at_creation",
+            creation
+                .ln_fee_rate_root
+                .to_signed_bytes_be(),
+        ),
+        ("sy_address", sy_address.clone()),
+        ("pt_address", pt_address.clone()),
+        ("yt_address", yt_address.clone()),
+    ];
+    if let Some(sy) = &sy {
+        attributes.push(("sy_decimals", BigInt::from(sy.decimals).to_signed_bytes_be()));
+        attributes.push(("asset_decimals", BigInt::from(sy.asset_decimals).to_signed_bytes_be()));
+    }
     let market = ProtocolComponent::new(&contract_id(&creation.market))
-        .with_tokens(&[sy_address.clone(), pt_address.clone(), yt_address.clone()])
-        .with_attributes(&[
-            (
-                "scalar_root",
-                creation
-                    .scalar_root
-                    .to_signed_bytes_be(),
-            ),
-            (
-                "initial_anchor",
-                creation
-                    .initial_anchor
-                    .to_signed_bytes_be(),
-            ),
-            ("expiry", expiry.to_signed_bytes_be()),
-            ("factory", creation.factory.clone()),
-            (
-                "ln_fee_rate_root_at_creation",
-                creation
-                    .ln_fee_rate_root
-                    .to_signed_bytes_be(),
-            ),
-            ("sy_address", sy_address.clone()),
-            ("pt_address", pt_address),
-            ("yt_address", yt_address),
-            ("sy_decimals", BigInt::from(sy.decimals).to_signed_bytes_be()),
-            ("asset_decimals", BigInt::from(sy.asset_decimals).to_signed_bytes_be()),
-        ])
+        .with_tokens(&[sy_address.clone(), pt_address, yt_address])
+        .with_attributes(&attributes)
         .as_swap_type(PENDLE_MARKET, ImplementationType::Custom);
+
+    // The market quotes from its own curve and the SY rate the refresh reads, so an SY that does
+    // not resolve now costs only its wrap edges. Its component is left out, which also leaves it
+    // out of `store_sy_seen`, so the next market on the same SY profiles it again.
+    let Some(sy) = sy else {
+        log::info!(
+            "Market {}: SY {} did not resolve, emitting the market only",
+            market_hex,
+            hex::encode(&sy_address)
+        );
+        return vec![market];
+    };
 
     // An SY whose conversions none of the two closed forms explain contributes no wrap edges,
     // so it gets no component — but its market still quotes PT against SY.
