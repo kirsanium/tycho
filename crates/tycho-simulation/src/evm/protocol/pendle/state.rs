@@ -323,6 +323,11 @@ impl PendleSyState {
     ///
     /// `OneToOne` still rescales for decimals: one wstETH is one SY-wstETH, but only because both
     /// carry 18. A 6-decimal token against an 18-decimal SY is one-to-one in *units*, not in wei.
+    ///
+    /// A deposit is quoted at the closed form, which some SYs do not quite pay: seven of the 46
+    /// live SYs swept took a 1e-7 to 1e-6 haircut on entry, so their deposits quote up to 1e-6
+    /// high, and the error compounds across hops. The indexer's classifier accepts no wider a
+    /// haircut, so 1e-6 bounds it. Redemptions matched their closed form to the unit.
     fn convert(
         &self,
         amount: U256,
