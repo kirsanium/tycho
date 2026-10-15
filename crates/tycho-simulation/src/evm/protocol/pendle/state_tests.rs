@@ -783,6 +783,28 @@ fn the_reported_limit_is_the_boundary() {
         .is_err());
 }
 
+/// A trade too big for the market is the caller's size, not a broken state, so a router can retry
+/// smaller instead of dropping the component. Checked on the two flash-swap legs, whose oversize
+/// failures surface from the PT borrow and from the router's search rather than from a market
+/// check of their own.
+#[rstest::rstest]
+#[case::yt_in_past_the_pt_the_market_holds(YT, SY, "83658000000000000001")]
+#[case::sy_in_whose_tokenized_pt_the_market_cannot_absorb(SY, YT, "100000000000000000000000")]
+fn an_oversized_flash_swap_is_invalid_input(
+    #[case] token_in: &str,
+    #[case] token_out: &str,
+    #[case] amount: &str,
+) {
+    let error = wsteth_market(1_700_000_000)
+        .get_amount_out(
+            BigUint::from_str(amount).unwrap(),
+            &token(token_in, 18),
+            &token(token_out, 18),
+        )
+        .unwrap_err();
+    assert!(matches!(error, SimulationError::InvalidInput(_, None)), "{error:?}");
+}
+
 /// A one-to-one wrap in matching decimals returns exactly what went in. This is the case where a
 /// wrong `index_rate` classification is invisible to the indexer but wrong by 24% here.
 #[test]

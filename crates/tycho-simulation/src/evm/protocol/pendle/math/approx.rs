@@ -366,6 +366,12 @@ pub fn approx_swap_exact_sy_for_yt(
     let estimate = estimate_swap_exact_sy_for_yt(market, index, block_time, exact_sy_in)?;
     let hard_bounds =
         [sy_utils::sy_to_asset(index, exact_sy_in)?, calc_soft_max_pt_in(market, &comp)?];
+    // Tokenizing the input alone already needs more PT sold back than the market absorbs. The
+    // router reverts here too (`ApproxParamsInvalid`), but the cause is the input's size, not a
+    // malformed search, so it is reported as the trade being too big.
+    if hard_bounds[0] > hard_bounds[1] {
+        return Err(PendleError::ApproxRangeOverflow);
+    }
     let mut state = ApproxState::init_no_offchain(estimate, hard_bounds)?;
 
     for iteration in 0..state.max_iteration {

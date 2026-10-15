@@ -202,11 +202,16 @@ impl PendleMarketState {
     /// Redeeming `n` YT needs `n` PT, so the borrowed leg is exactly the YT amount. What the
     /// trader keeps is the redemption proceeds less what repaying the borrow costs.
     fn yt_for_sy(&self, yt_in: U256) -> Result<(U256, MarketState), PendleError> {
-        let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
-        let net_pt_to_account = pmath::to_i256(yt_in)?;
-        let trade = market::calc_trade(&self.market, &comp, self.py_index, net_pt_to_account)?;
+        // The borrowed PT leg is a real market trade, so it goes through the same checks the
+        // market runs: above all, it cannot lend out more PT than it holds.
+        let executed = market::execute_trade(
+            &self.market,
+            self.py_index,
+            pmath::to_i256(yt_in)?,
+            self.quote_time(),
+        )?;
         // Buying the PT back costs this much SY.
-        let sy_to_repay = pmath::to_u256(-trade.net_sy_to_account)?;
+        let sy_to_repay = pmath::to_u256(-executed.trade.net_sy_to_account)?;
         // Redeeming PT+YT returns the asset value of the position, converted at the index.
         let redeemed = sy_utils::asset_to_sy(self.py_index, yt_in)?;
         if redeemed < sy_to_repay {
@@ -217,15 +222,7 @@ impl PendleMarketState {
         }
         // Only the borrowed PT leg touches the market. Tokenizing and redeeming PY happens on the
         // YT contract, against reserves this component does not hold.
-        let market_after = market::apply_trade(
-            &self.market,
-            &comp,
-            self.py_index,
-            net_pt_to_account,
-            &trade,
-            self.quote_time(),
-        )?;
-        Ok((redeemed - sy_to_repay, market_after))
+        Ok((redeemed - sy_to_repay, executed.market))
     }
 
     /// One market edge, quoted: the output, its gas, and the reserves the trade leaves behind.
