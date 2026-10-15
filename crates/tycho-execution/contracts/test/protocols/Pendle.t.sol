@@ -40,9 +40,10 @@ contract PendleExecutorTest is Constants, TestUtils {
     uint256 constant GAS_PT_FOR_SY = 235_000;
     uint256 constant GAS_SY_FOR_YT = 425_000;
     uint256 constant GAS_YT_FOR_SY = 335_000;
-    // The wstETH SY is `one_to_one`. An `index_rate` SY reads through to the wrapped protocol
-    // and is quoted at GAS_WRAP_INDEX_RATE = 180_000, which no test here measures.
+    // The wstETH SY converts wstETH `one_to_one` and stETH at the `index_rate`, which reads
+    // through to the wrapped protocol and wraps or unwraps on the way.
     uint256 constant GAS_WRAP_ONE_TO_ONE = 90_000;
+    uint256 constant GAS_WRAP_INDEX_RATE = 180_000;
 
     IERC20 sy = IERC20(PENDLE_WSTETH_SY);
     IERC20 pt = IERC20(PENDLE_WSTETH_PT);
@@ -277,6 +278,58 @@ contract PendleExecutorTest is Constants, TestUtils {
 
         assertGt(wstETH.balanceOf(BOB), balanceBefore);
         assertLe(gasUsed, GAS_WRAP_ONE_TO_ONE);
+    }
+
+    /// stETH is share-based, so `deal` cannot set a balance; it is minted by staking instead.
+    function _fundSteth(uint256 amount) internal returns (uint256 funded) {
+        vm.deal(address(this), amount + 1 ether);
+        (bool ok,) = STETH_ADDR.call{value: amount + 1 ether}(
+            abi.encodeWithSignature("submit(address)", address(0))
+        );
+        require(ok, "stETH submit failed");
+        IERC20(STETH_ADDR).safeTransfer(address(pendleExposed), amount);
+        // A stETH transfer rounds down to whole shares.
+        funded = IERC20(STETH_ADDR).balanceOf(address(pendleExposed));
+        vm.prank(address(pendleExposed));
+        IERC20(STETH_ADDR).forceApprove(PENDLE_WSTETH_SY, funded);
+    }
+
+    function testSwapStethForSyAtTheIndexRate() public {
+        uint256 amountIn = _fundSteth(1e18);
+        uint256 balanceBefore = sy.balanceOf(BOB);
+        bytes memory data = _data(
+            PendleEdge.TokenForSy,
+            STETH_ADDR,
+            PENDLE_WSTETH_SY,
+            PENDLE_WSTETH_SY
+        );
+
+        uint256 before = gasleft();
+        pendleExposed.swap(amountIn, data, BOB);
+        uint256 gasUsed = before - gasleft();
+        console.log("pendle edge gas steth->sy", gasUsed);
+
+        assertGt(sy.balanceOf(BOB), balanceBefore);
+        assertLe(gasUsed, GAS_WRAP_INDEX_RATE);
+    }
+
+    function testSwapSyForStethAtTheIndexRate() public {
+        deal(PENDLE_WSTETH_SY, address(pendleExposed), 1e18);
+        uint256 balanceBefore = IERC20(STETH_ADDR).balanceOf(BOB);
+        bytes memory data = _data(
+            PendleEdge.SyForToken,
+            PENDLE_WSTETH_SY,
+            STETH_ADDR,
+            PENDLE_WSTETH_SY
+        );
+
+        uint256 before = gasleft();
+        pendleExposed.swap(1e18, data, BOB);
+        uint256 gasUsed = before - gasleft();
+        console.log("pendle edge gas sy->steth", gasUsed);
+
+        assertGt(IERC20(STETH_ADDR).balanceOf(BOB), balanceBefore);
+        assertLe(gasUsed, GAS_WRAP_INDEX_RATE);
     }
 
     /// Funds the executor, runs one edge, and returns the gas the `swap` call itself consumed.
