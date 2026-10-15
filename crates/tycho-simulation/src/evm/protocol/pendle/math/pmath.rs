@@ -118,12 +118,22 @@ pub fn to_u256(x: I256) -> PendleResult<U256> {
 
 /// `a * (1 + factor)`.
 pub fn tweak_up(a: U256, factor: U256) -> PendleResult<U256> {
-    mul_down(a, one() + factor)
+    let scale = one()
+        .checked_add(factor)
+        .ok_or(PendleError::Overflow { operation: "tweakUp" })?;
+    mul_down(a, scale)
 }
 
-/// `a * (1 - factor)`.
+/// `a * (1 - factor)`. A factor above one reverts in the contract's checked arithmetic.
 pub fn tweak_down(a: U256, factor: U256) -> PendleResult<U256> {
-    mul_down(a, one() - factor)
+    mul_down(a, one_minus(factor, "tweakDown")?)
+}
+
+/// `1 - x`, failing where the contract's checked subtraction reverts.
+fn one_minus(x: U256, operation: &'static str) -> PendleResult<U256> {
+    one()
+        .checked_sub(x)
+        .ok_or(PendleError::Overflow { operation })
 }
 
 pub fn clamp(x: U256, lower: U256, upper: U256) -> U256 {
@@ -155,7 +165,7 @@ pub fn sub_with_lower_bound(a: U256, b: U256, bound: U256) -> U256 {
 
 /// `a <= b && a >= b * (1 - eps)`: the acceptance test the router's approximation loop uses.
 pub fn is_a_smaller_approx_b(a: U256, b: U256, eps: U256) -> PendleResult<bool> {
-    Ok(a <= b && a >= mul_down(b, one() - eps)?)
+    Ok(a <= b && a >= mul_down(b, one_minus(eps, "isASmallerApproxB")?)?)
 }
 
 #[cfg(test)]
@@ -384,5 +394,16 @@ mod tests {
         assert!(matches!(div_down(u(1), U256::ZERO), Err(PendleError::DivisionByZero { .. })));
         assert!(matches!(raw_div_up(u(1), U256::ZERO), Err(PendleError::DivisionByZero { .. })));
         assert!(matches!(div_down_i(s(1), I256::ZERO), Err(PendleError::DivisionByZero { .. })));
+    }
+
+    /// The contract reverts on these in checked arithmetic, so the port returns an error rather
+    /// than panicking on the subtraction.
+    #[test]
+    fn a_factor_past_one_is_an_error_not_a_panic() {
+        let past_one = one() + u(1);
+        assert!(tweak_down(u(1_000), past_one).is_err());
+        assert!(is_a_smaller_approx_b(u(1), u(2), past_one).is_err());
+        assert!(tweak_up(u(1_000), U256::MAX).is_err());
+        assert_eq!(tweak_down(u(1_000), one()).unwrap(), U256::ZERO);
     }
 }
