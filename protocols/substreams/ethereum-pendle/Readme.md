@@ -6,8 +6,10 @@ protocol system, and the state each needs to be quoted natively:
 - **`pendle_market`** — the SY↔PT AMM. Reserves (`total_pt`, `total_sy`) are replayed from
   `Swap`/`Mint`/`Burn` rather than read from storage, because the events are identical across all
   five market generations and the storage layout is not.
-- **`pendle_sy`** — the ERC-5115 wrapper behind a market, with one attribute per quotable
-  `(token, direction)` pair naming the conversion it uses.
+- **`pendle_sy`** — the ERC-5115 wrapper behind a market. Its state carries one attribute per
+  quotable `(token, direction)` pair naming the conversion it uses (`token_in_class_0x…`,
+  `token_out_class_0x…`), its share supply (`sy_total_supply`), which bounds every redemption, and
+  whether it is `paused`.
 
 ## Factories
 
@@ -41,10 +43,30 @@ and matched against two closed forms:
 A pair matching neither is left out of the component, so an unquotable edge is **absent** rather
 than silently wrong. See `src/sy.rs`.
 
+The classes are state, not static attributes: 251 of the 379 SYs are upgradeable proxies, and 31
+have been upgraded after deployment. On an SY's `Upgraded` event, `map_sy_state` re-runs the
+classification at the end of the block, re-emits every class of the component's listed tokens and
+deletes those that no longer match. A token an upgrade adds stays unquotable, since a component's
+token list is fixed at creation. `Paused` and `Unpaused` set the `paused` attribute the same way.
+
+## What is read, and when
+
+| Value | Read | Then follows |
+|---|---|---|
+| Classes, `paused` | Once, at creation | `Upgraded`, `Paused`, `Unpaused` |
+| SY supply | `totalSupply()` once, at creation | The SY's own mints and burns |
+| SY balances | `balanceOf` once per token, at creation | `Transfer`s; re-read per refresh block for SYs behind a live or just-expired market |
+| Exchange rate | Every refresh block | — |
+
+All creation reads ride one batch. The rate is read for the SY of each live market and for SYs
+with an `index_rate` token; an SY whose tokens are all `one_to_one` and whose markets have expired
+is never read again. A rebasing token moves an SY's balance without a `Transfer`, so its reported
+balance drifts between transfers wherever it is not re-read; no quote reads a balance.
+
 ## The refresh, and its one parameter
 
 `SY.exchangeRate()` has no event stream — it moves with whatever protocol the SY wraps. So it is
-read once per refresh block for every SY behind a live market, in one batched `eth_call`, and
+read once per refresh block for every SY that needs it (see above), in one batched `eth_call`, and
 republished alongside two clocks:
 
 - `rate_sampled_at` dates the rate, and stops advancing when a read stops resolving.
@@ -64,10 +86,9 @@ backfill time. `0` is rejected rather than reinterpreted. Whatever the interval,
 refreshed on the block it is created, and a market on any block its yield token emits
 `NewInterestIndex`, so neither waits for the next refresh to be quotable.
 
-The trade is freshness only. SY balances are read off chain on any block a `Transfer` moved one,
-not only on refresh blocks, so a coarse interval leaves the PY index stale without leaving balances
-wrong. What the refresh alone covers is a *rebase*, which moves a balance with no transfer to
-notice.
+The trade is freshness only. Supply and balances follow events whatever the interval, so a coarse
+interval leaves the PY index stale without leaving a redemption bound wrong. What the refresh alone
+covers is a *rebase*, which moves a balance with no transfer to notice.
 
 ## Module graph
 
