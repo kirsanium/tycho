@@ -12,5 +12,6 @@ mod modules;
 mod registry;
 mod sy;
 mod sy_rates;
+mod transfers;
 
 pub use modules::*;

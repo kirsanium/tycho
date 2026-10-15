@@ -12,6 +12,7 @@ use tycho_substreams::{abi::erc20, balances::aggregate_balances_changes, prelude
 
 use crate::{
     abi::pendle_sy,
+    consts::PENDLE_SY,
     fees::{fan_out, fee_scope, read_market_fees, LN_FEE_RATE_ROOT, RESERVE_FEE_PERCENT},
     keys::{contract_id, market_by_yt_key, market_tokens_key, py_index_key, MARKET_REGISTRY},
     market_state::{
@@ -23,6 +24,7 @@ use crate::{
         encode_timestamp, py_index_current, RefreshParams, BLOCK_TIMESTAMP, PY_INDEX_CURRENT,
         RATE_SAMPLED_AT, SY_EXCHANGE_RATE,
     },
+    transfers::{component_transfers, is_market},
 };
 
 /// Joins new components, market state and balance changes into the per-transaction output.
@@ -40,10 +42,7 @@ pub fn map_protocol_changes(
     py_index_store: StoreGetBigInt,
 ) -> Result<BlockChanges, substreams::errors::Error> {
     let refresh = RefreshParams::parse(&params)?;
-    // Which holdings a `Transfer` touched this block. Collected before `deltas` is consumed by the
-    // aggregation below, because `sy_balances` re-reads exactly these off chain — see there for
-    // why a transfer is enough on its own to warrant a read.
-    let moved = moved_holdings(&deltas);
+    let to_read = sy_holdings_to_read(&block, &new_components, &components_store);
     let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
 
     for tx_components in &new_components.tx_components {
@@ -132,9 +131,8 @@ pub fn map_protocol_changes(
         }
     }
 
-    // After the transfer-derived balances, so the read value wins for an SY holding a rebasing
-    // token.
-    for (tx, change) in sy_balances(&block, &refresh, &moved, &registry_store, &components_store) {
+    for (tx, change) in sy_balances(&block, &refresh, &to_read, &registry_store, &components_store)
+    {
         transaction_changes
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(&tx))
@@ -196,37 +194,28 @@ fn absolute_state_changes(
     changes
 }
 
-/// Reads each SY component's real token balances, rather than accumulating them from transfers.
+/// Reads each SY component's real token balances. This is the only source of an SY's balances:
+/// the transfer path covers markets alone.
 ///
-/// A share-based token moves a holder's balance on rebase without emitting `Transfer`, so no
-/// event-derived accounting can follow it. The wstETH SY holds **stETH**, and the drift is real
-/// and measured: at block 16032658 the transfer-derived balance was `0` where the node reported
-/// `4` wei. Economically nothing, but the indexer reconciles balances against `balanceOf` for
-/// exact equality, so it is a mismatch.
-///
-/// Markets are deliberately left on the transfer path. A market custodies only SY shares and PT,
-/// neither of which rebases, so transfers are exact there and cost no RPC.
+/// Transfers cannot be replayed for an SY. It is created with its first market, usually long
+/// after it first held anything, so replaying from the creation block starts from zero. And a
+/// share-based token moves a holder's balance on rebase without emitting `Transfer`: the wstETH SY
+/// holds stETH. Markets stay on the transfer path. A market custodies only SY shares and PT,
+/// neither of which rebases, it holds nothing before it is created, and transfers cost no RPC.
 ///
 /// Every SY component is read, not only those behind a live market: an SY has no maturity, so its
 /// holdings go on moving after the last market that priced against it has expired, and a wrapper
 /// quoting depth from frozen balances would report limits it cannot honour.
 ///
-/// # Which holdings are read, and why it is not only the refresh
+/// # Which holdings are read
 ///
-/// The read corrects what is *emitted*; it does not write back into the balance store, which goes
-/// on accumulating transfers alone. So the store's own drift never converges, and on any block
-/// where the transfer path emits — that is, any block a holding moved — the emitted balance is the
-/// drifted one.
+/// Every holding on a refresh block, which is what catches a rebase. Off a refresh block, the
+/// holdings in `to_read` (see [`sy_holdings_to_read`]), so a balance is current on any block it
+/// changed by a transfer, whatever `sy_rate_refresh_blocks` is set to. That costs one `balanceOf`
+/// per moved holding on a block that already had activity, so it scales with transfer volume
+/// rather than with block count and adds nothing to a backfill's per-block cost.
 ///
-/// Reading only on refresh blocks would therefore make `sy_rate_refresh_blocks` a correctness
-/// knob as well as a freshness one: raising it for a backfill, which is what it exists for, would
-/// leave balances wrong for up to that many blocks rather than merely stale. So a holding is read
-/// whenever *either* is true — this is a refresh block, or a `Transfer` moved it. The second case
-/// costs one `balanceOf` per moved holding on a block that already had activity, so it scales with
-/// transfer volume rather than with block count and adds nothing to a backfill's per-block cost.
-///
-/// The refresh case still stands on its own: a rebase moves a balance with no transfer at all, so
-/// without it a quiet SY would never be re-read.
+/// A read that fails leaves the last read balance in place.
 ///
 /// Costs one `balanceOf` per (SY component, declared token) per refresh block, plus one per moved
 /// holding otherwise. The refresh half grows with the number of SYs ever created, and
@@ -234,12 +223,12 @@ fn absolute_state_changes(
 fn sy_balances(
     block: &eth::Block,
     params: &RefreshParams,
-    moved: &HashSet<(String, Vec<u8>)>,
+    to_read: &HashSet<(String, Vec<u8>)>,
     registry_store: &StoreGetString,
     components_store: &StoreGetRaw,
 ) -> Vec<(Transaction, BalanceChange)> {
     let refreshing = params.should_refresh(block.number);
-    if !refreshing && moved.is_empty() {
+    if !refreshing && to_read.is_empty() {
         return vec![];
     }
     let Some(registry) = registry_store.get_last(MARKET_REGISTRY) else { return vec![] };
@@ -254,7 +243,7 @@ fn sy_balances(
         let address = hex::decode(sy.trim_start_matches("0x"))
             .expect("registry holds a non-hex SY component id");
         for token in tokens {
-            if !is_read(refreshing, moved, &sy, &token) {
+            if !is_read(refreshing, to_read, &sy, &token) {
                 continue;
             }
             holdings.push((sy.clone(), address.clone(), token));
@@ -489,24 +478,41 @@ fn refresh_live_state(
 /// Whether one SY holding has its balance read this block.
 ///
 /// A refresh block reads everything; any other block reads what moved. See [`sy_balances`].
-fn is_read(refreshing: bool, moved: &HashSet<(String, Vec<u8>)>, sy: &str, token: &[u8]) -> bool {
-    refreshing || moved.contains(&(sy.to_string(), token.to_vec()))
+fn is_read(refreshing: bool, to_read: &HashSet<(String, Vec<u8>)>, sy: &str, token: &[u8]) -> bool {
+    refreshing || to_read.contains(&(sy.to_string(), token.to_vec()))
 }
 
-/// The `(component, token)` holdings a `Transfer` moved this block.
-///
-/// Market ids appear here too and are simply never matched: the lookup runs over the SY components
-/// alone, and a market is not one.
-fn moved_holdings(deltas: &BlockBalanceDeltas) -> HashSet<(String, Vec<u8>)> {
-    deltas
-        .balance_deltas
+/// The `(SY, token)` holdings read this block whether or not it is a refresh block: those a
+/// `Transfer` moved, and every holding of an SY created this block, which has no balance yet.
+fn sy_holdings_to_read(
+    block: &eth::Block,
+    new_components: &BlockTransactionProtocolComponents,
+    components_store: &StoreGetRaw,
+) -> HashSet<(String, Vec<u8>)> {
+    let mut holdings = HashSet::new();
+    for transfer in component_transfers(block, components_store) {
+        if is_market(components_store, &transfer.component_id) {
+            continue;
+        }
+        holdings.insert((transfer.component_id, transfer.log.address.clone()));
+    }
+    for component in new_components
+        .tx_components
         .iter()
-        .filter_map(|delta| {
-            String::from_utf8(delta.component_id.clone())
-                .ok()
-                .map(|id| (id, delta.token.clone()))
-        })
-        .collect()
+        .flat_map(|tx| &tx.components)
+    {
+        let is_sy = component
+            .protocol_type
+            .as_ref()
+            .is_some_and(|t| t.name == PENDLE_SY);
+        if !is_sy {
+            continue;
+        }
+        for token in &component.tokens {
+            holdings.insert((component.id.clone(), token.clone()));
+        }
+    }
+    holdings
 }
 
 /// The SYs whose `exchangeRate()` is read this block.
@@ -592,59 +598,40 @@ mod tests {
     const STETH: [u8; 20] = [0xae; 20];
     const WSTETH: [u8; 20] = [0x7f; 20];
 
-    fn delta(component_id: &str, token: [u8; 20]) -> BalanceDelta {
-        BalanceDelta {
-            ord: 0,
-            tx: None,
-            token: token.to_vec(),
-            delta: vec![1],
-            component_id: component_id.as_bytes().to_vec(),
-        }
+    fn holdings(entries: &[(&str, [u8; 20])]) -> HashSet<(String, Vec<u8>)> {
+        entries
+            .iter()
+            .map(|(id, token)| (id.to_string(), token.to_vec()))
+            .collect()
     }
 
     #[test]
     fn a_refresh_block_reads_every_holding() {
-        let moved = HashSet::new();
-        assert!(is_read(true, &moved, SY, &STETH));
-        assert!(is_read(true, &moved, SY, &WSTETH));
+        let to_read = HashSet::new();
+        assert!(is_read(true, &to_read, SY, &STETH));
+        assert!(is_read(true, &to_read, SY, &WSTETH));
     }
 
-    /// The case the refresh alone would miss: the transfer path emits on this block, and what it
-    /// emits is the drifted store value unless the read overwrites it.
+    /// Off a refresh block, a holding a transfer moved is read, so its balance is current on the
+    /// block it changed.
     #[test]
-    fn a_moved_holding_is_read_off_a_refresh_block() {
-        let moved = moved_holdings(&BlockBalanceDeltas { balance_deltas: vec![delta(SY, STETH)] });
-        assert!(is_read(false, &moved, SY, &STETH));
+    fn a_holding_to_read_is_read_off_a_refresh_block() {
+        assert!(is_read(false, &holdings(&[(SY, STETH)]), SY, &STETH));
     }
 
     /// A holding nothing touched cannot have moved without a rebase, and a rebase is what the
     /// refresh is for. Reading it here would cost an RPC call for a balance that did not change.
     #[test]
     fn an_untouched_holding_is_left_alone_off_a_refresh_block() {
-        let moved = moved_holdings(&BlockBalanceDeltas { balance_deltas: vec![delta(SY, STETH)] });
-        assert!(!is_read(false, &moved, SY, &WSTETH));
+        assert!(!is_read(false, &holdings(&[(SY, STETH)]), SY, &WSTETH));
     }
 
     /// Two components can hold the same token, so the pair is the key, not the token.
     #[test]
     fn a_holding_is_keyed_by_component_and_token_together() {
         let other = "0x9f30507c264cc6eb5be35b18ff9ad7b4539aa920";
-        let moved =
-            moved_holdings(&BlockBalanceDeltas { balance_deltas: vec![delta(other, STETH)] });
-        assert!(is_read(false, &moved, other, &STETH));
-        assert!(!is_read(false, &moved, SY, &STETH));
-    }
-
-    /// Market deltas ride the same channel and are simply never looked up — but they must not
-    /// collide with an SY of the same address either, which is what keying on both prevents.
-    #[test]
-    fn market_deltas_are_carried_without_matching_an_sy() {
-        let market = "0x34280882267ffa6383b363e278b027be083bbe3b";
-        let moved = moved_holdings(&BlockBalanceDeltas {
-            balance_deltas: vec![delta(market, STETH), delta(SY, WSTETH)],
-        });
-        assert_eq!(moved.len(), 2);
-        assert!(!is_read(false, &moved, SY, &STETH));
-        assert!(is_read(false, &moved, SY, &WSTETH));
+        let to_read = holdings(&[(other, STETH)]);
+        assert!(is_read(false, &to_read, other, &STETH));
+        assert!(!is_read(false, &to_read, SY, &STETH));
     }
 }
