@@ -154,6 +154,41 @@ contract PendleExecutorTest is Constants, TestUtils {
         assertEq(tokenOut, PENDLE_WSTETH_SY);
     }
 
+    /// `SY.redeem` burns the caller's shares without `transferFrom`, so a redemption names the
+    /// caller, which the Dispatcher does not approve, rather than the SY.
+    function testGetTransferDataRedeemNeedsNoApproval() public {
+        bytes memory params = _data(
+            PendleEdge.SyForToken,
+            PENDLE_WSTETH_SY,
+            WSTETH_ADDR,
+            PENDLE_WSTETH_SY
+        );
+
+        vm.prank(ALICE);
+        (, address receiver,,,) = pendleExposed.getTransferData(params);
+
+        assertEq(receiver, ALICE);
+    }
+
+    function testSwapSyForTokenWithoutAllowance() public {
+        deal(PENDLE_WSTETH_SY, address(pendleExposed), 1e18);
+        uint256 balanceBefore = wstETH.balanceOf(BOB);
+
+        pendleExposed.swap(
+            1e18,
+            _data(
+                PendleEdge.SyForToken,
+                PENDLE_WSTETH_SY,
+                WSTETH_ADDR,
+                PENDLE_WSTETH_SY
+            ),
+            BOB
+        );
+
+        assertGt(wstETH.balanceOf(BOB), balanceBefore);
+        assertEq(sy.balanceOf(address(pendleExposed)), 0);
+    }
+
     function testSwapSyForPt() public {
         uint256 balanceBefore = pt.balanceOf(BOB);
 

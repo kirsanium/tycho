@@ -105,9 +105,10 @@ contract PendleExecutor is IExecutor {
     }
 
     /// @inheritdoc IExecutor
-    /// @dev Both Router V4 and the SY pull the input with `transferFrom` and take an explicit
-    /// receiver, so every edge is `ProtocolWillDebit` with the output going straight to the
-    /// receiver rather than back through the router.
+    /// @dev Router V4 and `SY.deposit` pull the input with `transferFrom`, so those edges approve
+    /// the router or the SY. `SY.redeem` burns the caller's own shares instead, so a redemption
+    /// names the caller as the receiver, which the Dispatcher never approves. Every edge takes an
+    /// explicit receiver, so the output goes straight to it rather than back through the router.
     function getTransferData(bytes calldata data)
         external
         view
@@ -123,7 +124,15 @@ contract PendleExecutor is IExecutor {
         address target;
         (edge, tokenIn, tokenOut, target) = _decodeData(data);
 
-        receiver = _isMarketEdge(edge) ? router : target;
+        if (_isMarketEdge(edge)) {
+            receiver = router;
+        } else if (edge == PendleEdge.SyForToken) {
+            // msg.sender is the TychoRouter: getTransferData is staticcalled, so address(this)
+            // would be this executor.
+            receiver = msg.sender;
+        } else {
+            receiver = target;
+        }
         transferType = TransferManager.TransferType.ProtocolWillDebit;
         outputToRouter = false;
     }

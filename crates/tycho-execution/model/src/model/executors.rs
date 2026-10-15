@@ -63,6 +63,13 @@ pub struct CallbackTransferData {
     pub receiver: Address,
 }
 
+/// The classes of `PendleExecutor` edge whose transfer semantics differ.
+const PENDLE_MARKET_EDGE: &str = "market";
+const PENDLE_TOKEN_FOR_SY: &str = "token_for_sy";
+const PENDLE_SY_FOR_TOKEN: &str = "sy_for_token";
+const PENDLE_EDGE_CLASSES: [&str; 3] =
+    [PENDLE_MARKET_EDGE, PENDLE_TOKEN_FOR_SY, PENDLE_SY_FOR_TOKEN];
+
 impl Executor {
     /// Array containing all [Executor]s.
     pub const VARIANTS: [Executor; 13] = [
@@ -361,11 +368,12 @@ impl Executor {
             }),
             // https://github.com/propeller-heads/tycho/blob/main/crates/tycho-execution/contracts/src/executors/PendleExecutor.sol
             Self::Pendle => {
-                // The edge byte selects one of six edges; the only distinction that changes
-                // the transfer semantics is whether it is one of the four market edges.
-                let is_market_edge = params.request(
+                // The edge byte selects one of six edges. What changes the transfer semantics is
+                // which of three classes it falls in: the four market edges, a deposit into the
+                // SY, or a redemption from it.
+                let edge = params.request(
                     ParamKey::ProtocolData { swap_index, start: 0, end: 1 },
-                    [true, false],
+                    PENDLE_EDGE_CLASSES,
                 )?;
                 let token_in = params.request(
                     ParamKey::ProtocolData { swap_index, start: 1, end: 21 },
@@ -385,13 +393,14 @@ impl Executor {
 
                 Ok(TransferData {
                     transfer_type: TransferType::ProtocolWillDebit,
-                    // The market edges are pulled by Pendle Router V4, whose address is
-                    // immutable in the executor and so is not sender controlled. Only the SY
-                    // edges approve an address the calldata chose.
-                    receiver: if is_market_edge {
-                        Address::Named("pendle-router-v4")
-                    } else {
-                        target
+                    receiver: match edge {
+                        // Pulled by Pendle Router V4, whose address is immutable in the executor
+                        // and so is not sender controlled.
+                        PENDLE_MARKET_EDGE => Address::Named("pendle-router-v4"),
+                        // `redeem` burns the router's own shares, so nothing is approved.
+                        PENDLE_SY_FOR_TOKEN => Address::Router,
+                        // A deposit approves the SY the calldata chose.
+                        _ => target,
                     },
                     token_in,
                     token_out,
@@ -707,13 +716,11 @@ impl Executor {
             }
             // https://github.com/propeller-heads/tycho/blob/main/crates/tycho-execution/contracts/src/executors/PendleExecutor.sol
             Self::Pendle => {
-                // The edge byte selects one of six edges; the only distinction that changes
-                // the transfer semantics is whether it is one of the four market edges.
-                let is_market_edge = params.request(
+                let edge = params.request(
                     ParamKey::ProtocolData { swap_index, start: 0, end: 1 },
-                    [true, false],
+                    PENDLE_EDGE_CLASSES,
                 )?;
-                if is_market_edge {
+                if edge == PENDLE_MARKET_EDGE {
                     return Err(Error::Ignore {
                         reason: "pendle market edge calls the immutable Pendle Router V4, which the sender does not control. would require simulating the real router".into(),
                     });
