@@ -10,6 +10,10 @@
 //! token 1:1 *and* the accounting asset at the index rate.
 
 use substreams::scalar::BigInt;
+use substreams_ethereum::{pb::eth::rpc::RpcResponse, rpc::RpcBatch};
+use tycho_substreams::{abi::erc20, prelude::*};
+
+use crate::{abi::pendle_sy, consts::PENDLE_SY, keys::contract_id};
 
 /// Which closed-form conversion an SY applies to one specific token.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +126,258 @@ pub fn classify_redeem(
     let asset_amount = pow10(sy_decimals) * exchange_rate.clone() / BigInt::from(RATE_ONE);
     let index_rate = asset_amount * pow10(token_decimals) / pow10(asset_decimals);
     classify(observed, &one_to_one, &index_rate)
+}
+
+/// An SY resolved far enough to quote its wrap edges.
+pub(crate) struct SyProfile {
+    pub(crate) address: Vec<u8>,
+    pub(crate) decimals: u32,
+    pub(crate) asset: Vec<u8>,
+    pub(crate) asset_decimals: u32,
+    /// Quotable entry tokens and the conversion each uses.
+    pub(crate) tokens_in: Vec<(Vec<u8>, TokenClass)>,
+    /// Quotable exit tokens and the conversion each uses.
+    pub(crate) tokens_out: Vec<(Vec<u8>, TokenClass)>,
+}
+
+impl SyProfile {
+    pub(crate) fn into_component(self) -> ProtocolComponent {
+        let mut tokens = vec![self.address.clone()];
+        for (token, _) in self
+            .tokens_in
+            .iter()
+            .chain(self.tokens_out.iter())
+        {
+            if !tokens.contains(token) {
+                tokens.push(token.clone());
+            }
+        }
+
+        // An entry token and an exit token can convert differently on the same SY, so the class
+        // is recorded per direction rather than once per token.
+        let mut attributes = vec![
+            ("asset_address".to_string(), self.asset.clone()),
+            ("asset_decimals".to_string(), BigInt::from(self.asset_decimals).to_signed_bytes_be()),
+            ("sy_decimals".to_string(), BigInt::from(self.decimals).to_signed_bytes_be()),
+        ];
+        for (token, class) in &self.tokens_in {
+            attributes.push((
+                format!("token_in_class_0x{}", hex::encode(token)),
+                class.as_str().as_bytes().to_vec(),
+            ));
+        }
+        for (token, class) in &self.tokens_out {
+            attributes.push((
+                format!("token_out_class_0x{}", hex::encode(token)),
+                class.as_str().as_bytes().to_vec(),
+            ));
+        }
+
+        ProtocolComponent::new(&contract_id(&self.address))
+            .with_tokens(&tokens)
+            .with_attributes(&attributes)
+            .as_swap_type(PENDLE_SY, ImplementationType::Custom)
+    }
+}
+
+pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
+    let responses = RpcBatch::new()
+        .add(pendle_sy::functions::Decimals {}, sy_address.to_vec())
+        .add(pendle_sy::functions::AssetInfo {}, sy_address.to_vec())
+        .add(pendle_sy::functions::ExchangeRate {}, sy_address.to_vec())
+        .add(pendle_sy::functions::GetTokensIn {}, sy_address.to_vec())
+        .add(pendle_sy::functions::GetTokensOut {}, sy_address.to_vec())
+        .execute()
+        .map(|r| r.responses)
+        .unwrap_or_default();
+
+    let decimals = decode_decimals(responses.first()?)?;
+    let (_asset_type, asset, asset_decimals) = responses
+        .get(1)
+        .and_then(RpcBatch::decode::<_, pendle_sy::functions::AssetInfo>)?;
+    let exchange_rate = responses
+        .get(2)
+        .and_then(RpcBatch::decode::<_, pendle_sy::functions::ExchangeRate>)?;
+    // The token lists are optional: an SY that will not enumerate them still yields a quotable
+    // market, it just contributes no wrap edges.
+    let tokens_in = responses
+        .get(3)
+        .and_then(RpcBatch::decode::<_, pendle_sy::functions::GetTokensIn>)
+        .unwrap_or_default();
+    let tokens_out = responses
+        .get(4)
+        .and_then(RpcBatch::decode::<_, pendle_sy::functions::GetTokensOut>)
+        .unwrap_or_default();
+
+    let asset_decimals = asset_decimals.to_u64() as u32;
+    let token_decimals = read_token_decimals(&tokens_in, &tokens_out);
+
+    let mut quotable_in = Vec::new();
+    for (token, probe) in probe_deposits(sy_address, &tokens_in, &token_decimals) {
+        let Some(class) = classify_deposit(&probe, decimals, asset_decimals, &exchange_rate) else {
+            continue;
+        };
+        quotable_in.push((token, class));
+    }
+
+    let mut quotable_out = Vec::new();
+    for (token, token_decimals, probe) in
+        probe_redeems(sy_address, &tokens_out, &token_decimals, decimals)
+    {
+        let Some(class) =
+            classify_redeem(&probe, token_decimals, decimals, asset_decimals, &exchange_rate)
+        else {
+            continue;
+        };
+        quotable_out.push((token, class));
+    }
+
+    Some(SyProfile {
+        address: sy_address.to_vec(),
+        decimals,
+        asset,
+        asset_decimals,
+        tokens_in: quotable_in,
+        tokens_out: quotable_out,
+    })
+}
+
+fn decode_decimals(response: &RpcResponse) -> Option<u32> {
+    RpcBatch::decode::<_, pendle_sy::functions::Decimals>(response).map(|d| d.to_u64() as u32)
+}
+
+/// Reads `decimals()` for every token either side of the SY in one batch.
+///
+/// Native ETH is listed by some SYs as the zero address and has no `decimals()`; it drops out
+/// here and is therefore never classified or declared.
+fn read_token_decimals(tokens_in: &[Vec<u8>], tokens_out: &[Vec<u8>]) -> Vec<(Vec<u8>, u32)> {
+    let mut unique: Vec<Vec<u8>> = Vec::new();
+    for token in tokens_in
+        .iter()
+        .chain(tokens_out.iter())
+    {
+        if token.iter().all(|b| *b == 0) || unique.contains(token) {
+            continue;
+        }
+        unique.push(token.clone());
+    }
+
+    let mut batch = RpcBatch::new();
+    for token in &unique {
+        batch = batch.add(erc20::functions::Decimals {}, token.clone());
+    }
+    let responses = batch
+        .execute()
+        .map(|r| r.responses)
+        .unwrap_or_default();
+
+    let mut decimals = Vec::new();
+    for (token, response) in unique.into_iter().zip(responses.iter()) {
+        let Some(value) = RpcBatch::decode::<_, erc20::functions::Decimals>(response) else {
+            continue;
+        };
+        decimals.push((token, value.to_u64() as u32));
+    }
+    decimals
+}
+
+/// Probes `previewDeposit` with one whole unit of each entry token.
+fn probe_deposits(
+    sy_address: &[u8],
+    tokens_in: &[Vec<u8>],
+    token_decimals: &[(Vec<u8>, u32)],
+) -> Vec<(Vec<u8>, BigInt)> {
+    let mut probes = Vec::new();
+    for token in tokens_in {
+        let Some((_, decimals)) = token_decimals
+            .iter()
+            .find(|(t, _)| t == token)
+        else {
+            continue;
+        };
+        probes.push((token.clone(), *decimals));
+    }
+
+    let mut batch = RpcBatch::new();
+    for (token, decimals) in &probes {
+        batch = batch.add(
+            pendle_sy::functions::PreviewDeposit {
+                token_in: token.clone(),
+                amount_token_to_deposit: pow10(*decimals),
+            },
+            sy_address.to_vec(),
+        );
+    }
+
+    let mut results = Vec::new();
+    for ((token, _), value) in probes
+        .into_iter()
+        .zip(execute_probes::<pendle_sy::functions::PreviewDeposit>(batch))
+    {
+        let Some(value) = value else { continue };
+        results.push((token, value));
+    }
+    results
+}
+
+/// Probes `previewRedeem` with one whole SY unit for each exit token.
+///
+/// Returns each token with its own decimals, which the redeem conversion needs to rescale the
+/// asset-unit result the SY reports.
+fn probe_redeems(
+    sy_address: &[u8],
+    tokens_out: &[Vec<u8>],
+    token_decimals: &[(Vec<u8>, u32)],
+    sy_decimals: u32,
+) -> Vec<(Vec<u8>, u32, BigInt)> {
+    let mut probes = Vec::new();
+    for token in tokens_out {
+        let Some((_, decimals)) = token_decimals
+            .iter()
+            .find(|(t, _)| t == token)
+        else {
+            continue;
+        };
+        probes.push((token.clone(), *decimals));
+    }
+
+    let mut batch = RpcBatch::new();
+    for (token, _) in &probes {
+        batch = batch.add(
+            pendle_sy::functions::PreviewRedeem {
+                token_out: token.clone(),
+                amount_shares_to_redeem: pow10(sy_decimals),
+            },
+            sy_address.to_vec(),
+        );
+    }
+
+    let mut results = Vec::new();
+    for ((token, decimals), value) in probes
+        .into_iter()
+        .zip(execute_probes::<pendle_sy::functions::PreviewRedeem>(batch))
+    {
+        let Some(value) = value else { continue };
+        results.push((token, decimals, value));
+    }
+    results
+}
+
+/// Executes a probe batch, yielding one entry per call in the order they were added.
+///
+/// A reverting probe — a paused SY, a token the view rejects — yields `None`, which leaves that
+/// token out of the component rather than guessed at.
+fn execute_probes<F>(batch: RpcBatch) -> Vec<Option<BigInt>>
+where
+    F: substreams_ethereum::Function + substreams_ethereum::rpc::RPCDecodable<BigInt>,
+{
+    batch
+        .execute()
+        .map(|r| r.responses)
+        .unwrap_or_default()
+        .iter()
+        .map(RpcBatch::decode::<_, F>)
+        .collect()
 }
 
 #[cfg(test)]
