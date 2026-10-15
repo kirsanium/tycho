@@ -20,6 +20,9 @@
 //!
 //! [`PendleState`]: super::state::PendleState
 
+/// The `rate_sampled_at` of a state whose rate has not been read yet.
+pub const NEVER_SAMPLED: u64 = 0;
+
 /// Whether a state sampled at `rate_sampled_at` can still answer for the chain head at `head`.
 ///
 /// Equality, not a tolerance: the rate is a measurement taken at one block, and any other block
@@ -27,8 +30,9 @@
 ///
 /// `head` moving *behind* the sample is not staleness — a snapshot can carry a reading newer than
 /// the header it was decoded against — so only a head strictly ahead of the sample is refused.
+/// A state that was [`NEVER_SAMPLED`] has no rate to quote with and is never current.
 pub fn is_current(rate_sampled_at: u64, head: u64) -> bool {
-    head <= rate_sampled_at
+    rate_sampled_at != NEVER_SAMPLED && head <= rate_sampled_at
 }
 
 #[cfg(test)]
@@ -52,5 +56,12 @@ mod tests {
     #[test]
     fn a_sample_ahead_of_the_head_is_current() {
         assert!(is_current(1_800_000_012, 1_800_000_000));
+    }
+
+    /// Not even against a head of zero, which a default header carries.
+    #[test]
+    fn a_state_never_sampled_is_not_current() {
+        assert!(!is_current(NEVER_SAMPLED, 1_800_000_000));
+        assert!(!is_current(NEVER_SAMPLED, 0));
     }
 }

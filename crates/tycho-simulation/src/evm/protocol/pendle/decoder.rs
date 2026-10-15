@@ -4,16 +4,25 @@
 //! the two component types the Substreams package emits carry entirely different attributes.
 //!
 //! Every attribute read here is one the indexing PR emits. A missing one is an error rather than a
-//! default: quoting a market whose `py_index` silently defaulted would be wrong in exactly the way
-//! that is hardest to notice.
+//! default, with two exceptions that both describe a real on-chain state rather than a guess:
+//!
+//! - A market's reserves and implied rate are absent until its first liquidity event, because the
+//!   indexer only writes them from events. A market's storage starts zeroed, so absent means zero.
+//! - A rate (`py_index_current`, `sy_exchange_rate`) is absent until a refresh first reads it. The
+//!   state then decodes as never sampled, which no head counts as current: it refuses every quote
+//!   and reports no depth until a delta brings the rate in.
+//!
+//! Failing either case instead would lose the component for the life of the stream, since a
+//! component that fails to decode is never decoded again.
 
 use std::{collections::HashMap, str::FromStr};
 
-use alloy::primitives::U256;
+use alloy::primitives::{I256, U256};
 use tycho_client::feed::{synchronizer::ComponentWithState, BlockHeader};
 use tycho_common::{models::token::Token, Bytes};
 
 use super::{
+    clock::NEVER_SAMPLED,
     math::market::MarketState,
     state::{
         attribute_i256, attribute_u256, PendleMarketState, PendleState, PendleSyState, TokenClass,
@@ -96,10 +105,12 @@ fn decode_market(
         .ok_or_else(|| missing(ATTR_EXPIRY))?
         .saturating_to::<u64>();
 
-    let total_pt = attribute_i256(state, ATTR_TOTAL_PT).ok_or_else(|| missing(ATTR_TOTAL_PT))?;
-    let total_sy = attribute_i256(state, ATTR_TOTAL_SY).ok_or_else(|| missing(ATTR_TOTAL_SY))?;
-    let last_ln_implied_rate = attribute_u256(state, ATTR_LAST_LN_IMPLIED_RATE)
-        .ok_or_else(|| missing(ATTR_LAST_LN_IMPLIED_RATE))?;
+    // Written only from Mint, Burn, Swap and UpdateImpliedRate, so a market that has not seen its
+    // first liquidity yet carries none of them. The contract's storage is zero at that point too.
+    let total_pt = attribute_i256(state, ATTR_TOTAL_PT).unwrap_or(I256::ZERO);
+    let total_sy = attribute_i256(state, ATTR_TOTAL_SY).unwrap_or(I256::ZERO);
+    let last_ln_implied_rate =
+        attribute_u256(state, ATTR_LAST_LN_IMPLIED_RATE).unwrap_or(U256::ZERO);
     let ln_fee_rate_root = attribute_u256(state, ATTR_LN_FEE_RATE_ROOT)
         .ok_or_else(|| missing(ATTR_LN_FEE_RATE_ROOT))?;
     let reserve_fee_percent = attribute_u256(state, ATTR_RESERVE_FEE_PERCENT)
@@ -107,19 +118,7 @@ fn decode_market(
 
     // The live index, not the stored one. `py_index_stored` is a floor that drifts below the rate
     // the contract will actually use, so quoting off it is quietly wrong between interactions.
-    let py_index = attribute_u256(state, ATTR_PY_INDEX_CURRENT).ok_or_else(|| {
-        InvalidSnapshotError::MissingAttribute(format!(
-            "{ATTR_PY_INDEX_CURRENT} (py_index_stored alone is a stale floor and must not be \
-                 substituted)"
-        ))
-    })?;
-
-    // When `py_index` above was read. Required rather than defaulting to the header: the refresh
-    // emits the two together, and a header fallback would date a rate by a block it was not read
-    // at, which is precisely the claim the exactness guard exists to check.
-    let rate_sampled_at = attribute_u256(state, ATTR_RATE_SAMPLED_AT)
-        .ok_or_else(|| missing(ATTR_RATE_SAMPLED_AT))?
-        .saturating_to::<u64>();
+    let (py_index, rate_sampled_at) = rate_reading(state, ATTR_PY_INDEX_CURRENT)?;
 
     Ok(PendleMarketState {
         market: MarketState {
@@ -174,18 +173,12 @@ fn decode_sy(
         .ok_or_else(|| missing(ATTR_ASSET_DECIMALS))?
         .saturating_to::<u32>();
 
-    let exchange_rate = attribute_u256(state, ATTR_SY_EXCHANGE_RATE)
-        .ok_or_else(|| missing(ATTR_SY_EXCHANGE_RATE))?;
-    if exchange_rate.is_zero() {
+    let (exchange_rate, rate_sampled_at) = rate_reading(state, ATTR_SY_EXCHANGE_RATE)?;
+    if rate_sampled_at != NEVER_SAMPLED && exchange_rate.is_zero() {
         return Err(InvalidSnapshotError::ValueError(format!(
             "{ATTR_SY_EXCHANGE_RATE} is zero, which no live SY reports"
         )));
     }
-    // Dates the rate above, and is emitted with it. Required for the same reason it is on a
-    // market: a wrapper quote is only exact at the block its rate was read at.
-    let rate_sampled_at = attribute_u256(state, ATTR_RATE_SAMPLED_AT)
-        .ok_or_else(|| missing(ATTR_RATE_SAMPLED_AT))?
-        .saturating_to::<u64>();
 
     // One attribute per quotable token, named for the direction and the token. A token the indexer
     // could not classify has no attribute here and is simply not quotable.
@@ -235,6 +228,25 @@ fn decode_sy(
     })
 }
 
+/// Reads a rate and the block timestamp it was read at, which the refresh emits together.
+///
+/// A rate that was never read decodes as zero at [`NEVER_SAMPLED`], a state that refuses to quote
+/// until a delta brings the rate in. A rate without its timestamp is an error: dating it by the
+/// header instead would claim it was read at a block it was not, which is exactly what the
+/// exactness guard checks.
+fn rate_reading(
+    state: &HashMap<String, Bytes>,
+    rate_name: &str,
+) -> Result<(U256, u64), InvalidSnapshotError> {
+    let Some(rate) = attribute_u256(state, rate_name) else {
+        return Ok((U256::ZERO, NEVER_SAMPLED));
+    };
+    let rate_sampled_at = attribute_u256(state, ATTR_RATE_SAMPLED_AT)
+        .ok_or_else(|| missing(ATTR_RATE_SAMPLED_AT))?
+        .saturating_to::<u64>();
+    Ok((rate, rate_sampled_at))
+}
+
 fn token_classes(
     statics: &HashMap<String, Bytes>,
     prefix: &str,
@@ -254,4 +266,277 @@ fn token_classes(
         classes.insert(token, class);
     }
     Ok(classes)
+}
+
+#[cfg(test)]
+mod tests {
+    use num_bigint::BigUint;
+    use tycho_common::{
+        dto::ProtocolStateDelta,
+        models::{
+            protocol::{ProtocolComponent, ProtocolComponentState},
+            Chain,
+        },
+        simulation::{
+            errors::SimulationError,
+            protocol_sim::{Balances, ProtocolSim},
+        },
+    };
+
+    use super::*;
+
+    const MARKET: &str = "0x34280882267ffa6383b363e278b027be083bbe3b";
+    const SY: &str = "0xcbc72d92b2dc8187414f6734718563898740c0bc";
+    const PT: &str = "0xb253eff1104802b97ac7e3ac9fdd73aece295a2c";
+    const YT: &str = "0x04b7fa1e727d7290d6e24fa9b426d0c940283a95";
+    const WSTETH: &str = "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0";
+    const HEAD: u64 = 1_800_000_000;
+
+    fn word(value: u128) -> Bytes {
+        Bytes::from(
+            U256::from(value)
+                .to_be_bytes::<32>()
+                .to_vec(),
+        )
+    }
+
+    fn address_bytes(value: &str) -> Bytes {
+        Bytes::from_str(value).unwrap()
+    }
+
+    fn token(value: &str) -> Token {
+        Token::new(&address_bytes(value), "TKN", 18, 0, &[Some(10_000)], Chain::Ethereum, 100)
+    }
+
+    fn header() -> BlockHeader {
+        BlockHeader { timestamp: HEAD, ..Default::default() }
+    }
+
+    fn snapshot(
+        id: &str,
+        protocol_type_name: &str,
+        static_attributes: HashMap<String, Bytes>,
+        attributes: HashMap<String, Bytes>,
+    ) -> ComponentWithState {
+        ComponentWithState {
+            state: ProtocolComponentState {
+                component_id: id.to_string(),
+                attributes,
+                balances: HashMap::new(),
+            },
+            component: ProtocolComponent {
+                id: id.to_string(),
+                protocol_type_name: protocol_type_name.to_string(),
+                static_attributes,
+                ..Default::default()
+            },
+            component_tvl: None,
+            entrypoints: Vec::new(),
+        }
+    }
+
+    /// A market as the indexer emits it on the block the factory created it: statics and fees,
+    /// but no reserves and no rate yet.
+    fn created_market() -> ComponentWithState {
+        snapshot(
+            MARKET,
+            MARKET_TYPE,
+            HashMap::from([
+                (ATTR_SCALAR_ROOT.to_string(), word(86_364_560_000_000_000_000)),
+                (ATTR_EXPIRY.to_string(), word(1_830_124_800)),
+                (ATTR_SY_ADDRESS.to_string(), address_bytes(SY)),
+                (ATTR_PT_ADDRESS.to_string(), address_bytes(PT)),
+                (ATTR_YT_ADDRESS.to_string(), address_bytes(YT)),
+            ]),
+            HashMap::from([
+                (ATTR_LN_FEE_RATE_ROOT.to_string(), word(499_875_041_000_000)),
+                (ATTR_RESERVE_FEE_PERCENT.to_string(), word(80)),
+            ]),
+        )
+    }
+
+    fn created_sy() -> ComponentWithState {
+        snapshot(
+            SY,
+            SY_TYPE,
+            HashMap::from([
+                (ATTR_SY_DECIMALS.to_string(), word(18)),
+                (ATTR_ASSET_DECIMALS.to_string(), word(18)),
+                (
+                    format!("{ATTR_TOKEN_IN_CLASS_PREFIX}{}", &WSTETH[2..]),
+                    Bytes::from(b"one_to_one".to_vec()),
+                ),
+                (
+                    format!("{ATTR_TOKEN_OUT_CLASS_PREFIX}{}", &WSTETH[2..]),
+                    Bytes::from(b"one_to_one".to_vec()),
+                ),
+            ]),
+            HashMap::new(),
+        )
+    }
+
+    async fn decode(snapshot: ComponentWithState) -> Result<PendleState, InvalidSnapshotError> {
+        let tokens = HashMap::from([(address_bytes(WSTETH), token(WSTETH))]);
+        PendleState::try_from_with_header(
+            snapshot,
+            header(),
+            &HashMap::new(),
+            &tokens,
+            &DecoderContext::default(),
+        )
+        .await
+    }
+
+    fn delta(id: &str, attributes: Vec<(&str, Bytes)>) -> ProtocolStateDelta {
+        ProtocolStateDelta {
+            component_id: id.to_string(),
+            updated_attributes: attributes
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
+            deleted_attributes: Default::default(),
+        }
+    }
+
+    fn one() -> BigUint {
+        BigUint::from(10u64.pow(18))
+    }
+
+    #[tokio::test]
+    async fn a_market_created_this_block_decodes_and_waits_for_its_rate() {
+        let state = decode(created_market()).await.unwrap();
+
+        let (max_in, max_out) = state
+            .get_limits(address_bytes(SY), address_bytes(PT))
+            .unwrap();
+        assert_eq!((max_in, max_out), (BigUint::ZERO, BigUint::ZERO));
+        assert!(matches!(
+            state.get_amount_out(one(), &token(SY), &token(PT)),
+            Err(SimulationError::RecoverableError(_))
+        ));
+    }
+
+    /// The rate arrives before the first liquidity does. The market is current but empty.
+    #[tokio::test]
+    async fn a_market_with_a_rate_but_no_liquidity_reports_no_depth() {
+        let mut state = decode(created_market()).await.unwrap();
+        state
+            .delta_transition(
+                delta(
+                    MARKET,
+                    vec![
+                        (ATTR_PY_INDEX_CURRENT, word(1_241_884_000_000_000_000)),
+                        (ATTR_RATE_SAMPLED_AT, word(HEAD.into())),
+                        ("block_timestamp", word(HEAD.into())),
+                    ],
+                ),
+                &HashMap::new(),
+                &Balances::default(),
+            )
+            .unwrap();
+
+        let (max_in, max_out) = state
+            .get_limits(address_bytes(SY), address_bytes(PT))
+            .unwrap();
+        assert_eq!((max_in, max_out), (BigUint::ZERO, BigUint::ZERO));
+        assert!(matches!(
+            state.get_amount_out(one(), &token(SY), &token(PT)),
+            Err(SimulationError::RecoverableError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_created_market_quotes_once_liquidity_and_a_rate_arrive() {
+        let mut state = decode(created_market()).await.unwrap();
+        state
+            .delta_transition(
+                delta(
+                    MARKET,
+                    vec![
+                        (ATTR_TOTAL_PT, word(83_658_000_000_000_000_000)),
+                        (ATTR_TOTAL_SY, word(1_429_719_000_000_000_000_000)),
+                        (ATTR_LAST_LN_IMPLIED_RATE, word(20_211_000_000_000_000)),
+                        (ATTR_PY_INDEX_CURRENT, word(1_241_884_000_000_000_000)),
+                        (ATTR_RATE_SAMPLED_AT, word(HEAD.into())),
+                        ("block_timestamp", word(HEAD.into())),
+                    ],
+                ),
+                &HashMap::new(),
+                &Balances::default(),
+            )
+            .unwrap();
+
+        let (max_in, _) = state
+            .get_limits(address_bytes(SY), address_bytes(PT))
+            .unwrap();
+        assert!(max_in > BigUint::ZERO);
+        let quote = state
+            .get_amount_out(one(), &token(SY), &token(PT))
+            .unwrap();
+        assert!(quote.amount > BigUint::ZERO);
+    }
+
+    #[tokio::test]
+    async fn an_sy_whose_rate_was_never_read_decodes_and_waits_for_it() {
+        let mut state = decode(created_sy()).await.unwrap();
+
+        let (max_in, _) = state
+            .get_limits(address_bytes(WSTETH), address_bytes(SY))
+            .unwrap();
+        assert_eq!(max_in, BigUint::ZERO);
+        assert!(matches!(
+            state.get_amount_out(one(), &token(WSTETH), &token(SY)),
+            Err(SimulationError::RecoverableError(_))
+        ));
+
+        state
+            .delta_transition(
+                delta(
+                    SY,
+                    vec![
+                        (ATTR_SY_EXCHANGE_RATE, word(1_241_884_000_000_000_000)),
+                        (ATTR_RATE_SAMPLED_AT, word(HEAD.into())),
+                        ("block_timestamp", word(HEAD.into())),
+                    ],
+                ),
+                &HashMap::new(),
+                &Balances::default(),
+            )
+            .unwrap();
+        let quote = state
+            .get_amount_out(one(), &token(WSTETH), &token(SY))
+            .unwrap();
+        assert_eq!(quote.amount, one(), "wstETH wraps one to one");
+    }
+
+    /// The refresh emits the two together, so one without the other is a broken stream rather
+    /// than a rate that has not been read yet.
+    #[tokio::test]
+    async fn a_rate_without_its_timestamp_is_rejected() {
+        let mut market = created_market();
+        market
+            .state
+            .attributes
+            .insert(ATTR_PY_INDEX_CURRENT.to_string(), word(1_241_884_000_000_000_000));
+
+        let error = decode(market).await.unwrap_err();
+
+        assert!(
+            matches!(&error, InvalidSnapshotError::MissingAttribute(name) if name == ATTR_RATE_SAMPLED_AT),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_exchange_rate_of_zero_is_rejected() {
+        let mut sy = created_sy();
+        sy.state
+            .attributes
+            .insert(ATTR_SY_EXCHANGE_RATE.to_string(), word(0));
+        sy.state
+            .attributes
+            .insert(ATTR_RATE_SAMPLED_AT.to_string(), word(HEAD.into()));
+
+        assert!(matches!(decode(sy).await, Err(InvalidSnapshotError::ValueError(_))));
+    }
 }

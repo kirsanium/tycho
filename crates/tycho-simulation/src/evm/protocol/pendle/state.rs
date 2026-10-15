@@ -508,6 +508,10 @@ impl ProtocolSim for PendleState {
                 if !state.is_current() {
                     return Ok(no_depth());
                 }
+                // No liquidity yet. Every bound below divides by the reserves.
+                if state.market.total_pt <= I256::ZERO || state.market.total_sy <= I256::ZERO {
+                    return Ok(no_depth());
+                }
                 let (Some(from), Some(to)) = (state.role(&sell_token), state.role(&buy_token))
                 else {
                     return Ok(no_depth());
@@ -539,6 +543,10 @@ impl ProtocolSim for PendleState {
                 Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
             }
             PendleState::Sy(state) => {
+                // As for a market: a rate this state cannot quote with bounds nothing.
+                if !state.is_current() {
+                    return Ok(no_depth());
+                }
                 let Some((class, direction)) = state.class(&sell_token, &buy_token) else {
                     return Ok(no_depth());
                 };
@@ -549,11 +557,7 @@ impl ProtocolSim for PendleState {
                     Direction::Deposit => &sell_token,
                     Direction::Redeem => &buy_token,
                 };
-                let Some(token_decimals) = state
-                    .token_decimals
-                    .get(token)
-                    .copied()
-                else {
+                let Some(token_decimals) = state.token_decimals.get(token).copied() else {
                     return Ok(no_depth());
                 };
                 // Redeeming is capped by what the SY holds of the token being paid out, so that
