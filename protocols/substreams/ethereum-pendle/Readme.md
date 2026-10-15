@@ -19,6 +19,16 @@ resolution rules.
 Fee resolution is deliberately *read back* from the factory rather than re-derived in Rust — the
 events say which markets moved and when, and `getMarketConfig` says what to.
 
+### Factory upgrades
+
+The V6 factory (`0x6d247b1c…`) is a `TransparentUpgradeableProxy`; the other four are immutable.
+The decoders are not version-guarded, so an implementation that changed `CreateNewMarket` or a fee
+event would stop matching without an error: new markets would not be discovered and fees would
+stop updating. `map_market_components` logs every event from a known factory that neither factory
+ABI declares, with its topic0, so an upgrade, or a changed event, leaves a trace in the module
+logs. Nothing acts on it yet. How upgrades should be handled (halting on the proxy's `Upgraded`
+event, a version check at market creation, or pinning the implementation slot) is still open.
+
 ## SY classification
 
 An SY wraps a different protocol per instance, so there is no single deposit/redeem formula. At

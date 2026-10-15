@@ -29,6 +29,17 @@ pub fn map_market_components(block: eth::Block) -> Result<BlockTransactionProtoc
     for tx in block.transactions() {
         let mut components = Vec::new();
         for log in tx.logs_with_calls().map(|(log, _)| log) {
+            if is_unknown_factory_event(log) {
+                log::info!(
+                    "Pendle factory 0x{} emitted an event this package does not decode (topic0 \
+                     0x{}); the factory may have been upgraded",
+                    hex::encode(&log.address),
+                    log.topics
+                        .first()
+                        .map(hex::encode)
+                        .unwrap_or_default()
+                );
+            }
             let Some(creation) = decode_creation(log) else { continue };
             components.extend(build_components(&creation));
         }
@@ -73,6 +84,28 @@ fn decode_creation(log: &eth::Log) -> Option<MarketCreation> {
         });
     }
     None
+}
+
+/// Whether `log` comes from a known factory but matches no event that factory's ABI declares.
+///
+/// The V6 factory is an upgradeable proxy. An implementation that changed an event's shape would
+/// stop `decode_creation` and `fee_scope` matching it without an error, so new markets or fee
+/// updates would go missing silently. Logging what does not match leaves a trace of that. Admin
+/// events the ABIs leave out, such as an `Upgraded` on the proxy, are logged too, which is wanted.
+fn is_unknown_factory_event(log: &eth::Log) -> bool {
+    let Ok(address) = <[u8; 20]>::try_from(log.address.as_slice()) else { return false };
+    if address == MARKET_FACTORY_V1 {
+        return !(pendle_market_factory_v1::events::CreateNewMarket::match_log(log) ||
+            pendle_market_factory_v1::events::NewMarketConfig::match_log(log) ||
+            pendle_market_factory_v1::events::SetOverriddenFee::match_log(log) ||
+            pendle_market_factory_v1::events::UnsetOverriddenFee::match_log(log));
+    }
+    if MARKET_FACTORIES_V3_PLUS.contains(&address) {
+        return !(pendle_market_factory::events::CreateNewMarket::match_log(log) ||
+            pendle_market_factory::events::SetOverriddenFee::match_log(log) ||
+            pendle_market_factory::events::NewTreasuryAndFeeReserve::match_log(log));
+    }
+    false
 }
 
 fn build_components(creation: &MarketCreation) -> Vec<ProtocolComponent> {
@@ -417,4 +450,56 @@ where
         .iter()
         .map(RpcBatch::decode::<_, F>)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FACTORY_V6: &str = "6d247b1c044fa1e22e6b04fa9f71baf99eb29a9f";
+    /// Topic0s taken from chain rather than from the bindings under test.
+    const NEW_TREASURY_AND_FEE_RESERVE: &str =
+        "c612910a1561af820dd8961721344b949df6bfcb3cd8dda1f87a5f25e80852cb";
+    const TREASURY_TOPIC: &str = "0000000000000000000000008270400d528c34e1596ef367eedec99080a1b592";
+    /// EIP-1967 `Upgraded(address)`.
+    const UPGRADED: &str = "bc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b";
+    const IMPLEMENTATION_TOPIC: &str =
+        "0000000000000000000000001111111111111111111111111111111111111111";
+
+    /// One ABI word of data, which every event used here carries.
+    fn log(address: &str, topics: &[&str]) -> eth::Log {
+        eth::Log {
+            address: hex::decode(address).unwrap(),
+            topics: topics
+                .iter()
+                .map(|t| hex::decode(t).unwrap())
+                .collect(),
+            data: vec![0; 32],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_declared_factory_event_is_known() {
+        let treasury = log(FACTORY_V6, &[NEW_TREASURY_AND_FEE_RESERVE, TREASURY_TOPIC]);
+        assert!(!is_unknown_factory_event(&treasury));
+    }
+
+    #[test]
+    fn a_proxy_upgrade_on_a_factory_is_unknown() {
+        assert!(is_unknown_factory_event(&log(FACTORY_V6, &[UPGRADED, IMPLEMENTATION_TOPIC])));
+    }
+
+    /// A known event whose shape changed — here, one indexed topic fewer — no longer matches, which
+    /// is the case the guard exists for.
+    #[test]
+    fn a_declared_event_with_a_changed_shape_is_unknown() {
+        assert!(is_unknown_factory_event(&log(FACTORY_V6, &[NEW_TREASURY_AND_FEE_RESERVE])));
+    }
+
+    #[test]
+    fn a_log_from_any_other_address_is_not_a_factory_event() {
+        let market = "34280882267ffa6383b363e278b027be083bbe3b";
+        assert!(!is_unknown_factory_event(&log(market, &[UPGRADED, IMPLEMENTATION_TOPIC])));
+    }
 }
