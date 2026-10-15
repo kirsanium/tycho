@@ -55,6 +55,9 @@ contract PendleExecutor is IExecutor {
     {
         (PendleEdge edge, address tokenIn, address tokenOut, address target) =
             _decodeData(data);
+        if (_isMarketEdge(edge)) {
+            _checkMarketPair(edge, tokenIn, tokenOut, target);
+        }
 
         if (edge == PendleEdge.SyForPt) {
             // An all-zero ApproxParams together with an empty LimitOrderData is what makes
@@ -137,6 +140,33 @@ contract PendleExecutor is IExecutor {
         }
         transferType = TransferManager.TransferType.ProtocolWillDebit;
         outputToRouter = false;
+    }
+
+    /// @dev Router V4 trades whatever market it is handed, so this confirms the market trades
+    /// the pair the calldata declares before any token moves, as the SY edges already check
+    /// their target. Done in `swap` only: `getTransferData` is staticcalled on every hop, and the
+    /// router's balance diff already catches an output token the swap did not produce.
+    function _checkMarketPair(
+        PendleEdge edge,
+        address tokenIn,
+        address tokenOut,
+        address market
+    ) internal view {
+        (address sy, address pt, address yt) = IPMarket(market).readTokens();
+        address expectedIn;
+        address expectedOut;
+        if (edge == PendleEdge.SyForPt) {
+            (expectedIn, expectedOut) = (sy, pt);
+        } else if (edge == PendleEdge.PtForSy) {
+            (expectedIn, expectedOut) = (pt, sy);
+        } else if (edge == PendleEdge.SyForYt) {
+            (expectedIn, expectedOut) = (sy, yt);
+        } else {
+            (expectedIn, expectedOut) = (yt, sy);
+        }
+        if (tokenIn != expectedIn || tokenOut != expectedOut) {
+            revert PendleExecutor__InvalidTarget();
+        }
     }
 
     function _isMarketEdge(PendleEdge edge) internal pure returns (bool) {
@@ -258,6 +288,13 @@ interface IPendleRouterV4 {
         uint256 minSyOut,
         LimitOrderData calldata limit
     ) external returns (uint256 netSyOut, uint256 netSyFee);
+}
+
+interface IPMarket {
+    function readTokens()
+        external
+        view
+        returns (address sy, address pt, address yt);
 }
 
 interface IStandardizedYield is IERC20 {

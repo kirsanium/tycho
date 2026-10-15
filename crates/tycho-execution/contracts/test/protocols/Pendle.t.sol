@@ -355,6 +355,36 @@ contract PendleExecutorTest is Constants, TestUtils {
         }
     }
 
+    /// A market edge whose declared pair is not the market's fails before any token moves, in
+    /// either direction of the mismatch.
+    function testMarketEdgeRejectsAPairTheMarketDoesNotTrade() public {
+        _fund(PENDLE_WSTETH_SY, 1e18, PENDLE_ROUTER_V4);
+
+        vm.expectRevert(PendleExecutor__InvalidTarget.selector);
+        pendleExposed.swap(
+            1e18,
+            _data(
+                PendleEdge.SyForPt,
+                PENDLE_WSTETH_SY,
+                PENDLE_WSTETH_YT,
+                PENDLE_WSTETH_MARKET
+            ),
+            BOB
+        );
+
+        vm.expectRevert(PendleExecutor__InvalidTarget.selector);
+        pendleExposed.swap(
+            1e18,
+            _data(
+                PendleEdge.SyForYt,
+                WSTETH_ADDR,
+                PENDLE_WSTETH_YT,
+                PENDLE_WSTETH_MARKET
+            ),
+            BOB
+        );
+    }
+
     /// The router is immutable, so a zero address would leave every market edge calling nothing
     /// with no way to correct it.
     function testConstructorRejectsZeroRouter() public {
