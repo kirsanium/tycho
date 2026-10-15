@@ -390,6 +390,9 @@ impl Executor {
                     // and currently is ignored anyway
                     Address::SENDER_CONTROLLED,
                 )?;
+                if token_in == Address::NativeETH || token_out == Address::NativeETH {
+                    return Err(Error::revert("PendleExecutor: native ETH is unsupported"));
+                }
 
                 Ok(TransferData {
                     transfer_type: TransferType::ProtocolWillDebit,

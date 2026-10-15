@@ -4,11 +4,13 @@ pragma solidity ^0.8.26;
 import {IExecutor} from "@interfaces/IExecutor.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TransferManager} from "../TransferManager.sol";
+import {ETH_ADDRESS} from "../../lib/NativeETH.sol";
 
 error PendleExecutor__InvalidDataLength();
 error PendleExecutor__InvalidEdge();
 error PendleExecutor__InvalidTarget();
 error PendleExecutor__InvalidRouter();
+error PendleExecutor__NativeEthUnsupported();
 
 /// @notice The six edges a Pendle market exposes to a router.
 /// @dev The four market edges run through Pendle Router V4; the two SY edges call the SY
@@ -164,6 +166,15 @@ contract PendleExecutor is IExecutor {
         tokenIn = address(bytes20(data[1:21]));
         tokenOut = address(bytes20(data[21:41]));
         target = address(bytes20(data[41:61]));
+        // Every edge pulls an ERC-20 with transferFrom and forwards no value. The router names
+        // native ETH by its sentinel and some SYs list it as the zero address.
+        if (_isNative(tokenIn) || _isNative(tokenOut)) {
+            revert PendleExecutor__NativeEthUnsupported();
+        }
+    }
+
+    function _isNative(address token) internal pure returns (bool) {
+        return token == ETH_ADDRESS || token == address(0);
     }
 
     function _emptyLimitOrderData()

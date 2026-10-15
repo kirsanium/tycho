@@ -328,6 +328,33 @@ contract PendleExecutorTest is Constants, TestUtils {
         );
     }
 
+    /// Calldata the encoder would never produce: native ETH, by the router's sentinel or the zero
+    /// address an SY may list, fails at the decode with a typed error.
+    function testDecodeParamsRejectsNativeEth() public {
+        address[2] memory natives =
+            [address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE), address(0)];
+        for (uint256 i = 0; i < natives.length; i++) {
+            vm.expectRevert(PendleExecutor__NativeEthUnsupported.selector);
+            pendleExposed.decodeParams(
+                _data(
+                    PendleEdge.TokenForSy,
+                    natives[i],
+                    PENDLE_WSTETH_SY,
+                    PENDLE_WSTETH_SY
+                )
+            );
+            vm.expectRevert(PendleExecutor__NativeEthUnsupported.selector);
+            pendleExposed.decodeParams(
+                _data(
+                    PendleEdge.SyForToken,
+                    PENDLE_WSTETH_SY,
+                    natives[i],
+                    PENDLE_WSTETH_SY
+                )
+            );
+        }
+    }
+
     /// The router is immutable, so a zero address would leave every market edge calling nothing
     /// with no way to correct it.
     function testConstructorRejectsZeroRouter() public {
