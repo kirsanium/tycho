@@ -736,6 +736,28 @@ fn redeeming_is_bounded_by_supply_and_depositing_is_not() {
     assert_eq!(deposit_in, BigUint::from(u128::MAX));
 }
 
+/// A redemption past the limit is refused rather than quoted: on chain the burn reverts once it
+/// asks for more SY than exists, and a quote that floored the supply at zero would price it.
+#[rstest::rstest]
+#[case::paid_in_wsteth(WSTETH)]
+#[case::paid_in_steth(STETH)]
+fn a_redemption_past_the_limit_is_invalid_input(#[case] exit: &str) {
+    let sy = Bytes::from_str(SY).unwrap();
+    let (limit, _) = wsteth_sy()
+        .get_limits(sy, Bytes::from_str(exit).unwrap())
+        .unwrap();
+    wsteth_sy()
+        .get_amount_out(limit.clone(), &token(SY, 18), &token(exit, 18))
+        .expect("the limit itself must be quotable");
+
+    for amount in [limit + 1u32, u256_to_biguint(u("1000000000000000000000000000000"))] {
+        let error = wsteth_sy()
+            .get_amount_out(amount, &token(SY, 18), &token(exit, 18))
+            .unwrap_err();
+        assert!(matches!(error, SimulationError::InvalidInput(_, None)), "{error:?}");
+    }
+}
+
 /// Both bounds on a wrap edge are only meaningful if the input they report actually produces the
 /// output they report. Asserted on the decimal-gap component, where substituting the SY's decimals
 /// for the token's — the shape this once had — leaves the redeem bound yielding nothing at all.

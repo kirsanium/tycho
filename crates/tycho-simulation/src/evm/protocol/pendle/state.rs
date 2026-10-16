@@ -481,6 +481,16 @@ impl ProtocolSim for PendleState {
                     TokenClass::OneToOne => GAS_WRAP_ONE_TO_ONE,
                     TokenClass::IndexRate => GAS_WRAP_INDEX_RATE,
                 };
+                // The burn reverts on chain past the shares that exist, which the limit sits under.
+                if direction == Direction::Redeem && amount > state.max_redeem_sy() {
+                    return Err(SimulationError::InvalidInput(
+                        format!(
+                            "redeeming {amount} SY exceeds the {} the SY can redeem",
+                            state.max_redeem_sy()
+                        ),
+                        None,
+                    ));
+                }
                 let out = state.convert(amount, class, direction, token_decimals)?;
                 let after = state.after(direction, amount, out)?;
                 (out, gas, PendleState::Sy(after))
@@ -771,7 +781,8 @@ impl PendleSyState {
                 .ok_or(PendleError::Overflow { operation: "SY supply after a deposit" })?,
             Direction::Redeem => self
                 .total_supply
-                .saturating_sub(amount_in),
+                .checked_sub(amount_in)
+                .ok_or(PendleError::Overflow { operation: "SY supply after a redemption" })?,
         };
         Ok(next)
     }
