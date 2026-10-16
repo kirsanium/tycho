@@ -97,6 +97,7 @@ modules:
       - source: sf.ethereum.type.v2.Block
       - map: map_protocol_components
       - store: store_protocol_components
+      - store: store_market_registry
     output:
       type: proto:tycho.evm.v1.BlockChanges
 

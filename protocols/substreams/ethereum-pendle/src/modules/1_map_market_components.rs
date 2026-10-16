@@ -7,7 +7,7 @@ use crate::{
     abi::{pendle_market, pendle_market_factory, pendle_market_factory_v1},
     consts::{MARKET_FACTORIES_V3_PLUS, MARKET_FACTORY_V1, PENDLE_MARKET},
     keys::contract_id,
-    sy::profile_sy,
+    sy::{profile_sy, read_paused, CREATION_SY_PAUSED},
 };
 
 /// Discovers markets from the factories' creation events and resolves what the events omit.
@@ -165,6 +165,13 @@ fn build_components(creation: &MarketCreation) -> Vec<ProtocolComponent> {
         attributes.push(("sy_decimals", BigInt::from(sy.decimals).to_signed_bytes_be()));
         attributes.push(("asset_decimals", BigInt::from(sy.asset_decimals).to_signed_bytes_be()));
     }
+    // A paused SY reverts every transfer, so the market cannot trade either. The profile already
+    // read it; only a market whose SY did not profile costs a read of its own.
+    let sy_paused = match &sy {
+        Some(sy) => sy.paused,
+        None => read_paused(&sy_address),
+    };
+    attributes.push((CREATION_SY_PAUSED, vec![u8::from(sy_paused)]));
     let market = ProtocolComponent::new(&contract_id(&creation.market))
         .with_tokens(&[sy_address.clone(), pt_address, yt_address])
         .with_attributes(&attributes)

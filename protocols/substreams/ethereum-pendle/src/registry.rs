@@ -130,6 +130,17 @@ pub fn sy_components(registry: &str) -> Vec<String> {
     seen
 }
 
+/// Returns the id of every market priced against `sy`, expired or not, in registry order.
+///
+/// Not filtered by expiry: a market's quotes refuse once it expires anyway, and a market's pause
+/// flag should still be right if a consumer looks at it afterwards.
+pub fn markets_of_sy(registry: &str, sy: &str) -> Vec<String> {
+    entries(registry)
+        .filter(|entry| entry.sy == sy)
+        .map(|entry| entry.id)
+        .collect()
+}
+
 /// Parses the registry, skipping lines that do not decode.
 fn entries(registry: &str) -> impl Iterator<Item = MarketEntry> + '_ {
     registry
@@ -238,6 +249,15 @@ mod tests {
         let market = wsteth();
         assert!(market.is_from(&hex::decode(FACTORY_V1).unwrap()));
         assert!(!market.is_from(&hex::decode("6d247b1c044fa1e22e6b04fa9f71baf99eb29a9f").unwrap()));
+    }
+
+    #[test]
+    fn an_sy_lists_every_market_priced_against_it() {
+        let later = entry("0xdead", &wsteth().sy, 1_000);
+        let other = entry("0xbeef", "0xcafe", 2_000_000_000);
+        let registry = format!("{};{};{};", wsteth().encode(), other.encode(), later.encode());
+        assert_eq!(markets_of_sy(&registry, &wsteth().sy), vec![wsteth().id, later.id]);
+        assert!(markets_of_sy(&registry, "0xabc").is_empty());
     }
 
     #[test]

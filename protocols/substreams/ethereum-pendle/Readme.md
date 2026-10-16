@@ -50,13 +50,15 @@ answers its probe and deletes those that answer but no longer match. A token who
 keeps its class: upgrades usually happen while an SY is paused, and a paused SY reverts its
 previews, so the re-run on `Unpaused` is the one that classifies such an upgrade. A token an
 upgrade adds stays unquotable, since a component's token list is fixed at creation. `Paused` and
-`Unpaused` set the `paused` attribute.
+`Unpaused` set the SY's `paused` attribute, and `sy_paused` on every market priced against it: a
+paused SY reverts every transfer, so none of those markets can trade either.
 
 ## What is read, and when
 
 | Value | Read | Then follows |
 |---|---|---|
 | Classes, `paused` | Once, at creation | `Upgraded`, `Paused`, `Unpaused` |
+| Market `sy_paused` | The SY's `paused()`, at market creation (from the SY profile) | The SY's `Paused`, `Unpaused` |
 | SY supply | `totalSupply()` once, at creation | The SY's own mints and burns |
 | SY balances | `balanceOf` once per token, at creation | `Transfer`s |
 | Exchange rate | Every refresh block | — |

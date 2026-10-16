@@ -3,16 +3,18 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::Result;
 use substreams::{
     hex, log,
-    store::{StoreGet, StoreGetRaw},
+    store::{StoreGet, StoreGetRaw, StoreGetString},
 };
 use substreams_ethereum::pb::eth::v2 as eth;
 use tycho_substreams::prelude::*;
 
 use crate::{
-    keys::contract_id,
+    consts::PENDLE_MARKET,
+    keys::{contract_id, MARKET_REGISTRY},
+    registry::markets_of_sy,
     sy::{
-        class_attributes, classify_sy, is_class_attribute, Classification, CREATION_PAUSED, PAUSED,
-        TOKEN_IN_CLASS_PREFIX, TOKEN_OUT_CLASS_PREFIX,
+        class_attributes, classify_sy, is_class_attribute, Classification, CREATION_PAUSED,
+        CREATION_SY_PAUSED, PAUSED, SY_PAUSED, TOKEN_IN_CLASS_PREFIX, TOKEN_OUT_CLASS_PREFIX,
     },
     transfers::{is_market, new_sy_components},
 };
@@ -40,13 +42,18 @@ const UPGRADED_TOPIC: [u8; 32] =
 ///   is what classifies such an upgrade once the SY answers again. Only the tokens the component
 ///   lists can be classified: its token list is fixed at creation.
 ///
-/// A new SY's own events in its creation block are skipped: its creation state is read at the end
-/// of that block and already includes them.
+/// A paused SY reverts every transfer, and every market swap moves SY, so each market also carries
+/// `sy_paused`: its SY's pause flag as read at the market's creation, then set by the SY's
+/// `Paused` and `Unpaused` on every market priced against it.
+///
+/// A new component's own events in its creation block are skipped: its creation state is read at
+/// the end of that block and already includes them.
 #[substreams::handlers::map]
 pub fn map_sy_state(
     block: eth::Block,
     new_components: BlockTransactionProtocolComponents,
     components_store: StoreGetRaw,
+    registry_store: StoreGetString,
 ) -> Result<BlockChanges> {
     let mut changes: BTreeMap<u64, TransactionChanges> = BTreeMap::new();
     let mut record = |tx: &Transaction, change: EntityChanges| {
@@ -65,13 +72,26 @@ pub fn map_sy_state(
     for (tx, component) in &created {
         record(tx, creation_state(component));
     }
+    let new_markets = new_market_components(&new_components);
+    for (tx, market) in &new_markets {
+        record(tx, market_creation_state(market));
+    }
+    let new_market_ids: HashSet<&str> = new_markets
+        .iter()
+        .map(|(_, market)| market.id.as_str())
+        .collect();
 
     // The last upgrade or unpause per SY in this block, keyed by SY so a re-profile runs once.
     let mut reprofile: BTreeMap<String, Transaction> = BTreeMap::new();
+    // Every pause change, from any emitter, for the markets of whichever SY it turns out to be.
+    let mut pauses: Vec<(Transaction, String, bool)> = Vec::new();
     for tx in block.transactions() {
         for log in tx.logs_with_calls().map(|(log, _)| log) {
             let Some(topic) = log.topics.first() else { continue };
             let sy_id = contract_id(&log.address);
+            if topic.as_slice() == PAUSED_TOPIC || topic.as_slice() == UNPAUSED_TOPIC {
+                pauses.push((tx.into(), sy_id.clone(), topic.as_slice() == PAUSED_TOPIC));
+            }
             if seeded.contains(sy_id.as_str()) ||
                 !components_store.has_last(&sy_id) ||
                 is_market(&components_store, &sy_id)
@@ -96,6 +116,18 @@ pub fn map_sy_state(
                     attributes: vec![update(PAUSED, vec![u8::from(paused)])],
                 },
             );
+        }
+    }
+
+    // An SY's markets are found through the registry, which is parsed only on a block that paused
+    // or unpaused something. A market can predate its SY's component, when the SY did not profile
+    // for the first market on it, so the SY being a component is not required here.
+    if !pauses.is_empty() {
+        let registry = registry_store
+            .get_last(MARKET_REGISTRY)
+            .unwrap_or_default();
+        for (tx, change) in market_pause_changes(&registry, &pauses, &new_market_ids) {
+            record(&tx, change);
         }
     }
 
@@ -136,6 +168,62 @@ fn creation_state(component: &ProtocolComponent) -> EntityChanges {
         .unwrap_or_else(|| panic!("SY {} was created without its pause seed", component.id));
     attributes.push(update(PAUSED, paused));
     EntityChanges { component_id: component.id.clone(), attributes }
+}
+
+/// `sy_paused` on every market of each SY that paused or unpaused, in event order, leaving out the
+/// markets created this block, whose creation read already includes it. An emitter that is not an
+/// SY in the registry has no markets and yields nothing.
+fn market_pause_changes(
+    registry: &str,
+    pauses: &[(Transaction, String, bool)],
+    new_markets: &HashSet<&str>,
+) -> Vec<(Transaction, EntityChanges)> {
+    let mut changes = Vec::new();
+    for (tx, sy_id, paused) in pauses {
+        for market in markets_of_sy(registry, sy_id) {
+            if new_markets.contains(market.as_str()) {
+                continue;
+            }
+            changes.push((
+                tx.clone(),
+                EntityChanges {
+                    component_id: market,
+                    attributes: vec![update(SY_PAUSED, vec![u8::from(*paused)])],
+                },
+            ));
+        }
+    }
+    changes
+}
+
+/// A new market's `sy_paused`, taken from what was read at its creation.
+fn market_creation_state(market: &ProtocolComponent) -> EntityChanges {
+    let paused = market
+        .get_attribute_value(CREATION_SY_PAUSED)
+        .unwrap_or_else(|| panic!("market {} was created without its SY's pause seed", market.id));
+    EntityChanges { component_id: market.id.clone(), attributes: vec![update(SY_PAUSED, paused)] }
+}
+
+fn new_market_components(
+    components: &BlockTransactionProtocolComponents,
+) -> Vec<(&Transaction, &ProtocolComponent)> {
+    let mut created = Vec::new();
+    for tx_components in &components.tx_components {
+        let tx = tx_components
+            .tx
+            .as_ref()
+            .expect("component batch without a transaction");
+        for component in &tx_components.components {
+            let is_market = component
+                .protocol_type
+                .as_ref()
+                .is_some_and(|t| t.name == PENDLE_MARKET);
+            if is_market {
+                created.push((tx, component));
+            }
+        }
+    }
+    created
 }
 
 /// Every class attribute of the listed tokens after a re-classification: an update for each token
@@ -283,6 +371,66 @@ mod tests {
                 (format!("token_out_class_0x{sy}"), true),
             ]
         );
+    }
+
+    /// A pause reaches every market of its SY, an unpause clears it, and a market created this
+    /// block is left to its creation read. A `Paused` from a contract that is no SY changes
+    /// nothing.
+    #[test]
+    fn a_pause_reaches_every_market_of_its_sy() {
+        use crate::registry::MarketEntry;
+        let sy = format!("0x{}", hex::encode(SY));
+        let market = |id: &str, sy: &str| MarketEntry {
+            id: id.to_string(),
+            sy: sy.to_string(),
+            expiry: 1,
+            factory: "27b1dacd74688af24a64bd3c9c1b143118740784".to_string(),
+            ln_fee_rate_root_at_creation: "0".to_string(),
+        };
+        let registry = [
+            market("0xaa", &sy),
+            market("0xbb", "0xcafe"),
+            market("0xcc", &sy),
+            market("0xdd", &sy),
+        ]
+        .iter()
+        .map(|entry| format!("{};", entry.encode()))
+        .collect::<String>();
+        let tx = |index: u64| Transaction { index, ..Default::default() };
+        let pauses = vec![
+            (tx(1), sy.clone(), true),
+            (tx(2), "0x0000000000000000000000000000000000000001".to_string(), true),
+            (tx(3), sy.clone(), false),
+        ];
+        let created_this_block = HashSet::from(["0xdd"]);
+
+        let changes: Vec<(u64, String, Vec<u8>)> =
+            market_pause_changes(&registry, &pauses, &created_this_block)
+                .into_iter()
+                .map(|(tx, change)| {
+                    assert_eq!(change.attributes.len(), 1);
+                    assert_eq!(change.attributes[0].name, SY_PAUSED);
+                    (tx.index, change.component_id, change.attributes[0].value.clone())
+                })
+                .collect();
+        assert_eq!(
+            changes,
+            vec![
+                (1, "0xaa".to_string(), vec![1]),
+                (1, "0xcc".to_string(), vec![1]),
+                (3, "0xaa".to_string(), vec![0]),
+                (3, "0xcc".to_string(), vec![0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_market_starts_with_its_sy_pause_as_read_at_creation() {
+        let market = ProtocolComponent::new("0x34280882267ffa6383b363e278b027be083bbe3b")
+            .with_attributes(&[("expiry", vec![1u8]), (CREATION_SY_PAUSED, vec![1u8])]);
+        let state = market_creation_state(&market);
+        assert_eq!(by_name(&state.attributes), vec![(SY_PAUSED.to_string(), false)]);
+        assert_eq!(state.attributes[0].value, vec![1u8]);
     }
 
     #[test]

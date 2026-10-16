@@ -576,6 +576,7 @@ mod tests {
                     b"one_to_one".to_vec(),
                 ),
                 (crate::sy::CREATION_PAUSED, vec![0u8]),
+                (crate::sy::CREATION_SY_PAUSED, vec![0u8]),
             ]);
         let names: Vec<String> = as_emitted(&component)
             .static_att

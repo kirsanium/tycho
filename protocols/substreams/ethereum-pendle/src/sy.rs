@@ -163,6 +163,12 @@ pub const CREATION_BALANCE_PREFIX: &str = "creation_balance_0x";
 pub const CREATION_PAUSED: &str = "creation_paused";
 /// State attribute: whether the SY is paused, which refuses every quote against it.
 pub const PAUSED: &str = "paused";
+/// Static attribute carrying whether a market's SY was paused when the market was created.
+/// Consumed by `map_sy_state` and stripped before the component is emitted.
+pub const CREATION_SY_PAUSED: &str = "creation_sy_paused";
+/// State attribute on a market: whether its SY is paused. A paused SY reverts every transfer, and
+/// every market swap moves SY, so this refuses every quote against the market.
+pub const SY_PAUSED: &str = "sy_paused";
 /// Prefixes of the per-token class attributes, followed by the token's hex address. Emitted as
 /// state, since an upgrade can change how a token converts.
 pub const TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
@@ -172,6 +178,7 @@ pub const TOKEN_OUT_CLASS_PREFIX: &str = "token_out_class_0x";
 pub fn is_creation_seed(name: &str) -> bool {
     name == CREATION_TOTAL_SUPPLY ||
         name == CREATION_PAUSED ||
+        name == CREATION_SY_PAUSED ||
         name.starts_with(CREATION_BALANCE_PREFIX)
 }
 
@@ -397,6 +404,22 @@ struct Seeds {
     total_supply: BigInt,
     holdings: Vec<(Vec<u8>, BigInt)>,
     paused: bool,
+}
+
+/// Reads whether the SY is paused, for a market whose SY did not profile. An SY without a
+/// `paused()` cannot be paused, and one that does not answer is taken as not paused: its market
+/// then quotes as it would have before this flag existed.
+pub(crate) fn read_paused(sy_address: &[u8]) -> bool {
+    RpcBatch::new()
+        .add(pendle_sy::functions::Paused {}, sy_address.to_vec())
+        .execute()
+        .ok()
+        .and_then(|r| {
+            r.responses
+                .first()
+                .and_then(RpcBatch::decode::<_, pendle_sy::functions::Paused>)
+        })
+        .unwrap_or(false)
 }
 
 fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
