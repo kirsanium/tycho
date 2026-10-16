@@ -12,6 +12,10 @@ pub const MARKET_FACTORIES_V3_PLUS: [[u8; 20]; 4] = [
     hex!("6d247b1c044fa1e22e6b04fa9f71baf99eb29a9f"),
 ];
 
+/// WETH9. It wraps and unwraps with `Deposit` and `Withdrawal` and emits no `Transfer` for
+/// either, so a component's WETH balance has to follow those two events as well.
+pub const WETH: [u8; 20] = hex!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+
 pub const PENDLE_MARKET: &str = "pendle_market";
 pub const PENDLE_SY: &str = "pendle_sy";
 

@@ -5,10 +5,13 @@ use substreams::{
     store::{StoreGet, StoreGetRaw},
 };
 use substreams_ethereum::{pb::eth::v2 as eth, Event};
-use tycho_substreams::{abi::erc20, prelude::*};
+use tycho_substreams::{
+    abi::{erc20, weth},
+    prelude::*,
+};
 
 use crate::{
-    consts::PENDLE_SY,
+    consts::{PENDLE_SY, WETH},
     keys::{contract_id, market_tokens_key},
 };
 
@@ -30,8 +33,7 @@ pub fn component_transfers<'a>(
     let mut transfers = Vec::new();
     for tx in block.transactions() {
         for log in tx.logs_with_calls().map(|(log, _)| log) {
-            let Some(transfer) = erc20::events::Transfer::match_and_decode(log) else { continue };
-            for (holder, amount) in holder_deltas(&transfer) {
+            for (holder, amount) in log_holder_deltas(log) {
                 let component_id = contract_id(&holder);
                 let Some(tokens) = components_store.get_last(&component_id) else { continue };
                 let tokens: Vec<Vec<u8>> = serde_sibor::from_bytes(&tokens)
@@ -116,6 +118,31 @@ pub fn new_sy_components(
         }
     }
     created
+}
+
+/// The signed balance change a log makes to each holder: a `Transfer`'s two sides, or WETH9's
+/// `Deposit` and `Withdrawal`, which wrap and unwrap ether without a `Transfer`. An SY taking
+/// WETH and unwrapping it to stake ether would otherwise keep that WETH on its books.
+///
+/// The two WETH events are honoured from WETH9 only. Another token emitting events of the same
+/// shape alongside its own mint and burn `Transfer`s would be counted twice.
+fn log_holder_deltas(log: &eth::Log) -> Vec<(Vec<u8>, BigInt)> {
+    if let Some(transfer) = erc20::events::Transfer::match_and_decode(log) {
+        return holder_deltas(&transfer);
+    }
+    if log.address.as_slice() != WETH {
+        return vec![];
+    }
+    if let Some(deposit) = weth::events::Deposit::match_and_decode(log) {
+        if deposit.wad != BigInt::zero() {
+            return vec![(deposit.dst, deposit.wad)];
+        }
+    } else if let Some(withdrawal) = weth::events::Withdrawal::match_and_decode(log) {
+        if withdrawal.wad != BigInt::zero() {
+            return vec![(withdrawal.src, withdrawal.wad.neg())];
+        }
+    }
+    vec![]
 }
 
 /// Splits a transfer into the signed change it makes to each side's balance.
@@ -215,6 +242,47 @@ mod tests {
             holders.dedup();
             assert_eq!(holders.len(), count, "duplicate holder for a transfer {from:?} -> {to:?}");
         }
+    }
+
+    /// WETH9 `Deposit(address indexed dst, uint wad)` and `Withdrawal(address indexed src, uint
+    /// wad)`, by topic0 as mainnet logs carry them.
+    const WETH_DEPOSIT: &str = "e1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c";
+    const WETH_WITHDRAWAL: &str =
+        "7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65";
+
+    fn weth_event(address: [u8; 20], topic0: &str, holder: [u8; 20], wad: u64) -> eth::Log {
+        let mut holder_topic = vec![0u8; 12];
+        holder_topic.extend_from_slice(&holder);
+        let mut data = vec![0u8; 24];
+        data.extend_from_slice(&wad.to_be_bytes());
+        eth::Log {
+            address: address.to_vec(),
+            topics: vec![hex::decode(topic0).unwrap(), holder_topic],
+            data,
+            ..Default::default()
+        }
+    }
+
+    /// An SY that takes WETH and unwraps it to stake ether emits no `Transfer` for the unwrap, only
+    /// WETH's `Withdrawal`. Without it the WETH stays on the SY's books for good.
+    #[test]
+    fn weth_wraps_and_unwraps_move_the_holder() {
+        assert_eq!(
+            log_holder_deltas(&weth_event(WETH, WETH_WITHDRAWAL, SY, 100)),
+            vec![(SY.to_vec(), BigInt::from(-100))]
+        );
+        assert_eq!(
+            log_holder_deltas(&weth_event(WETH, WETH_DEPOSIT, SY, 100)),
+            vec![(SY.to_vec(), BigInt::from(100))]
+        );
+    }
+
+    /// Another token emitting events of the same shape is not WETH, and may also emit `Transfer`s
+    /// for the same movement, which would then be counted twice.
+    #[test]
+    fn deposit_and_withdrawal_count_only_from_weth() {
+        assert!(log_holder_deltas(&weth_event(MARKET, WETH_WITHDRAWAL, SY, 100)).is_empty());
+        assert!(log_holder_deltas(&weth_event(MARKET, WETH_DEPOSIT, SY, 100)).is_empty());
     }
 
     #[test]
