@@ -25,8 +25,8 @@ use super::{
     clock::NEVER_SAMPLED,
     math::market::MarketState,
     state::{
-        attribute_i256, attribute_u256, PendleMarketState, PendleState, PendleSyState, TokenClass,
-        ValueTooWide, PAUSED, SY_TOTAL_SUPPLY, TOKEN_IN_CLASS_PREFIX, TOKEN_OUT_CLASS_PREFIX,
+        attribute_i256, attribute_u256, class_attribute_token, Direction, PendleMarketState,
+        PendleState, PendleSyState, TokenClass, ValueTooWide, PAUSED, SY_TOTAL_SUPPLY,
     },
 };
 use crate::protocol::{
@@ -105,15 +105,15 @@ fn decode_market(
     let state = &snapshot.state.attributes;
 
     let scalar_root =
-        attribute_i256(statics, ATTR_SCALAR_ROOT).ok_or_else(|| missing(ATTR_SCALAR_ROOT))?;
+        attribute_i256(statics, ATTR_SCALAR_ROOT)?.ok_or_else(|| missing(ATTR_SCALAR_ROOT))?;
     let expiry = attribute_u256(statics, ATTR_EXPIRY)?
         .ok_or_else(|| missing(ATTR_EXPIRY))?
         .saturating_to::<u64>();
 
     // Written only from Mint, Burn, Swap and UpdateImpliedRate, so a market that has not seen its
     // first liquidity yet carries none of them. The contract's storage is zero at that point too.
-    let total_pt = attribute_i256(state, ATTR_TOTAL_PT).unwrap_or(I256::ZERO);
-    let total_sy = attribute_i256(state, ATTR_TOTAL_SY).unwrap_or(I256::ZERO);
+    let total_pt = attribute_i256(state, ATTR_TOTAL_PT)?.unwrap_or(I256::ZERO);
+    let total_sy = attribute_i256(state, ATTR_TOTAL_SY)?.unwrap_or(I256::ZERO);
     let last_ln_implied_rate =
         attribute_u256(state, ATTR_LAST_LN_IMPLIED_RATE)?.unwrap_or(U256::ZERO);
     let ln_fee_rate_root = attribute_u256(state, ATTR_LN_FEE_RATE_ROOT)?
@@ -188,8 +188,7 @@ fn decode_sy(
     // One state attribute per quotable token, named for the direction and the token. A token the
     // indexer could not classify has no attribute here and is simply not quotable. They are state
     // because an upgrade can change them.
-    let tokens_in = token_classes(state, TOKEN_IN_CLASS_PREFIX)?;
-    let tokens_out = token_classes(state, TOKEN_OUT_CLASS_PREFIX)?;
+    let (tokens_in, tokens_out) = token_classes(state)?;
     if tokens_in.is_empty() && tokens_out.is_empty() {
         return Err(InvalidSnapshotError::ValueError(format!(
             "SY {sy_address} declares no quotable tokens in either direction"
@@ -254,26 +253,31 @@ fn rate_reading(
     Ok((rate, rate_sampled_at))
 }
 
-fn token_classes(
-    statics: &HashMap<String, Bytes>,
-    prefix: &str,
-) -> Result<HashMap<Bytes, TokenClass>, InvalidSnapshotError> {
-    let mut classes = HashMap::new();
-    for (name, value) in statics {
-        let Some(suffix) = name.strip_prefix(prefix) else { continue };
-        let token = Bytes::from_str(suffix).map_err(|e| {
-            InvalidSnapshotError::ValueError(format!("{name} does not name an address: {e}"))
-        })?;
+/// The entry and exit token classes the state carries.
+fn token_classes(state: &HashMap<String, Bytes>) -> Result<TokenClasses, InvalidSnapshotError> {
+    let mut tokens_in = HashMap::new();
+    let mut tokens_out = HashMap::new();
+    for (name, value) in state {
+        let Some((direction, token)) =
+            class_attribute_token(name).map_err(InvalidSnapshotError::ValueError)?
+        else {
+            continue;
+        };
         let class = TokenClass::parse(value).ok_or_else(|| {
             InvalidSnapshotError::ValueError(format!(
                 "{name} carries an unknown token class {:?}",
                 String::from_utf8_lossy(value)
             ))
         })?;
-        classes.insert(token, class);
+        match direction {
+            Direction::Deposit => tokens_in.insert(token, class),
+            Direction::Redeem => tokens_out.insert(token, class),
+        };
     }
-    Ok(classes)
+    Ok((tokens_in, tokens_out))
 }
+
+type TokenClasses = (HashMap<Bytes, TokenClass>, HashMap<Bytes, TokenClass>);
 
 #[cfg(test)]
 mod tests {
@@ -285,12 +289,13 @@ mod tests {
             Chain,
         },
         simulation::{
-            errors::SimulationError,
+            errors::{SimulationError, TransitionError},
             protocol_sim::{Balances, ProtocolSim},
         },
     };
 
     use super::*;
+    use crate::evm::protocol::pendle::state::{TOKEN_IN_CLASS_PREFIX, TOKEN_OUT_CLASS_PREFIX};
 
     const MARKET: &str = "0x34280882267ffa6383b363e278b027be083bbe3b";
     const SY: &str = "0xcbc72d92b2dc8187414f6734718563898740c0bc";
@@ -565,6 +570,65 @@ mod tests {
             matches!(&error, InvalidSnapshotError::MissingAttribute(name) if name == ATTR_RATE_SAMPLED_AT),
             "{error:?}"
         );
+    }
+
+    /// Suffixes a class attribute name can carry that do not name a 20-byte address.
+    const NOT_AN_ADDRESS: [&str; 3] = ["zz", "7f7f", "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"];
+
+    /// A class attribute that names no address fails a snapshot and a delta alike, as an update
+    /// or a deletion. Skipping it on either path would leave a class the indexer meant to set or
+    /// delete unapplied.
+    #[tokio::test]
+    async fn a_class_attribute_that_names_no_address_is_rejected() {
+        for suffix in NOT_AN_ADDRESS {
+            let name = format!("{TOKEN_IN_CLASS_PREFIX}{suffix}");
+
+            let mut sy = created_sy();
+            sy.state
+                .attributes
+                .insert(name.clone(), Bytes::from(b"one_to_one".to_vec()));
+            let error = decode(sy).await.unwrap_err();
+            assert!(matches!(error, InvalidSnapshotError::ValueError(_)), "{suffix}: {error:?}");
+
+            let mut state = decode(created_sy()).await.unwrap();
+            let update = delta(SY, vec![(&name, Bytes::from(b"one_to_one".to_vec()))]);
+            let error = state
+                .delta_transition(update, &HashMap::new(), &Balances::default())
+                .unwrap_err();
+            assert!(matches!(error, TransitionError::DecodeError(_)), "{suffix}: {error:?}");
+
+            let mut deletion = delta(SY, vec![]);
+            deletion.deleted_attributes = [name.clone()].into();
+            let error = state
+                .delta_transition(deletion, &HashMap::new(), &Balances::default())
+                .unwrap_err();
+            assert!(matches!(error, TransitionError::DecodeError(_)), "{suffix}: {error:?}");
+        }
+    }
+
+    /// A signed value never needs more than 32 bytes in minimal two's complement, so a wider one
+    /// is malformed and rejected rather than truncated to its low bytes.
+    #[tokio::test]
+    async fn a_signed_value_past_256_bits_is_rejected() {
+        let too_wide = Bytes::from([vec![0x01], vec![0u8; 32]].concat());
+
+        let mut market = created_market();
+        market
+            .state
+            .attributes
+            .insert(ATTR_TOTAL_PT.to_string(), too_wide.clone());
+        let error = decode(market).await.unwrap_err();
+        assert!(matches!(error, InvalidSnapshotError::ValueError(_)), "{error:?}");
+
+        let mut state = decode(created_market()).await.unwrap();
+        let error = state
+            .delta_transition(
+                delta(MARKET, vec![(ATTR_TOTAL_SY, too_wide)]),
+                &HashMap::new(),
+                &Balances::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, TransitionError::DecodeError(_)), "{error:?}");
     }
 
     #[tokio::test]

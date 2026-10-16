@@ -866,32 +866,40 @@ pub(super) fn u256_from_be(raw: &[u8], name: &str) -> Result<U256, ValueTooWide>
     Ok(U256::from_be_slice(significant))
 }
 
-/// Reads an attribute as a big-endian signed integer.
-pub(super) fn attribute_i256(attributes: &HashMap<String, Bytes>, name: &str) -> Option<I256> {
-    attributes.get(name).map(|raw| {
-        let mut padded = [0u8; 32];
-        let start = 32 - raw.len().min(32);
-        padded[start..].copy_from_slice(&raw[raw.len().saturating_sub(32)..]);
-        // Sign-extend, since the indexer writes minimal two's-complement.
-        if raw
-            .first()
-            .is_some_and(|b| b & 0x80 != 0)
-        {
-            for byte in padded.iter_mut().take(start) {
-                *byte = 0xff;
-            }
+/// Reads an attribute as a big-endian signed integer, `None` when it is absent.
+///
+/// The indexer writes minimal two's complement, which fits any 256-bit value in 32 bytes, so a
+/// wider value is an error rather than something to truncate.
+pub(super) fn attribute_i256(
+    attributes: &HashMap<String, Bytes>,
+    name: &str,
+) -> Result<Option<I256>, ValueTooWide> {
+    let Some(raw) = attributes.get(name) else { return Ok(None) };
+    if raw.len() > 32 {
+        return Err(ValueTooWide { name: name.to_string(), len: raw.len() });
+    }
+    let mut padded = [0u8; 32];
+    let start = 32 - raw.len();
+    padded[start..].copy_from_slice(raw);
+    // Sign-extend, since the indexer writes minimal two's complement.
+    if raw
+        .first()
+        .is_some_and(|b| b & 0x80 != 0)
+    {
+        for byte in padded.iter_mut().take(start) {
+            *byte = 0xff;
         }
-        I256::from_be_bytes(padded)
-    })
+    }
+    Ok(Some(I256::from_be_bytes(padded)))
 }
 
 impl PendleMarketState {
     fn apply(&mut self, delta: &ProtocolStateDelta) -> Result<(), TransitionError> {
         let attributes = &delta.updated_attributes;
-        if let Some(value) = attribute_i256(attributes, "total_pt") {
+        if let Some(value) = attribute_i256(attributes, "total_pt")? {
             self.market.total_pt = value;
         }
-        if let Some(value) = attribute_i256(attributes, "total_sy") {
+        if let Some(value) = attribute_i256(attributes, "total_sy")? {
             self.market.total_sy = value;
         }
         if let Some(value) = attribute_u256(attributes, "last_ln_implied_rate")? {
@@ -952,7 +960,11 @@ impl PendleSyState {
         // An upgrade re-classifies the SY's tokens: each class arrives as an update, and a token
         // that no longer matches either closed form loses its class as a deletion.
         for (name, value) in attributes {
-            let Some((direction, token)) = class_attribute_token(name) else { continue };
+            let Some((direction, token)) =
+                class_attribute_token(name).map_err(TransitionError::DecodeError)?
+            else {
+                continue;
+            };
             let class = TokenClass::parse(value).ok_or_else(|| {
                 TransitionError::DecodeError(format!(
                     "{name} carries an unknown token class {:?}",
@@ -963,7 +975,11 @@ impl PendleSyState {
                 .insert(token, class);
         }
         for name in &delta.deleted_attributes {
-            let Some((direction, token)) = class_attribute_token(name) else { continue };
+            let Some((direction, token)) =
+                class_attribute_token(name).map_err(TransitionError::DecodeError)?
+            else {
+                continue;
+            };
             self.classes_mut(direction)
                 .remove(&token);
         }
@@ -987,12 +1003,22 @@ pub(super) const TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
 pub(super) const TOKEN_OUT_CLASS_PREFIX: &str = "token_out_class_0x";
 
 /// The direction and token a class attribute names, or `None` for any other attribute.
-pub(super) fn class_attribute_token(name: &str) -> Option<(Direction, Bytes)> {
+///
+/// A class attribute whose suffix is not a 20-byte address is an error, the same for a snapshot
+/// and a delta, rather than an attribute to skip: skipping it would leave a class the indexer
+/// meant to set or delete unapplied.
+pub(super) fn class_attribute_token(name: &str) -> Result<Option<(Direction, Bytes)>, String> {
     let (direction, suffix) = if let Some(suffix) = name.strip_prefix(TOKEN_IN_CLASS_PREFIX) {
         (Direction::Deposit, suffix)
+    } else if let Some(suffix) = name.strip_prefix(TOKEN_OUT_CLASS_PREFIX) {
+        (Direction::Redeem, suffix)
     } else {
-        (Direction::Redeem, name.strip_prefix(TOKEN_OUT_CLASS_PREFIX)?)
+        return Ok(None);
     };
-    let token = Bytes::from_str(&format!("0x{suffix}")).ok()?;
-    Some((direction, token))
+    let token = Bytes::from_str(&format!("0x{suffix}"))
+        .map_err(|e| format!("{name} does not name an address: {e}"))?;
+    if token.len() != 20 {
+        return Err(format!("{name} names {} bytes, not a 20-byte address", token.len()));
+    }
+    Ok(Some((direction, token)))
 }
