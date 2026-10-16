@@ -63,9 +63,11 @@ paused SY reverts every transfer, so none of those markets can trade either.
 | SY balances | `balanceOf` once per token, at creation | `Transfer`s |
 | Exchange rate | Every refresh block | — |
 
-All creation reads ride one batch. The rate is read for the SY of each live market and for SYs
-with an `index_rate` token; an SY whose tokens are all `one_to_one` and whose markets have expired
-is never read again.
+Creation reads are batched per kind (market, SY units, decimals, probes, seeds). The rate is read
+for the SY of each live market and for every SY that has ever had an `index_rate` token; an SY whose
+tokens have only ever been `one_to_one` and whose markets have expired is never read again. The
+flag is never cleared, because a re-classification cannot see the class of a token whose probe did
+not answer.
 
 Balances are never re-read. A rebasing token (stETH, aTokens) moves an SY's balance without a
 `Transfer`, so the reported holding of one misses every rebase since creation, and one whose

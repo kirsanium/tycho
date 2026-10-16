@@ -6,36 +6,36 @@ use crate::{
     sy::{is_class_attribute, TokenClass},
 };
 
-/// Records, per SY, whether any of its tokens is converted at the exchange rate.
+/// Records the SYs that have, or have had, a token converted at the exchange rate.
 ///
 /// Only such an SY needs its rate read when no live market prices against it: a `one_to_one`
-/// conversion is a decimal rescale and never looks at the rate. Written whenever `map_sy_state`
-/// emits the SY's classes, at creation and on each re-classification.
+/// conversion is a decimal rescale and never looks at the rate. Set whenever `map_sy_state` emits
+/// an `index_rate` class, at creation or on a re-classification.
+///
+/// Never cleared. A re-classification leaves out every token whose probe did not answer, which
+/// keeps its class, so a change without an `index_rate` class does not show the SY has none. An
+/// SY re-classified away from `index_rate` keeps its rate read, one read per refresh block.
 #[substreams::handlers::store]
 pub fn store_sy_rate_needed(sy_state: BlockChanges, store: StoreSetInt64) {
     for tx_changes in sy_state.changes {
         for change in tx_changes.entity_changes {
-            let Some(needed) = needs_rate(&change.attributes) else { continue };
-            store.set(0, sy_rate_needed_key(&change.component_id), &i64::from(needed));
+            if sets_an_index_rate_class(&change.attributes) {
+                store.set(0, sy_rate_needed_key(&change.component_id), &1);
+            }
         }
     }
 }
 
-/// Whether a set of class attributes includes a rate-converted token; `None` when the change
-/// carries no classes at all, as a pause does.
-fn needs_rate(attributes: &[Attribute]) -> Option<bool> {
-    let mut classes = attributes
-        .iter()
-        .filter(|attribute| is_class_attribute(&attribute.name))
-        .peekable();
-    classes.peek()?;
-    Some(classes.any(|attribute| {
-        attribute.change == i32::from(ChangeType::Update) &&
+/// Whether a change sets any token's class to `index_rate`.
+fn sets_an_index_rate_class(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        is_class_attribute(&attribute.name) &&
+            attribute.change == i32::from(ChangeType::Update) &&
             attribute.value ==
                 TokenClass::IndexRate
                     .as_str()
                     .as_bytes()
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -56,27 +56,35 @@ mod tests {
             attribute("token_in_class_0xaa", "one_to_one", ChangeType::Update),
             attribute("token_out_class_0xbb", "index_rate", ChangeType::Update),
         ];
-        assert_eq!(needs_rate(&attributes), Some(true));
+        assert!(sets_an_index_rate_class(&attributes));
     }
 
     #[test]
-    fn one_to_one_tokens_alone_need_no_rate() {
+    fn one_to_one_tokens_alone_set_nothing() {
         let attributes = [attribute("token_in_class_0xaa", "one_to_one", ChangeType::Update)];
-        assert_eq!(needs_rate(&attributes), Some(false));
+        assert!(!sets_an_index_rate_class(&attributes));
     }
 
-    /// A re-classification that deletes the only rate-converted token stops the reads.
+    /// A re-profile whose `index_rate` token did not answer its probe carries only the other
+    /// tokens. That token keeps its class, so the change must not read as "no rate needed".
     #[test]
-    fn a_deleted_rate_converted_class_needs_no_rate() {
+    fn a_re_profile_without_the_rate_converted_token_leaves_the_flag() {
         let attributes = [
             attribute("token_in_class_0xaa", "one_to_one", ChangeType::Update),
-            attribute("token_out_class_0xbb", "", ChangeType::Deletion),
+            attribute("token_out_class_0xaa", "one_to_one", ChangeType::Update),
+            attribute("token_out_class_0xcc", "", ChangeType::Deletion),
         ];
-        assert_eq!(needs_rate(&attributes), Some(false));
+        assert!(!sets_an_index_rate_class(&attributes));
     }
 
     #[test]
-    fn a_pause_says_nothing_about_the_rate() {
-        assert_eq!(needs_rate(&[attribute("paused", "\u{1}", ChangeType::Update)]), None);
+    fn a_pause_sets_nothing() {
+        assert!(!sets_an_index_rate_class(&[attribute("paused", "\u{1}", ChangeType::Update)]));
+    }
+
+    #[test]
+    fn a_deleted_index_rate_class_sets_nothing() {
+        let attributes = [attribute("token_out_class_0xbb", "index_rate", ChangeType::Deletion)];
+        assert!(!sets_an_index_rate_class(&attributes));
     }
 }
