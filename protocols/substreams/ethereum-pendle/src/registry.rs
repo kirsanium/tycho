@@ -141,6 +141,15 @@ pub fn markets_of_sy(registry: &str, sy: &str) -> Vec<String> {
         .collect()
 }
 
+/// The market ids `store_markets_by_yt` lists for one yield token, in creation order.
+pub fn markets_of_yt(listed: &str) -> Vec<String> {
+    listed
+        .split(';')
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Parses the registry, skipping lines that do not decode.
 fn entries(registry: &str) -> impl Iterator<Item = MarketEntry> + '_ {
     registry
@@ -258,6 +267,13 @@ mod tests {
         let registry = format!("{};{};{};", wsteth().encode(), other.encode(), later.encode());
         assert_eq!(markets_of_sy(&registry, &wsteth().sy), vec![wsteth().id, later.id]);
         assert!(markets_of_sy(&registry, "0xabc").is_empty());
+    }
+
+    /// The append store joins with `;` and leaves a trailing one.
+    #[test]
+    fn a_yield_token_lists_every_market_it_backs() {
+        assert_eq!(markets_of_yt("0xaa;0xbb;"), vec!["0xaa".to_string(), "0xbb".to_string()]);
+        assert!(markets_of_yt("").is_empty());
     }
 
     #[test]

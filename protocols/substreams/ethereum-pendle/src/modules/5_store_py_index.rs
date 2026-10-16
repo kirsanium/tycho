@@ -1,6 +1,6 @@
 use substreams::{
     scalar::BigInt,
-    store::{StoreGet, StoreGetRaw, StoreNew, StoreSet, StoreSetBigInt},
+    store::{StoreGet, StoreGetString, StoreNew, StoreSet, StoreSetBigInt},
 };
 use substreams_ethereum::{pb::eth::v2 as eth, rpc::RpcBatch};
 use tycho_substreams::prelude::*;
@@ -8,8 +8,9 @@ use tycho_substreams::prelude::*;
 use crate::{
     abi::pendle_yield_token,
     consts::PENDLE_MARKET,
-    keys::{market_by_yt_key, py_index_key},
+    keys::{markets_by_yt_key, py_index_key},
     market_state::py_index_stored,
+    registry::markets_of_yt,
 };
 
 /// Tracks each market's `pyIndexStored`, the floor half of the live PY index.
@@ -25,7 +26,7 @@ use crate::{
 pub fn store_py_index(
     block: eth::Block,
     new_components: BlockTransactionProtocolComponents,
-    components_store: StoreGetRaw,
+    markets_by_yt: StoreGetString,
     store: StoreSetBigInt,
 ) {
     for (component_id, index) in seed_new_markets(&new_components) {
@@ -35,13 +36,12 @@ pub fn store_py_index(
     for tx in block.transactions() {
         for log in tx.logs_with_calls().map(|(log, _)| log) {
             let Some(index) = py_index_stored(log) else { continue };
-            let Some(component_id) = components_store.get_last(market_by_yt_key(&log.address))
-            else {
+            let Some(markets) = markets_by_yt.get_last(markets_by_yt_key(&log.address)) else {
                 continue;
             };
-            let component_id =
-                String::from_utf8(component_id).expect("market id is not valid utf-8");
-            store.set(log.ordinal, py_index_key(&component_id), &index);
+            for market in markets_of_yt(&markets) {
+                store.set(log.ordinal, py_index_key(&market), &index);
+            }
         }
     }
 }

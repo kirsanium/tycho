@@ -18,6 +18,8 @@ mod map_protocol_components;
 // Stage 4
 #[path = "4_store_market_registry.rs"]
 mod store_market_registry;
+#[path = "4_store_markets_by_yt.rs"]
+mod store_markets_by_yt;
 #[path = "4_store_protocol_components.rs"]
 mod store_protocol_components;
 
@@ -52,6 +54,7 @@ pub use map_sy_state::map_sy_state;
 pub use store_balances::store_balances;
 pub use store_market_registry::store_market_registry;
 pub use store_market_reserves::store_market_reserves;
+pub use store_markets_by_yt::store_markets_by_yt;
 pub use store_protocol_components::store_protocol_components;
 pub use store_py_index::store_py_index;
 pub use store_sy_rate_needed::store_sy_rate_needed;

@@ -14,14 +14,14 @@ use crate::{
     abi::pendle_sy,
     fees::{fan_out, fee_scope, read_market_fees, LN_FEE_RATE_ROOT, RESERVE_FEE_PERCENT},
     keys::{
-        contract_id, market_by_yt_key, market_tokens_key, py_index_key, sy_rate_needed_key,
+        contract_id, market_tokens_key, markets_by_yt_key, py_index_key, sy_rate_needed_key,
         MARKET_REGISTRY,
     },
     market_state::{
         last_ln_implied_rate, py_index_stored, LAST_LN_IMPLIED_RATE, PY_INDEX_STORED, TOTAL_PT,
         TOTAL_SY,
     },
-    registry::{expired_markets, live_markets, sy_components, MarketEntry},
+    registry::{expired_markets, live_markets, markets_of_yt, sy_components, MarketEntry},
     sy::{is_class_attribute, is_creation_seed, SY_TOTAL_SUPPLY},
     sy_rates::{
         encode_timestamp, py_index_current, RefreshParams, BLOCK_TIMESTAMP, PY_INDEX_CURRENT,
@@ -44,6 +44,7 @@ pub fn map_protocol_changes(
     py_index_store: StoreGetBigInt,
     sy_state: BlockChanges,
     rate_needed_store: StoreGetInt64,
+    markets_by_yt: StoreGetString,
 ) -> Result<BlockChanges, substreams::errors::Error> {
     let refresh = RefreshParams::parse(&params)?;
     let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
@@ -131,14 +132,14 @@ pub fn map_protocol_changes(
         }
     }
 
-    for (tx, change) in absolute_state_changes(&block, &components_store) {
+    for (tx, change) in absolute_state_changes(&block, &components_store, &markets_by_yt) {
         transaction_changes
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(&tx))
             .add_entity_change(&change);
     }
 
-    let forced = forced_refresh(&block, &new_components, &components_store);
+    let forced = forced_refresh(&block, &new_components, &markets_by_yt);
     for (tx, change) in refresh_live_state(
         &block,
         &refresh,
@@ -193,35 +194,37 @@ pub fn map_protocol_changes(
 fn absolute_state_changes(
     block: &eth::Block,
     components_store: &StoreGetRaw,
+    markets_by_yt: &StoreGetString,
 ) -> Vec<(Transaction, EntityChanges)> {
     let mut changes = Vec::new();
     for tx in block.transactions() {
         for log in tx.logs_with_calls().map(|(log, _)| log) {
-            let entry = if let Some(rate) = last_ln_implied_rate(log) {
+            let entries = if let Some(rate) = last_ln_implied_rate(log) {
                 let component_id = contract_id(&log.address);
-                components_store
-                    .get_last(market_tokens_key(&component_id))
-                    .map(|_| (component_id, LAST_LN_IMPLIED_RATE, rate))
+                if components_store.has_last(market_tokens_key(&component_id)) {
+                    vec![(component_id, LAST_LN_IMPLIED_RATE, rate)]
+                } else {
+                    vec![]
+                }
             } else if let Some(index) = py_index_stored(log) {
-                components_store
-                    .get_last(market_by_yt_key(&log.address))
-                    .map(|id| {
-                        let component_id =
-                            String::from_utf8(id).expect("market id is not valid utf-8");
-                        (component_id, PY_INDEX_STORED, index)
-                    })
+                // The index belongs to the yield token, so every market it backs takes it.
+                markets_backed_by(markets_by_yt, &log.address)
+                    .into_iter()
+                    .map(|market| (market, PY_INDEX_STORED, index.clone()))
+                    .collect()
             } else {
                 continue;
             };
 
-            let Some((component_id, name, value)) = entry else { continue };
-            changes.push((
-                tx.into(),
-                EntityChanges {
-                    component_id,
-                    attributes: vec![state_attribute(name, value.to_signed_bytes_be())],
-                },
-            ));
+            for (component_id, name, value) in entries {
+                changes.push((
+                    tx.into(),
+                    EntityChanges {
+                        component_id,
+                        attributes: vec![state_attribute(name, value.to_signed_bytes_be())],
+                    },
+                ));
+            }
         }
     }
     changes
@@ -443,7 +446,7 @@ fn refresh_live_state(
 fn forced_refresh(
     block: &eth::Block,
     new_components: &BlockTransactionProtocolComponents,
-    components_store: &StoreGetRaw,
+    markets_by_yt: &StoreGetString,
 ) -> HashSet<String> {
     let mut forced: HashSet<String> = new_components
         .tx_components
@@ -456,10 +459,7 @@ fn forced_refresh(
             if py_index_stored(log).is_none() {
                 continue;
             }
-            let Some(market) = components_store.get_last(market_by_yt_key(&log.address)) else {
-                continue;
-            };
-            forced.insert(String::from_utf8(market).expect("market id is not valid utf-8"));
+            forced.extend(markets_backed_by(markets_by_yt, &log.address));
         }
     }
     forced
@@ -535,6 +535,14 @@ fn read_exchange_rates(sy_ids: &[String]) -> BTreeMap<String, Option<BigInt>> {
 
 /// Returns a market's SY and PT addresses, or `None` if the id names something that is not a
 /// market.
+/// Every market the yield token at `yt` backs, or none when it backs no market.
+fn markets_backed_by(markets_by_yt: &StoreGetString, yt: &[u8]) -> Vec<String> {
+    markets_by_yt
+        .get_last(markets_by_yt_key(yt))
+        .map(|listed| markets_of_yt(&listed))
+        .unwrap_or_default()
+}
+
 fn market_sy_pt(store: &StoreGetRaw, component_id: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     let roles = store.get_last(market_tokens_key(component_id))?;
     let roles: Vec<Vec<u8>> = serde_sibor::from_bytes(&roles)

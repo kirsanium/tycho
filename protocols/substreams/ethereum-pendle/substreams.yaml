@@ -68,6 +68,15 @@ modules:
     inputs:
       - map: map_protocol_components
 
+  # Every market a yield token backs, for routing its NewInterestIndex back to all of them.
+  - name: store_markets_by_yt
+    kind: store
+    initialBlock: 16032059
+    updatePolicy: append
+    valueType: string
+    inputs:
+      - map: map_protocol_components
+
   - name: map_relative_component_balance
     kind: map
     initialBlock: 16032059
@@ -111,7 +120,7 @@ modules:
     inputs:
       - source: sf.ethereum.type.v2.Block
       - map: map_protocol_components
-      - store: store_protocol_components
+      - store: store_markets_by_yt
 
   - name: store_balances
     kind: store
@@ -158,6 +167,7 @@ modules:
       - store: store_py_index
       - map: map_sy_state
       - store: store_sy_rate_needed
+      - store: store_markets_by_yt
     output:
       type: proto:tycho.evm.v1.BlockChanges
 
