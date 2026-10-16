@@ -6,6 +6,7 @@ use substreams_ethereum::pb::eth::v2 as eth;
 use tycho_substreams::prelude::*;
 
 use crate::{
+    deltas::in_transaction_order,
     keys::{contract_id, market_tokens_key},
     market_state::reserve_delta,
     sy::supply_seed,
@@ -84,5 +85,5 @@ pub fn map_reserve_deltas(
             component_id: component.id.clone().into_bytes(),
         });
     }
-    Ok(BlockBalanceDeltas { balance_deltas })
+    Ok(in_transaction_order(balance_deltas))
 }

@@ -9,6 +9,7 @@ use substreams_ethereum::pb::eth::v2 as eth;
 use tycho_substreams::prelude::*;
 
 use crate::{
+    deltas::in_transaction_order,
     sy::balance_seeds,
     transfers::{component_transfers, new_sy_components},
 };
@@ -71,5 +72,5 @@ pub fn map_relative_component_balance(
             });
         }
     }
-    Ok(BlockBalanceDeltas { balance_deltas })
+    Ok(in_transaction_order(balance_deltas))
 }

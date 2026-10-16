@@ -5,6 +5,7 @@
 
 mod abi;
 mod consts;
+mod deltas;
 mod fees;
 mod keys;
 mod market_state;
