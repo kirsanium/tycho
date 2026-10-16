@@ -260,7 +260,7 @@ impl SyProfile {
 }
 
 pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
-    let Classification { decimals, asset, asset_decimals, tokens_in, tokens_out } =
+    let Classification { decimals, asset, asset_decimals, tokens_in, tokens_out, .. } =
         classify_sy(sy_address)?;
 
     let tokens = component_tokens(sy_address, &tokens_in, &tokens_out);
@@ -291,6 +291,11 @@ pub(crate) struct Classification {
     pub(crate) tokens_in: Vec<(Vec<u8>, TokenClass)>,
     /// Quotable exit tokens and the conversion each uses.
     pub(crate) tokens_out: Vec<(Vec<u8>, TokenClass)>,
+    /// Entry tokens whose decimals or probe did not answer, so whether they still match a closed
+    /// form is unknown. A paused SY reverts its previews, which lands every token here.
+    pub(crate) undetermined_in: Vec<Vec<u8>>,
+    /// Exit tokens whose decimals or probe did not answer.
+    pub(crate) undetermined_out: Vec<Vec<u8>>,
 }
 
 /// Classifies each token the SY lists by probing `previewDeposit` / `previewRedeem` against the
@@ -328,7 +333,12 @@ pub(crate) fn classify_sy(sy_address: &[u8]) -> Option<Classification> {
     let token_decimals = read_token_decimals(&tokens_in, &tokens_out);
 
     let mut quotable_in = Vec::new();
+    let mut undetermined_in = Vec::new();
     for (token, probe) in probe_deposits(sy_address, &tokens_in, &token_decimals) {
+        let Some(probe) = probe else {
+            undetermined_in.push(token);
+            continue;
+        };
         let Some(class) = classify_deposit(&probe, decimals, asset_decimals, &exchange_rate) else {
             continue;
         };
@@ -336,9 +346,12 @@ pub(crate) fn classify_sy(sy_address: &[u8]) -> Option<Classification> {
     }
 
     let mut quotable_out = Vec::new();
-    for (token, token_decimals, probe) in
-        probe_redeems(sy_address, &tokens_out, &token_decimals, decimals)
-    {
+    let mut undetermined_out = Vec::new();
+    for (token, probe) in probe_redeems(sy_address, &tokens_out, &token_decimals, decimals) {
+        let Some((token_decimals, probe)) = probe else {
+            undetermined_out.push(token);
+            continue;
+        };
         let Some(class) =
             classify_redeem(&probe, token_decimals, decimals, asset_decimals, &exchange_rate)
         else {
@@ -353,6 +366,8 @@ pub(crate) fn classify_sy(sy_address: &[u8]) -> Option<Classification> {
         asset_decimals,
         tokens_in: quotable_in,
         tokens_out: quotable_out,
+        undetermined_in,
+        undetermined_out,
     })
 }
 
@@ -461,20 +476,23 @@ fn read_token_decimals(tokens_in: &[Vec<u8>], tokens_out: &[Vec<u8>]) -> Vec<(Ve
 }
 
 /// Probes `previewDeposit` with one whole unit of each entry token.
+///
+/// Returns every entry token, with `None` where its decimals or its probe did not answer.
 fn probe_deposits(
     sy_address: &[u8],
     tokens_in: &[Vec<u8>],
     token_decimals: &[(Vec<u8>, u32)],
-) -> Vec<(Vec<u8>, BigInt)> {
+) -> Vec<(Vec<u8>, Option<BigInt>)> {
+    let mut results = Vec::new();
     let mut probes = Vec::new();
     for token in tokens_in {
-        let Some((_, decimals)) = token_decimals
+        match token_decimals
             .iter()
             .find(|(t, _)| t == token)
-        else {
-            continue;
-        };
-        probes.push((token.clone(), *decimals));
+        {
+            Some((_, decimals)) => probes.push((token.clone(), *decimals)),
+            None => results.push((token.clone(), None)),
+        }
     }
 
     let mut batch = RpcBatch::new();
@@ -487,37 +505,34 @@ fn probe_deposits(
             sy_address.to_vec(),
         );
     }
-
-    let mut results = Vec::new();
-    for ((token, _), value) in probes
-        .into_iter()
-        .zip(execute_probes::<pendle_sy::functions::PreviewDeposit>(batch))
-    {
-        let Some(value) = value else { continue };
-        results.push((token, value));
+    let mut values = execute_probes::<pendle_sy::functions::PreviewDeposit>(batch).into_iter();
+    for (token, _) in probes {
+        results.push((token, values.next().flatten()));
     }
     results
 }
 
 /// Probes `previewRedeem` with one whole SY unit for each exit token.
 ///
-/// Returns each token with its own decimals, which the redeem conversion needs to rescale the
-/// asset-unit result the SY reports.
+/// Returns every exit token, with its own decimals and probe — the redeem conversion needs the
+/// decimals to rescale the asset-unit result the SY reports — or `None` where either did not
+/// answer.
 fn probe_redeems(
     sy_address: &[u8],
     tokens_out: &[Vec<u8>],
     token_decimals: &[(Vec<u8>, u32)],
     sy_decimals: u32,
-) -> Vec<(Vec<u8>, u32, BigInt)> {
+) -> Vec<(Vec<u8>, Option<RedeemProbe>)> {
+    let mut results = Vec::new();
     let mut probes = Vec::new();
     for token in tokens_out {
-        let Some((_, decimals)) = token_decimals
+        match token_decimals
             .iter()
             .find(|(t, _)| t == token)
-        else {
-            continue;
-        };
-        probes.push((token.clone(), *decimals));
+        {
+            Some((_, decimals)) => probes.push((token.clone(), *decimals)),
+            None => results.push((token.clone(), None)),
+        }
     }
 
     let mut batch = RpcBatch::new();
@@ -531,21 +546,26 @@ fn probe_redeems(
         );
     }
 
-    let mut results = Vec::new();
-    for ((token, decimals), value) in probes
-        .into_iter()
-        .zip(execute_probes::<pendle_sy::functions::PreviewRedeem>(batch))
-    {
-        let Some(value) = value else { continue };
-        results.push((token, decimals, value));
+    let mut values = execute_probes::<pendle_sy::functions::PreviewRedeem>(batch).into_iter();
+    for (token, decimals) in probes {
+        results.push((
+            token,
+            values
+                .next()
+                .flatten()
+                .map(|value| (decimals, value)),
+        ));
     }
     results
 }
 
+/// An exit token's decimals and what `previewRedeem` returned for it.
+type RedeemProbe = (u32, BigInt);
+
 /// Executes a probe batch, yielding one entry per call in the order they were added.
 ///
-/// A reverting probe — a paused SY, a token the view rejects — yields `None`, which leaves that
-/// token out of the component rather than guessed at.
+/// A reverting probe — a paused SY, a token the view rejects — yields `None`. A failed batch
+/// yields nothing, so every probe in it reads as `None` to the caller.
 fn execute_probes<F>(batch: RpcBatch) -> Vec<Option<BigInt>>
 where
     F: substreams_ethereum::Function + substreams_ethereum::rpc::RPCDecodable<BigInt>,

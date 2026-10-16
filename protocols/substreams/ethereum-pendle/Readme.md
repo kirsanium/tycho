@@ -44,10 +44,13 @@ A pair matching neither is left out of the component, so an unquotable edge is *
 than silently wrong. See `src/sy.rs`.
 
 The classes are state, not static attributes: 251 of the 379 SYs are upgradeable proxies, and 31
-have been upgraded after deployment. On an SY's `Upgraded` event, `map_sy_state` re-runs the
-classification at the end of the block, re-emits every class of the component's listed tokens and
-deletes those that no longer match. A token an upgrade adds stays unquotable, since a component's
-token list is fixed at creation. `Paused` and `Unpaused` set the `paused` attribute the same way.
+have been upgraded after deployment. On an SY's `Upgraded` or `Unpaused` event, `map_sy_state`
+re-runs the classification at the end of the block, re-emits the class of every listed token that
+answers its probe and deletes those that answer but no longer match. A token whose probe reverts
+keeps its class: upgrades usually happen while an SY is paused, and a paused SY reverts its
+previews, so the re-run on `Unpaused` is the one that classifies such an upgrade. A token an
+upgrade adds stays unquotable, since a component's token list is fixed at creation. `Paused` and
+`Unpaused` set the `paused` attribute.
 
 ## What is read, and when
 
