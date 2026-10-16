@@ -212,7 +212,9 @@ tests:
           sy_decimals: "0x12"
         creation_tx: "0x35c6a24f0c9214a3809d03b539eec5ad314617c5c812c1a53750bb13e1a45131"
         skip_simulation: false
-        skip_execution: false
+        # Uncapped, so its deposit reports u128::MAX, which no execution can take. PendleExecutor's
+        # fork tests execute both SY edges.
+        skip_execution: true
 
   # The brief's reference instance: the wstETH market expiring 30 Dec 2027, created by the
   # original factory at block 17363218 and still live today. Its first swaps land at 17379452 and

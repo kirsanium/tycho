@@ -1570,22 +1570,19 @@ fn redeeming_is_bounded_by_supply_and_depositing_is_not() {
         .unwrap();
     assert_eq!(steth_out, quoted.amount);
 
-    // Depositing has no reserve behind it and no cap to read, so the bound is the stated
-    // convention: a million whole tokens, scaled by this token's own 18 decimals.
+    // An uncapped SY has no deposit limit of its own, so it reports the repo's unbounded soft
+    // limit, whatever the entry token's decimals.
     let (deposit_in, _) = wsteth_sy()
         .get_limits(wsteth, sy)
         .unwrap();
-    assert_eq!(deposit_in, BigUint::from(1_000_000u64) * BigUint::from(10u64).pow(18));
-
-    // Whole tokens, so the bound follows the entry token's own decimals rather than the SY's. A
-    // 6-decimal token is a million units at 1e12, not at 1e24.
+    assert_eq!(deposit_in, BigUint::from(u128::MAX));
     let (six_decimal_in, _) = six_decimal_asset_sy()
         .get_limits(
             Bytes::from_str(SIX_DECIMAL_TOKEN).unwrap(),
             Bytes::from_str(SIX_DECIMAL_SY).unwrap(),
         )
         .unwrap();
-    assert_eq!(six_decimal_in, BigUint::from(1_000_000u64) * BigUint::from(10u64).pow(6));
+    assert_eq!(six_decimal_in, BigUint::from(u128::MAX));
 }
 
 /// A redemption past the limit is refused rather than quoted: on chain the burn reverts once it

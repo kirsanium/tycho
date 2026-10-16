@@ -804,7 +804,7 @@ impl ProtocolSim for PendleState {
                             Some(room) => {
                                 largest_input_within(room, unbounded_soft_limit(), convert)?
                             }
-                            None => deposit_soft_limit(token_decimals),
+                            None => unbounded_soft_limit(),
                         }
                     }
                     Direction::Redeem => state.max_redeem_sy(token, class, token_decimals)?,
@@ -1166,19 +1166,6 @@ fn unquotable_pair(token_in: &Token, token_out: &Token) -> SimulationError {
          no closed form is known",
         token_in.address, token_out.address
     ))
-}
-
-/// The size a deposit edge is reported to absorb, in whole tokens. ERC-5115 publishes no cap, so
-/// this is a convention, not a measurement — see [`deposit_soft_limit`].
-const DEPOSIT_SOFT_LIMIT_TOKENS: u64 = 1_000_000;
-
-/// A deposit has no reserve behind it, so nothing on chain bounds it: ERC-5115 has no cap getter,
-/// and only says a deposit "MUST revert if ... the deposit limit being reached". The bound is
-/// therefore a stated convention rather than a reading — `DEPOSIT_SOFT_LIMIT_TOKENS` whole tokens,
-/// scaled by the token's own decimals, so the top of the range is a size that executes rather than
-/// a `u128::MAX` that sends a router's search into amounts no token has supply for.
-fn deposit_soft_limit(token_decimals: u32) -> U256 {
-    U256::from(DEPOSIT_SOFT_LIMIT_TOKENS) * U256::from(10u64).pow(U256::from(token_decimals))
 }
 
 /// The soft limit this repo uses for an edge with no reserve behind it, matching
