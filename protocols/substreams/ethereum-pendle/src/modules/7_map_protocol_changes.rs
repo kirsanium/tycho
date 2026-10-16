@@ -1,6 +1,6 @@
 use anyhow::Result;
 use itertools::Itertools;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use substreams::{
     log,
     pb::substreams::StoreDeltas,
@@ -8,7 +8,7 @@ use substreams::{
     store::{StoreGet, StoreGetBigInt, StoreGetInt64, StoreGetRaw, StoreGetString},
 };
 use substreams_ethereum::{pb::eth::v2 as eth, rpc::RpcBatch};
-use tycho_substreams::{abi::erc20, balances::aggregate_balances_changes, prelude::*};
+use tycho_substreams::{balances::aggregate_balances_changes, prelude::*};
 
 use crate::{
     abi::pendle_sy,
@@ -172,13 +172,6 @@ pub fn map_protocol_changes(
         }
     }
 
-    for (tx, change) in sy_balances(&block, &refresh, &registry_store, &components_store) {
-        transaction_changes
-            .entry(tx.index)
-            .or_insert_with(|| TransactionChangesBuilder::new(&tx))
-            .add_balance_change(&change);
-    }
-
     Ok(BlockChanges {
         block: Some((&block).into()),
         changes: transaction_changes
@@ -230,84 +223,6 @@ fn absolute_state_changes(
                 },
             ));
         }
-    }
-    changes
-}
-
-/// Re-reads each SY component's token balances on refresh blocks, correcting rebases.
-///
-/// An SY's balances are otherwise seeded at its creation and moved by transfers (see
-/// `map_relative_component_balance`), which a share-based token defeats: it moves a holder's
-/// balance on rebase without a `Transfer`, and the wstETH SY holds stETH. No quote reads a holding,
-/// so this keeps the reported balances exact rather than any price.
-///
-/// A read that fails leaves the accumulated balance in place.
-///
-/// Only SYs behind a live or just-expired market are re-read: that is where the range test checks
-/// balances to the wei. Elsewhere a rebasing token's reported balance drifts until the next
-/// `Transfer` moves it, which no quote notices.
-///
-/// Costs one `balanceOf` per (SY component, token) of those SYs per refresh block.
-fn sy_balances(
-    block: &eth::Block,
-    params: &RefreshParams,
-    registry_store: &StoreGetString,
-    components_store: &StoreGetRaw,
-) -> Vec<(Transaction, BalanceChange)> {
-    if !params.should_refresh(block.number) {
-        return vec![];
-    }
-    let Some(registry) = registry_store.get_last(MARKET_REGISTRY) else { return vec![] };
-    let Some(anchor) = block.transactions().last() else { return vec![] };
-    let anchor: Transaction = anchor.into();
-
-    let now = block.timestamp_seconds();
-    let behind_a_market: BTreeSet<String> = live_markets(&registry, now)
-        .into_iter()
-        .chain(expired_markets(&registry, now))
-        .map(|market| market.sy)
-        .collect();
-    let mut holdings: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
-    for sy in behind_a_market {
-        let Some(tokens) = components_store.get_last(&sy) else { continue };
-        let tokens: Vec<Vec<u8>> = serde_sibor::from_bytes(&tokens)
-            .expect("deserializing component tokens from the component store");
-        let address = hex::decode(sy.trim_start_matches("0x"))
-            .expect("registry holds a non-hex SY component id");
-        for token in tokens {
-            holdings.push((sy.clone(), address.clone(), token));
-        }
-    }
-    if holdings.is_empty() {
-        return vec![];
-    }
-
-    let mut batch = RpcBatch::new();
-    for (_, owner, token) in &holdings {
-        batch = batch.add(erc20::functions::BalanceOf { owner: owner.clone() }, token.clone());
-    }
-    let responses = batch
-        .execute()
-        .map(|r| r.responses)
-        .unwrap_or_default();
-
-    let mut changes = Vec::new();
-    for ((component_id, _, token), response) in holdings
-        .into_iter()
-        .zip(responses.iter())
-    {
-        let Some(balance) = RpcBatch::decode::<_, erc20::functions::BalanceOf>(response) else {
-            log::info!("SY {} did not answer balanceOf, leaving the balance stale", component_id);
-            continue;
-        };
-        changes.push((
-            anchor.clone(),
-            BalanceChange {
-                token,
-                balance: balance.to_signed_bytes_be(),
-                component_id: component_id.into_bytes(),
-            },
-        ));
     }
     changes
 }

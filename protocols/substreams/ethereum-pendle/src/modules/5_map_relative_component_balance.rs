@@ -29,8 +29,8 @@ use crate::{
 /// An SY usually held tokens long before it became a component with its first market, so its
 /// balances are seeded from the `balanceOf` reads taken at its creation and moved by transfers
 /// afterwards. The seed is read at the end of the creation block, so that block's transfers are
-/// already in it and are skipped. A rebasing token moves without a `Transfer`; the refresh
-/// re-reads the holdings of SYs with a live market, and no quote reads a holding.
+/// already in it and are skipped. A rebasing token moves without a `Transfer`, so an SY's
+/// reported holding of one misses every rebase since creation; no quote reads a holding.
 #[substreams::handlers::map]
 pub fn map_relative_component_balance(
     block: eth::Block,

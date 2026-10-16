@@ -91,8 +91,7 @@ tests:
         skip_execution: true
 
       # SY-wstETH: three quotable entry tokens across both classes. It holds stETH, which rebases
-      # without emitting Transfer, so its balance check covers the per-block re-read of SYs behind
-      # a live market.
+      # without emitting Transfer; its reported balance follows transfers only.
       - id: "0xcbc72d92b2dc8187414f6734718563898740c0bc"
         tokens:
           - "0xcbc72d92b2dc8187414f6734718563898740c0bc" # SY

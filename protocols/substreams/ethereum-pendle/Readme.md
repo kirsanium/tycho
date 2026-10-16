@@ -55,15 +55,18 @@ token list is fixed at creation. `Paused` and `Unpaused` set the `paused` attrib
 |---|---|---|
 | Classes, `paused` | Once, at creation | `Upgraded`, `Paused`, `Unpaused` |
 | SY supply | `totalSupply()` once, at creation | The SY's own mints and burns |
-| SY balances | `balanceOf` once per token, at creation | `Transfer`s; re-read per refresh block for SYs behind a live or just-expired market |
+| SY balances | `balanceOf` once per token, at creation | `Transfer`s |
 | Exchange rate | Every refresh block | — |
 
 All creation reads ride one batch. The rate is read for the SY of each live market and for SYs
 with an `index_rate` token; an SY whose tokens are all `one_to_one` and whose markets have expired
-is never read again. A rebasing token moves an SY's balance without a `Transfer`. A re-read replaces
-the reported balance but not the running total kept from creation, so a block that moves the
-balance without re-reading it reports that total, which has missed every rebase since creation. No
-quote reads a balance.
+is never read again.
+
+Balances are never re-read. A rebasing token (stETH, aTokens) moves an SY's balance without a
+`Transfer`, so the reported holding of one misses every rebase since creation, and one whose
+withdrawals outrun the accounted total is reported as zero. Quotes bound redemptions by supply
+and never read a balance, so this affects only the reported balances and anything derived from
+them, such as TVL.
 
 ## The refresh, and its one parameter
 
@@ -89,8 +92,7 @@ refreshed on the block it is created, and a market on any block its yield token 
 `NewInterestIndex`, so neither waits for the next refresh to be quotable.
 
 The trade is freshness only. Supply and balances follow events whatever the interval, so a coarse
-interval leaves the PY index stale without leaving a redemption bound wrong. What the refresh alone
-covers is a *rebase*, which moves a balance with no transfer to notice.
+interval leaves the PY index stale without leaving a redemption bound wrong.
 
 ## Module graph
 
