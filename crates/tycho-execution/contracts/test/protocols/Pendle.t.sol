@@ -35,7 +35,8 @@ contract PendleExecutorTest is Constants, TestUtils {
     // so it runs against a cold fork, which is the state a real swap meets.
     //
     // The measurement covers the executor's `swap` call only. The router's `approve` is added
-    // separately by `PROTOCOLS_NEEDING_APPROVAL` in `gas_estimator.rs`, so it must not be here.
+    // separately, per leg, by `pendle_leg_needs_approval` in `gas_estimator.rs`, so it must not
+    // be here.
     uint256 constant GAS_SY_FOR_PT = 330_000;
     uint256 constant GAS_PT_FOR_SY = 235_000;
     uint256 constant GAS_SY_FOR_YT = 425_000;
@@ -484,7 +485,7 @@ contract PendleExecutorTest is Constants, TestUtils {
     /// Every swap the simulation's parity test quotes delivers, here, exactly the amount it
     /// quotes. Both read the same fixture, so a drift on either side fails its own test.
     function testMarketEdgesDeliverWhatTheSimulationQuotes() public {
-        string memory json = vm.readFile(EXECUTED_SWAPS);
+        string memory json = _executedSwaps();
         uint256 count;
         for (uint256 i = 0;; i++) {
             string memory row = string.concat(".executed[", vm.toString(i), "]");
@@ -510,7 +511,8 @@ contract PendleExecutorTest is Constants, TestUtils {
     }
 
     function testMarketEdgesRejectWhatTheSimulationRejects() public {
-        string memory json = vm.readFile(EXECUTED_SWAPS);
+        string memory json = _executedSwaps();
+        uint256 count;
         for (uint256 i = 0;; i++) {
             string memory row = string.concat(".rejected[", vm.toString(i), "]");
             if (!vm.keyExistsJson(json, row)) break;
@@ -528,7 +530,23 @@ contract PendleExecutorTest is Constants, TestUtils {
                 _data(edge, tokenIn, tokenOut, PENDLE_WSTETH_MARKET),
                 BOB
             );
+            count++;
         }
+        assertEq(count, 1);
+    }
+
+    /// The fixture, checked to describe the fork and market these tests run against. A fixture
+    /// regenerated elsewhere would otherwise fail as an amount mismatch on every row.
+    function _executedSwaps() internal view returns (string memory json) {
+        json = vm.readFile(EXECUTED_SWAPS);
+        assertEq(
+            vm.parseJsonUint(json, ".block"), block.number, "fixture block"
+        );
+        assertEq(
+            vm.parseJsonAddress(json, ".market"),
+            PENDLE_WSTETH_MARKET,
+            "fixture market"
+        );
     }
 
     /// The router is immutable, so a zero address would leave every market edge calling nothing
