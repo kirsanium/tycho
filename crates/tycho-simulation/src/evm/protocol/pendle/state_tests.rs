@@ -60,6 +60,7 @@ fn wsteth_market(rate_sampled_at: u64) -> PendleState {
         pt_address: Bytes::from_str(PT).unwrap(),
         yt_address: Bytes::from_str(YT).unwrap(),
         sy_paused: false,
+        execution_timestamp: 0,
     })
 }
 
@@ -606,6 +607,52 @@ fn an_oversized_amount_is_never_a_fatal_error() {
     }
 }
 
+/// A quote taken at the last block before expiry executes in the next one, where the market
+/// reverts with `MarketExpired`. Once the execution block reaches expiry the market refuses every
+/// edge and reports no depth, and says so once.
+#[test]
+fn a_market_refuses_quotes_that_would_execute_at_expiry() {
+    let expiry = 1_830_124_800;
+    let mut state = wsteth_market(expiry - 6);
+    let one = BigUint::from(10u64.pow(18));
+    fn sy_for_pt(state: &PendleState, one: &BigUint) -> Result<BigUint, SimulationError> {
+        state
+            .get_amount_out(one.clone(), &token(SY, 18), &token(PT, 18))
+            .map(|r| r.amount)
+    }
+    let before = sy_for_pt(&state, &one).expect("live at the sampled block");
+
+    assert!(
+        !state.apply_block(&BlockContext::new(1, expiry - 1)),
+        "still live: nothing to re-emit"
+    );
+    assert_eq!(sy_for_pt(&state, &one).unwrap(), before, "the quote stays at the sampled block");
+
+    assert!(state.apply_block(&BlockContext::new(2, expiry)), "turning expired must re-emit");
+    assert!(!state.apply_block(&BlockContext::new(2, expiry)), "a repeated block changes nothing");
+    for (from, to) in [(SY, PT), (PT, SY), (SY, YT), (YT, SY)] {
+        assert!(
+            state
+                .get_amount_out(one.clone(), &token(from, 18), &token(to, 18))
+                .is_err(),
+            "{from}->{to}"
+        );
+        let (max_in, max_out) = state
+            .get_limits(Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap())
+            .unwrap();
+        assert_eq!((max_in, max_out), (BigUint::ZERO, BigUint::ZERO), "{from}->{to}");
+    }
+}
+
+/// An SY has no expiry, so the execution block never changes how it quotes.
+#[test]
+fn an_sy_ignores_the_execution_block() {
+    let mut state = wsteth_sy();
+    let before = state.clone();
+    assert!(!state.apply_block(&BlockContext::new(1, u64::MAX)));
+    assert_eq!(state, before);
+}
+
 /// PT against YT is not a market edge: minting and redeeming PY is the yield token's business, and
 /// SY is one side of every market swap.
 #[test]
@@ -1048,6 +1095,7 @@ fn wsteth_market_at_block_25_800_000() -> PendleState {
         pt_address: Bytes::from_str(PT).unwrap(),
         yt_address: Bytes::from_str(YT).unwrap(),
         sy_paused: false,
+        execution_timestamp: 0,
     })
 }
 

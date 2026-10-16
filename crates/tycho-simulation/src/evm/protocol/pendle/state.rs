@@ -33,7 +33,7 @@ use tycho_common::{
     models::token::Token,
     simulation::{
         errors::{SimulationError, TransitionError},
-        protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
+        protocol_sim::{Balances, BlockContext, GetAmountOutResult, ProtocolSim},
     },
     Bytes,
 };
@@ -126,6 +126,12 @@ pub struct PendleMarketState {
     /// Whether the market's SY is paused. A paused SY reverts every transfer, and every market
     /// edge moves SY, so this refuses every quote against the market.
     pub sy_paused: bool,
+    /// Timestamp of the block a quote is expected to execute in, from
+    /// [`ProtocolSim::apply_block`]; zero until one is given. Only ever used to judge expiry: a
+    /// quote is still computed at [`Self::rate_sampled_at`], but one that would execute at or
+    /// after expiry reverts on chain, so it is refused.
+    #[serde(default)]
+    pub execution_timestamp: u64,
 }
 
 /// The ERC-5115 wrapper, and the conversions it supports per token.
@@ -649,6 +655,19 @@ impl ProtocolSim for PendleState {
         }
     }
 
+    /// Records the execution block's timestamp on a market, so a quote that would execute at or
+    /// after expiry is refused. Re-emits only when that flips the market to expired; an SY has no
+    /// expiry and never changes.
+    fn apply_block(&mut self, block: &BlockContext) -> bool {
+        let PendleState::Market(state) = self else { return false };
+        if state.execution_timestamp == block.timestamp() {
+            return false;
+        }
+        let expired_before = state.expired();
+        state.execution_timestamp = block.timestamp();
+        expired_before != state.expired()
+    }
+
     fn clone_box(&self) -> Box<dyn ProtocolSim> {
         Box::new(self.clone())
     }
@@ -723,9 +742,13 @@ impl PendleMarketState {
     /// `quote_time` frozen below `expiry` and the market never seen to die. The head is a real
     /// chain timestamp, so taking the later of the two can only move the verdict up to where the
     /// chain already is — never past it, and never onto a market that still trades.
+    ///
+    /// The execution block counts too. A quote taken at the last block before expiry executes in
+    /// the next one, where the market reverts with `MarketExpired`.
     fn latest_known_time(&self) -> u64 {
         self.rate_sampled_at
             .max(self.head_timestamp)
+            .max(self.execution_timestamp)
     }
 
     fn guard_current(&self) -> Result<(), SimulationError> {

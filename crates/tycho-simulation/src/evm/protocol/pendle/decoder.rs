@@ -162,6 +162,7 @@ fn decode_market(
             ATTR_YT_ADDRESS,
         )?,
         sy_paused,
+        execution_timestamp: 0,
     })
 }
 
