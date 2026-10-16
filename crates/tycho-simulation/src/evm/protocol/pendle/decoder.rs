@@ -26,7 +26,8 @@ use super::{
     math::market::MarketState,
     state::{
         attribute_i256, attribute_u256, class_attribute_token, Direction, PendleMarketState,
-        PendleState, PendleSyState, TokenClass, ValueTooWide, PAUSED, SY_PAUSED, SY_TOTAL_SUPPLY,
+        PendleState, PendleSyState, TokenClass, ValueTooWide, PAUSED, SY_PAUSED, SY_SUPPLY_CAP,
+        SY_TOTAL_SUPPLY, YIELD_TOKEN,
     },
 };
 use crate::protocol::{
@@ -226,11 +227,30 @@ fn decode_sy(
         })
         .collect();
 
+    // An SY that caps its own supply carries the cap; one without a cap carries nothing.
+    let supply_cap = attribute_u256(state, SY_SUPPLY_CAP)?;
+    // What the SY holds of its yield token bounds a redemption to it. Both are optional: without
+    // them a redemption is bounded by supply alone.
+    let yield_token = statics
+        .get(YIELD_TOKEN)
+        .map(|raw| address(raw, YIELD_TOKEN))
+        .transpose()?;
+    let yield_token_held = yield_token.as_ref().and_then(|token| {
+        snapshot
+            .state
+            .balances
+            .get(token)
+            .map(|balance| U256::from_be_slice(balance))
+    });
+
     Ok(PendleSyState {
         sy_address,
         total_supply,
         paused,
         token_decimals,
+        supply_cap,
+        yield_token,
+        yield_token_held,
         exchange_rate,
         rate_sampled_at,
         head_timestamp: block.timestamp,
@@ -415,6 +435,31 @@ mod tests {
             decode(market).await,
             Err(InvalidSnapshotError::MissingAttribute(name)) if name == SY_PAUSED
         ));
+    }
+
+    /// The cap, the yield token and what the SY holds of it all decode; an SY without them still
+    /// decodes, bounded by supply alone.
+    #[tokio::test]
+    async fn an_sy_carries_its_cap_yield_token_and_holding() {
+        let mut sy = created_sy();
+        sy.component
+            .static_attributes
+            .insert(YIELD_TOKEN.to_string(), address_bytes(WSTETH));
+        sy.state
+            .attributes
+            .insert(SY_SUPPLY_CAP.to_string(), word(5_000));
+        sy.state
+            .balances
+            .insert(address_bytes(WSTETH), Bytes::from(vec![0x01, 0x00]));
+        let PendleState::Sy(state) = decode(sy).await.unwrap() else { panic!("not an SY") };
+        assert_eq!(state.supply_cap, Some(U256::from(5_000u32)));
+        assert_eq!(state.yield_token, Some(address_bytes(WSTETH)));
+        assert_eq!(state.yield_token_held, Some(U256::from(256u32)));
+
+        let PendleState::Sy(bare) = decode(created_sy()).await.unwrap() else {
+            panic!("not an SY")
+        };
+        assert_eq!((bare.supply_cap, bare.yield_token, bare.yield_token_held), (None, None, None));
     }
 
     /// Supply bounds every redemption, so an SY without it cannot be decoded.

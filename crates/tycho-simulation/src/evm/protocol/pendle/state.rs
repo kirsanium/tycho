@@ -84,10 +84,6 @@ const GAS_WRAP_ONE_TO_ONE: u64 = 90_000;
 /// known at quote time, so the two classes are charged separately.
 const GAS_WRAP_INDEX_RATE: u64 = 180_000;
 
-/// How far under its supply an SY's redemption limit sits. One SY of 357 swept held 3 wei less of
-/// its yield token than its supply, so redeeming the whole supply there fails by 3 wei.
-const SUPPLY_MARGIN_WEI: u64 = 10;
-
 /// How an SY converts a given token, as classified at component creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenClass {
@@ -162,6 +158,17 @@ pub struct PendleSyState {
     /// and the two are only comparable through this. A token missing here is one the stream does
     /// not carry, and its edges report no depth rather than a bound scaled by a guess.
     pub token_decimals: HashMap<Bytes, u32>,
+    /// The most SY shares the SY lets exist, when it caps its own supply. A deposit that would
+    /// mint past it reverts with `SupplyCapExceeded`.
+    #[serde(default)]
+    pub supply_cap: Option<U256>,
+    /// The token the SY holds as its backing (`yieldToken()`), when the stream carries it.
+    #[serde(default)]
+    pub yield_token: Option<Bytes>,
+    /// The SY's own balance of [`Self::yield_token`], from the component balances the stream
+    /// reports. It follows transfers, so a rebasing yield token's balance lags its rebases.
+    #[serde(default)]
+    pub yield_token_held: Option<U256>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,18 +512,35 @@ impl ProtocolSim for PendleState {
                     TokenClass::OneToOne => GAS_WRAP_ONE_TO_ONE,
                     TokenClass::IndexRate => GAS_WRAP_INDEX_RATE,
                 };
-                // The burn reverts on chain past the shares that exist, which the limit sits under.
-                if direction == Direction::Redeem && amount > state.max_redeem_sy() {
-                    return Err(SimulationError::InvalidInput(
-                        format!(
-                            "redeeming {amount} SY exceeds the {} the SY can redeem",
-                            state.max_redeem_sy()
-                        ),
-                        None,
-                    ));
+                if direction == Direction::Redeem {
+                    let max_in = state.max_redeem_sy(&token_out.address, class, token_decimals)?;
+                    if amount > max_in {
+                        return Err(SimulationError::InvalidInput(
+                            format!(
+                                "redeeming {amount} SY exceeds the {max_in} the SY can pay out"
+                            ),
+                            None,
+                        ));
+                    }
                 }
                 let out = state.convert(amount, class, direction, token_decimals)?;
-                let after = state.after(direction, amount, out)?;
+                if direction == Direction::Deposit {
+                    if let Some(room) = state.deposit_headroom() {
+                        if out > room {
+                            return Err(SimulationError::InvalidInput(
+                                format!(
+                                    "minting {out} SY passes the supply cap, which leaves {room}"
+                                ),
+                                None,
+                            ));
+                        }
+                    }
+                }
+                let token = match direction {
+                    Direction::Deposit => &token_in.address,
+                    Direction::Redeem => &token_out.address,
+                };
+                let after = state.after(direction, token, amount, out)?;
                 (out, gas, PendleState::Sy(after))
             }
         };
@@ -633,20 +657,26 @@ impl ProtocolSim for PendleState {
                 let Some(token_decimals) = state.token_decimals.get(token).copied() else {
                     return Ok(no_depth());
                 };
-                // Redeeming is capped by the SY's supply (see `max_redeem_sy`). Depositing has no
-                // reserve behind it at all.
-                match direction {
+                let convert =
+                    |amount: U256| state.convert(amount, class, direction, token_decimals);
+                let max_in = match direction {
+                    // A capped SY mints only up to its cap. An uncapped one has no limit of its
+                    // own; what the protocol it wraps accepts is not visible here.
                     Direction::Deposit => {
-                        let max_in = unbounded_soft_limit();
-                        let max_out = state.convert(max_in, class, direction, token_decimals)?;
-                        Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
+                        let unbounded = unbounded_soft_limit();
+                        match state.deposit_headroom() {
+                            None => unbounded,
+                            Some(room) => largest_input_within(room, unbounded, convert)?,
+                        }
                     }
-                    Direction::Redeem => {
-                        let max_in = state.max_redeem_sy();
-                        let max_out = state.convert(max_in, class, direction, token_decimals)?;
-                        Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
-                    }
+                    Direction::Redeem => state.max_redeem_sy(token, class, token_decimals)?,
+                };
+                let max_out = convert(max_in)?;
+                // An input too small to produce anything is no depth, not a trade.
+                if max_out.is_zero() {
+                    return Ok(no_depth());
                 }
+                Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
             }
         }
     }
@@ -655,13 +685,17 @@ impl ProtocolSim for PendleState {
         &mut self,
         delta: ProtocolStateDelta,
         _tokens: &HashMap<Bytes, Token>,
-        _balances: &Balances,
+        balances: &Balances,
     ) -> Result<(), TransitionError> {
         match self {
             PendleState::Market(state) => state.apply(&delta),
-            // No quote reads what an SY holds: its limits come from its supply, which arrives as an
-            // attribute, so balance updates carry nothing it needs.
-            PendleState::Sy(state) => state.apply(&delta),
+            // An SY's redemption to its yield token is bounded by what it holds of it, which
+            // arrives as a component balance.
+            PendleState::Sy(state) => {
+                state.apply(&delta)?;
+                state.apply_balances(balances);
+                Ok(())
+            }
         }
     }
 
@@ -818,24 +852,81 @@ impl PendleSyState {
         Ok(())
     }
 
-    /// The most SY a redemption can take: the supply, kept [`SUPPLY_MARGIN_WEI`] under it.
+    /// The most SY a redemption to `token` can take.
     ///
-    /// Supply bounds every exit, whatever the class: an SY can redeem no more shares than exist,
-    /// and what backs them may sit outside the SY, in a staking contract it withdraws from.
-    fn max_redeem_sy(&self) -> U256 {
-        self.total_supply
-            .saturating_sub(U256::from(SUPPLY_MARGIN_WEI))
+    /// Supply bounds every exit: no more shares can be burned than exist. On a mainnet fork, 82 of
+    /// the 88 exits of live SYs redeemed their whole supply to the wei. An exit to the SY's own
+    /// yield token is also paid out of what the SY holds of it, so the payout cannot pass that
+    /// holding; one live SY held 28 wei less than its supply needed. The holding counts only when
+    /// it backs at least 999/1000 of the whole supply's payout: an SY that keeps its yield
+    /// token in a staking contract holds little of it and pays from there.
+    ///
+    /// An exit through a protocol the SY wraps can be limited further, by that protocol's own
+    /// liquidity or pause, which nothing here can see.
+    fn max_redeem_sy(
+        &self,
+        token: &Bytes,
+        class: TokenClass,
+        token_decimals: u32,
+    ) -> Result<U256, PendleError> {
+        let supply = self.total_supply;
+        let (Some(yield_token), Some(held)) = (&self.yield_token, self.yield_token_held) else {
+            return Ok(supply);
+        };
+        if token != yield_token {
+            return Ok(supply);
+        }
+        let convert = |amount: U256| self.convert(amount, class, Direction::Redeem, token_decimals);
+        let payout = convert(supply)?;
+        if held >= payout || held < payout - payout / U256::from(1000) {
+            return Ok(supply);
+        }
+        largest_input_within(held, supply, convert)
+    }
+
+    /// The SY a deposit can still mint before the supply cap; `None` for an uncapped SY.
+    fn deposit_headroom(&self) -> Option<U256> {
+        self.supply_cap
+            .map(|cap| cap.saturating_sub(self.total_supply))
+    }
+
+    /// The SY's balance of a component token, from the stream's component balances, keyed by the
+    /// component id the indexer gives an SY: its address.
+    fn apply_balances(&mut self, balances: &Balances) {
+        let (Some(yield_token), Some(component)) = (
+            &self.yield_token,
+            balances
+                .component_balances
+                .get(&self.sy_address.to_string()),
+        ) else {
+            return;
+        };
+        if let Some(balance) = component.get(yield_token) {
+            self.yield_token_held = Some(U256::from_be_slice(balance));
+        }
     }
 
     /// The same wrapper after a conversion: a deposit mints the SY it returns, a redemption burns
     /// the SY it takes.
+    ///
+    /// What it holds of its yield token moves too: a deposit of it adds to the holding, and a
+    /// redemption to it pays out of it.
     fn after(
         &self,
         direction: Direction,
+        token: &Bytes,
         amount_in: U256,
         amount_out: U256,
     ) -> Result<Self, PendleError> {
         let mut next = self.clone();
+        if self.yield_token.as_ref() == Some(token) {
+            next.yield_token_held = self
+                .yield_token_held
+                .map(|held| match direction {
+                    Direction::Deposit => held.saturating_add(amount_in),
+                    Direction::Redeem => held.saturating_sub(amount_out),
+                });
+        }
         next.total_supply = match direction {
             Direction::Deposit => self
                 .total_supply
@@ -907,6 +998,30 @@ fn largest_fill(candidate: U256, fallback: U256, fills: impl Fn(U256) -> bool) -
         step <<= 1;
     }
     fallback
+}
+
+/// The largest input in `[0, upper]` whose conversion stays at or under `target`.
+///
+/// A wrap conversion is monotonic and plain integer arithmetic, so a bisection over it costs a few
+/// hundred multiplications.
+fn largest_input_within(
+    target: U256,
+    upper: U256,
+    convert: impl Fn(U256) -> Result<U256, PendleError>,
+) -> Result<U256, PendleError> {
+    if convert(upper)? <= target {
+        return Ok(upper);
+    }
+    let (mut within, mut past) = (U256::ZERO, upper);
+    while past - within > U256::from(1) {
+        let middle = within + (past - within) / U256::from(2);
+        if convert(middle)? <= target {
+            within = middle;
+        } else {
+            past = middle;
+        }
+    }
+    Ok(within)
 }
 
 /// What `get_limits` reports for a pair this component cannot trade.
@@ -1052,6 +1167,15 @@ impl PendleSyState {
         if let Some(value) = attribute_u256(attributes, PAUSED)? {
             self.paused = !value.is_zero();
         }
+        if let Some(value) = attribute_u256(attributes, SY_SUPPLY_CAP)? {
+            self.supply_cap = Some(value);
+        }
+        if delta
+            .deleted_attributes
+            .contains(SY_SUPPLY_CAP)
+        {
+            self.supply_cap = None;
+        }
         // An upgrade re-classifies the SY's tokens: each class arrives as an update, and a token
         // that no longer matches either closed form loses its class as a deletion.
         for (name, value) in attributes {
@@ -1095,6 +1219,10 @@ pub(super) const SY_TOTAL_SUPPLY: &str = "sy_total_supply";
 pub(super) const PAUSED: &str = "paused";
 /// State attribute on a market: whether its SY is paused.
 pub(super) const SY_PAUSED: &str = "sy_paused";
+/// State attribute: the cap on an SY's own supply, absent when it has none.
+pub(super) const SY_SUPPLY_CAP: &str = "sy_supply_cap";
+/// Static attribute: the token an SY holds as its backing.
+pub(super) const YIELD_TOKEN: &str = "yield_token";
 /// Prefixes of the per-token class attributes, followed by the token's hex address.
 pub(super) const TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
 pub(super) const TOKEN_OUT_CLASS_PREFIX: &str = "token_out_class_0x";

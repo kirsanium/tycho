@@ -88,6 +88,10 @@ fn wsteth_sy() -> PendleState {
             (Bytes::from_str(WSTETH).unwrap(), 18),
             (Bytes::from_str(STETH).unwrap(), 18),
         ]),
+        // Uncapped, and backed by wstETH it holds in full.
+        supply_cap: None,
+        yield_token: Some(Bytes::from_str(WSTETH).unwrap()),
+        yield_token_held: Some(u("3248104473502927520625")),
     })
 }
 
@@ -114,6 +118,9 @@ fn six_decimal_asset_sy() -> PendleState {
         total_supply: u("1000000000000000000000000"),
         paused: false,
         token_decimals: HashMap::from([(Bytes::from_str(SIX_DECIMAL_TOKEN).unwrap(), 6)]),
+        supply_cap: None,
+        yield_token: None,
+        yield_token_held: None,
     })
 }
 
@@ -448,7 +455,7 @@ fn a_redemption_burns_supply_and_a_deposit_mints_it() {
     let (max_in, _) = PendleState::Sy(redeemed.clone())
         .get_limits(Bytes::from_str(SY).unwrap(), wsteth.clone())
         .unwrap();
-    assert_eq!(max_in, u256_to_biguint(redeemed.total_supply - U256::from(10u8)));
+    assert_eq!(max_in, u256_to_biguint(redeemed.total_supply));
 
     let deposited = quote_after(&state, u256_to_biguint(amount), &token(STETH, 18), &token(SY, 18));
     let PendleState::Sy(deposited) = &deposited else { unreachable!() };
@@ -716,6 +723,152 @@ fn selling_yt_just_past_its_depth_is_invalid_input() {
     }
 }
 
+fn with_sy(state: PendleState, change: impl FnOnce(&mut PendleSyState)) -> PendleState {
+    let PendleState::Sy(mut sy) = state else { panic!("not an SY") };
+    change(&mut sy);
+    PendleState::Sy(sy)
+}
+
+/// A capped SY reverts a mint past its cap, so the deposit limit is the largest input whose mint
+/// fits in what is left, one wei more is refused, and each quote's mint uses some of it up.
+#[test]
+fn a_capped_sy_deposits_up_to_its_cap() {
+    let headroom = u("1000000000000000000000");
+    let state = with_sy(wsteth_sy(), |sy| sy.supply_cap = Some(sy.total_supply + headroom));
+    let (sy, steth) = (Bytes::from_str(SY).unwrap(), Bytes::from_str(STETH).unwrap());
+
+    let (max_in, max_out) = state
+        .get_limits(steth.clone(), sy.clone())
+        .unwrap();
+    assert!(max_out <= u256_to_biguint(headroom));
+    let filled = state
+        .get_amount_out(max_in.clone(), &token(STETH, 18), &token(SY, 18))
+        .expect("the limit fills");
+    assert_eq!(filled.amount, max_out);
+    let error = state
+        .get_amount_out(max_in + 1u32, &token(STETH, 18), &token(SY, 18))
+        .unwrap_err();
+    assert!(matches!(error, SimulationError::InvalidInput(..)), "{error:?}");
+
+    let (after_in, _) = filled
+        .new_state
+        .get_limits(steth.clone(), sy.clone())
+        .unwrap();
+    assert!(after_in < BigUint::from(1000u32), "the mint used the cap up: {after_in}");
+
+    let full = with_sy(wsteth_sy(), |sy| sy.supply_cap = Some(sy.total_supply));
+    assert_eq!(full.get_limits(steth, sy).unwrap(), (BigUint::ZERO, BigUint::ZERO));
+}
+
+#[test]
+fn a_delta_sets_and_lifts_the_supply_cap() {
+    let mut state = wsteth_sy();
+    let set = ProtocolStateDelta {
+        component_id: SY.to_string(),
+        updated_attributes: HashMap::from([("sy_supply_cap".to_string(), Bytes::from(vec![7]))]),
+        deleted_attributes: Default::default(),
+    };
+    state
+        .delta_transition(set, &HashMap::new(), &Balances::default())
+        .unwrap();
+    let PendleState::Sy(sy) = &state else { unreachable!() };
+    assert_eq!(sy.supply_cap, Some(U256::from(7u8)));
+
+    let lift = ProtocolStateDelta {
+        component_id: SY.to_string(),
+        updated_attributes: HashMap::new(),
+        deleted_attributes: ["sy_supply_cap".to_string()].into(),
+    };
+    state
+        .delta_transition(lift, &HashMap::new(), &Balances::default())
+        .unwrap();
+    let PendleState::Sy(sy) = &state else { unreachable!() };
+    assert_eq!(sy.supply_cap, None);
+}
+
+/// An SY holding a little less of its yield token than its supply needs (one live SY was 28 wei
+/// short) cannot pay a whole-supply redemption to that token. The exit to the yield token is
+/// bounded by the holding; the stETH exit, which unwraps instead of paying the holding out, is not.
+#[test]
+fn a_redemption_to_the_yield_token_is_bounded_by_what_the_sy_holds() {
+    let state = with_sy(wsteth_sy(), |sy| {
+        sy.yield_token_held = Some(sy.total_supply - U256::from(28u8));
+    });
+    let PendleState::Sy(inner) = &state else { unreachable!() };
+    let (sy, wsteth, steth) = (
+        Bytes::from_str(SY).unwrap(),
+        Bytes::from_str(WSTETH).unwrap(),
+        Bytes::from_str(STETH).unwrap(),
+    );
+
+    let (max_in, _) = state
+        .get_limits(sy.clone(), wsteth)
+        .unwrap();
+    assert_eq!(max_in, u256_to_biguint(inner.total_supply - U256::from(28u8)));
+    let error = state
+        .get_amount_out(max_in + 1u32, &token(SY, 18), &token(WSTETH, 18))
+        .unwrap_err();
+    assert!(matches!(error, SimulationError::InvalidInput(..)), "{error:?}");
+
+    let (steth_in, _) = state.get_limits(sy, steth).unwrap();
+    assert_eq!(steth_in, u256_to_biguint(inner.total_supply));
+}
+
+/// An SY that keeps its yield token in a staking contract holds little of it and pays a
+/// redemption from there, so a holding far below the payout does not bound it.
+#[test]
+fn a_holding_far_below_the_payout_leaves_supply_as_the_bound() {
+    let state = with_sy(wsteth_sy(), |sy| sy.yield_token_held = Some(U256::from(1_000u32)));
+    let PendleState::Sy(inner) = &state else { unreachable!() };
+    let (max_in, _) = state
+        .get_limits(Bytes::from_str(SY).unwrap(), Bytes::from_str(WSTETH).unwrap())
+        .unwrap();
+    assert_eq!(max_in, u256_to_biguint(inner.total_supply));
+}
+
+/// The holding arrives as a component balance, keyed by the SY's id, and a quote moves it.
+#[test]
+fn the_yield_token_holding_follows_balances_and_quotes() {
+    let mut state = wsteth_sy();
+    let balances = Balances {
+        component_balances: HashMap::from([(
+            SY.to_string(),
+            HashMap::from([(Bytes::from_str(WSTETH).unwrap(), Bytes::from(vec![0x0a]))]),
+        )]),
+        account_balances: HashMap::new(),
+    };
+    let nothing = ProtocolStateDelta {
+        component_id: SY.to_string(),
+        updated_attributes: HashMap::new(),
+        deleted_attributes: Default::default(),
+    };
+    state
+        .delta_transition(nothing, &HashMap::new(), &balances)
+        .unwrap();
+    let PendleState::Sy(inner) = &state else { unreachable!() };
+    assert_eq!(inner.yield_token_held, Some(U256::from(10u8)));
+
+    let deposited = wsteth_sy()
+        .get_amount_out(BigUint::from(5u32), &token(WSTETH, 18), &token(SY, 18))
+        .unwrap()
+        .new_state;
+    let PendleState::Sy(after) = deposited
+        .as_any()
+        .downcast_ref::<PendleState>()
+        .unwrap()
+        .clone()
+    else {
+        unreachable!()
+    };
+    let PendleState::Sy(before) = wsteth_sy() else { unreachable!() };
+    assert_eq!(
+        after.yield_token_held,
+        before
+            .yield_token_held
+            .map(|h| h + U256::from(5u8))
+    );
+}
+
 /// PT against YT is not a market edge: minting and redeeming PY is the yield token's business, and
 /// SY is one side of every market swap.
 #[test]
@@ -896,13 +1049,13 @@ fn gas_reflects_the_direction_and_the_wrap_class() {
 /// The two directions of a wrap edge are not symmetric. An SY mints new shares against whatever it
 /// forwards on, so a deposit has no reserve to exhaust, but no redemption can take more SY than
 /// exists. Supply bounds every exit alike: wstETH paid out directly, and stETH paid by unwrapping
-/// the same wstETH. The limit sits 10 wei under supply.
+/// the same wstETH. The limit is the supply to the wei, which redeems in full on a mainnet fork.
 #[test]
 fn redeeming_is_bounded_by_supply_and_depositing_is_not() {
     let sy = Bytes::from_str(SY).unwrap();
     let wsteth = Bytes::from_str(WSTETH).unwrap();
     let steth = Bytes::from_str(STETH).unwrap();
-    let limit = u("3248104473502927520615");
+    let limit = u("3248104473502927520625");
 
     let (wsteth_in, wsteth_out) = wsteth_sy()
         .get_limits(sy.clone(), wsteth.clone())
@@ -974,8 +1127,8 @@ fn a_wrap_bound_is_reachable_across_a_decimal_gap() {
         .get_amount_out(redeem_in.clone(), &sy_token, &usdc_token)
         .expect("the reported redeem maximum must be quotable");
     assert_eq!(quoted.amount, redeem_out, "redeem bound does not describe its own edge");
-    // The input side is the supply, 10 wei under, in SY units rather than the token's.
-    assert_eq!(redeem_in, BigUint::from(10u32).pow(24) - BigUint::from(10u32));
+    // The input side is the supply, in SY units rather than the token's.
+    assert_eq!(redeem_in, BigUint::from(10u32).pow(24));
 }
 
 /// A token the stream does not carry has no decimals to convert through, and every bound on a wrap
