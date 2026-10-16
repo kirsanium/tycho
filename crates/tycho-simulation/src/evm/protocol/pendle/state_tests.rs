@@ -572,6 +572,40 @@ fn a_market_refuses_every_edge_while_its_sy_is_paused() {
     }
 }
 
+/// No caller amount reads as a broken state. Up to `u128::MAX` every edge either quotes or says
+/// the request is too large; past it the amount exceeds any token supply and is refused before
+/// it can overflow the math.
+#[test]
+fn an_oversized_amount_is_never_a_fatal_error() {
+    let market = wsteth_market(1_700_000_000);
+    let sy = wsteth_sy();
+    let cases = [
+        (&market, SY, PT),
+        (&market, PT, SY),
+        (&market, SY, YT),
+        (&market, YT, SY),
+        (&sy, WSTETH, SY),
+        (&sy, STETH, SY),
+        (&sy, SY, WSTETH),
+        (&sy, SY, STETH),
+    ];
+    let at_bound = BigUint::from(u128::MAX);
+    for (state, from, to) in cases {
+        match state.get_amount_out(at_bound.clone(), &token(from, 18), &token(to, 18)) {
+            Ok(_) | Err(SimulationError::InvalidInput(..)) => {}
+            Err(error) => panic!("{from}->{to} at u128::MAX: {error:?}"),
+        }
+        for amount in
+            [at_bound.clone() + 1u32, BigUint::from(1u32) << 200, BigUint::from(1u32) << 300]
+        {
+            let error = state
+                .get_amount_out(amount, &token(from, 18), &token(to, 18))
+                .unwrap_err();
+            assert!(matches!(error, SimulationError::InvalidInput(..)), "{from}->{to}: {error:?}");
+        }
+    }
+}
+
 /// PT against YT is not a market edge: minting and redeeming PY is the yield token's business, and
 /// SY is one side of every market swap.
 #[test]

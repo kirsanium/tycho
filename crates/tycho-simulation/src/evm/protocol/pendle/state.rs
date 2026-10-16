@@ -457,9 +457,11 @@ impl ProtocolSim for PendleState {
         if amount_in == BigUint::from(0u32) {
             return Err(SimulationError::InvalidInput("amount_in is zero".to_string(), None));
         }
-        if amount_in.bits() > 256 {
+        // More than any token's supply. The math is checked, but an amount this size overflows
+        // inside it, and an overflow there reads as a broken state rather than a request too large.
+        if amount_in > BigUint::from(u128::MAX) {
             return Err(SimulationError::InvalidInput(
-                format!("amount_in {amount_in} does not fit in 256 bits"),
+                format!("amount_in {amount_in} exceeds any token supply"),
                 None,
             ));
         }
