@@ -243,9 +243,9 @@ impl PendleMarketState {
         // a wei above what the trader receives.
         let py_to_repay = sy_utils::sy_to_asset_up(self.py_index, sy_owed)?;
         if yt_in < py_to_repay {
-            return Err(PendleError::NegativeResult {
-                a: yt_in.to_string(),
-                b: py_to_repay.to_string(),
+            return Err(PendleError::YtSaleCannotRepay {
+                yt_in: yt_in.to_string(),
+                py_to_repay: py_to_repay.to_string(),
             });
         }
         let sy_out = sy_utils::asset_to_sy(self.py_index, yt_in - py_to_repay)?;
@@ -570,38 +570,48 @@ impl ProtocolSim for PendleState {
                     return Ok(no_depth());
                 };
 
-                let (max_in, max_out) = match (from, to) {
+                // Each limit is the largest input the edge actually fills: a closed form for the
+                // boundary, checked against the quote, which replicates the router to the wei.
+                let fills = |amount: U256| {
+                    state
+                        .amount_out(amount, from, to)
+                        .is_ok()
+                };
+                let max_in = match (from, to) {
+                    // The router's search stops at the haircut rate floor, and accepts a request
+                    // up to `eps` above what that bound costs.
                     (MarketToken::Sy, MarketToken::Pt) => {
-                        approx::max_sy_in_for_pt(&state.market, state.py_index, state.quote_time())?
-                    }
-                    // The bound picks the input. The output is the quote at that input, since
-                    // the YT minted is not the PT sold back but everything the SY tokenizes into.
-                    (MarketToken::Sy, MarketToken::Yt) => {
-                        let (max_sy_in, _) = approx::max_sy_in_for_yt(
+                        let (exact, _) = approx::max_sy_in_for_pt(
                             &state.market,
                             state.py_index,
                             state.quote_time(),
                         )?;
-                        let filled =
-                            state.amount_out(max_sy_in, MarketToken::Sy, MarketToken::Yt)?;
-                        (max_sy_in, filled.amount_out)
+                        largest_fill(approx::with_eps_slack(exact)?, exact, fills)
                     }
-                    // Selling PT hands PT *to* the market, so the 96% proportion cap binds.
-                    (MarketToken::Pt, MarketToken::Sy) => {
-                        let max_pt_in = state.max_pt_in()?;
-                        (max_pt_in, state.pt_for_sy(max_pt_in)?.0)
+                    // The same search, bounded by the proportion cap the minted PT is sold into.
+                    (MarketToken::Sy, MarketToken::Yt) => {
+                        let (exact, _) = approx::max_sy_in_for_yt(
+                            &state.market,
+                            state.py_index,
+                            state.quote_time(),
+                        )?;
+                        largest_fill(approx::with_eps_slack(exact)?, exact, fills)
                     }
-                    // Selling YT flash-*borrows* PT from the market to redeem against, so the
-                    // market sends PT out and the rate floor binds — the same bound as SY→PT, not
-                    // the proportion cap. The two YT legs therefore have different constraints
-                    // from each other, despite sharing the PT legs' reserves.
+                    // Selling PT hands PT *to* the market, so the 96% proportion cap binds, and the
+                    // market checks it directly: the closed form is the boundary.
+                    (MarketToken::Pt, MarketToken::Sy) => state.max_pt_in()?,
+                    // Selling YT flash-*borrows* PT from the market, outside the router's search,
+                    // so the market's own rate floor binds without the search's haircut. Close to
+                    // expiry, repaying the borrowed PT can bind first; the walk finds whichever.
                     (MarketToken::Yt, MarketToken::Sy) => {
-                        let max_yt_in = state.max_pt_out()?;
-                        (max_yt_in, state.yt_for_sy(max_yt_in)?.0)
+                        largest_fill(state.max_pt_out_unhaircut()?, state.max_pt_out()?, fills)
                     }
                     // PT against YT, or either against itself: not an edge of this market.
                     _ => return Ok(no_depth()),
                 };
+                let max_out = state
+                    .amount_out(max_in, from, to)?
+                    .amount_out;
                 Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
             }
             PendleState::Sy(state) => {
@@ -768,10 +778,17 @@ impl PendleMarketState {
         approx::calc_soft_max_pt_in(&self.market, &comp)
     }
 
-    /// The most PT the market will send out, from the exchange-rate floor.
+    /// The most PT the router's search will take out, from the exchange-rate floor less its
+    /// 999/1000 haircut.
     fn max_pt_out(&self) -> Result<U256, PendleError> {
         let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
         approx::calc_max_pt_out(&comp, self.market.total_pt)
+    }
+
+    /// The most PT the market itself will send out before its exchange rate falls below par.
+    fn max_pt_out_unhaircut(&self) -> Result<U256, PendleError> {
+        let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
+        approx::calc_max_pt_out_unhaircut(&comp, self.market.total_pt)
     }
 }
 
@@ -860,6 +877,36 @@ fn unquotable_pair(token_in: &Token, token_out: &Token) -> SimulationError {
 /// multiply by it without overflowing.
 fn unbounded_soft_limit() -> U256 {
     U256::from(u128::MAX)
+}
+
+/// The largest input a market edge fills, found from `candidate`, a closed form for the edge's
+/// boundary.
+///
+/// The closed forms land within a few wei of the boundary, except where the contract's own
+/// estimate rounds (selling YT, to about 1e-11 of the amount). If the edge fills at `candidate`, a
+/// few wei above it are tried; if it does not, it is walked down in doubling steps until it does,
+/// which lands within twice the miss. `fallback`, a bound the edge is known to fill, covers a
+/// candidate that misses by more than a thousandth, which no tested state does.
+fn largest_fill(candidate: U256, fallback: U256, fills: impl Fn(U256) -> bool) -> U256 {
+    if fills(candidate) {
+        let mut largest = candidate;
+        for _ in 0..4 {
+            let next = largest + U256::from(1);
+            if !fills(next) {
+                break;
+            }
+            largest = next;
+        }
+        return largest;
+    }
+    let mut step = U256::from(1);
+    while step <= candidate / U256::from(1000) {
+        if fills(candidate - step) {
+            return candidate - step;
+        }
+        step <<= 1;
+    }
+    fallback
 }
 
 /// What `get_limits` reports for a pair this component cannot trade.

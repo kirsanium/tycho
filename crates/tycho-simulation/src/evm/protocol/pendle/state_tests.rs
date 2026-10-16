@@ -653,6 +653,69 @@ fn an_sy_ignores_the_execution_block() {
     assert_eq!(state, before);
 }
 
+/// Each market limit is the largest input the edge fills, not a bound safely below it: the limit
+/// fills, and anything a billionth past it is refused as too large, never as a broken state. The
+/// two SY-in edges are exact to the wei. Checked from four years out to a minute before expiry.
+#[test]
+fn market_limits_are_the_largest_input_that_fills() {
+    let expiry = 1_830_124_800u64;
+    let states = [
+        wsteth_market(1_700_000_000),
+        wsteth_market(expiry - 86_400),
+        wsteth_market(expiry - 60),
+        wsteth_market_at_block_25_800_000(),
+    ];
+    for state in &states {
+        for (from, to) in [(SY, PT), (PT, SY), (SY, YT), (YT, SY)] {
+            let (token_in, token_out) = (token(from, 18), token(to, 18));
+            let quote =
+                |amount: &BigUint| state.get_amount_out(amount.clone(), &token_in, &token_out);
+            let (max_in, max_out) = state
+                .get_limits(token_in.address.clone(), token_out.address.clone())
+                .unwrap();
+            assert_eq!(quote(&max_in).unwrap().amount, max_out, "{from}->{to}");
+
+            let past = &max_in + &max_in / 1_000_000_000u32 + 1u32;
+            let error = quote(&past).unwrap_err();
+            assert!(matches!(error, SimulationError::InvalidInput(..)), "{from}->{to}: {error:?}");
+            if from == SY {
+                assert!(quote(&(&max_in + 1u32)).is_err(), "{from}->{to} is not exact");
+            }
+        }
+    }
+}
+
+/// Close to expiry, selling YT just past its depth fails on repaying the borrowed PT rather than on
+/// the market's rate floor. That is the caller's amount being too large, not a broken state.
+#[test]
+fn selling_yt_just_past_its_depth_is_invalid_input() {
+    let expiry = 1_830_124_800u64;
+    for state in [wsteth_market(expiry - 86_400), wsteth_market(expiry - 60)] {
+        let (yt, sy) = (token(YT, 18), token(SY, 18));
+        let fills = |amount: &BigUint| {
+            state
+                .get_amount_out(amount.clone(), &yt, &sy)
+                .is_ok()
+        };
+        let (mut fill, _) = state
+            .get_limits(yt.address.clone(), sy.address.clone())
+            .unwrap();
+        let mut refuse = &fill + &fill / 1_000_000_000u32 + 1u32;
+        while &refuse - &fill > BigUint::from(1u32) {
+            let mid = (&fill + &refuse) / 2u32;
+            if fills(&mid) {
+                fill = mid;
+            } else {
+                refuse = mid;
+            }
+        }
+        let error = state
+            .get_amount_out(refuse, &yt, &sy)
+            .unwrap_err();
+        assert!(matches!(error, SimulationError::InvalidInput(..)), "{error:?}");
+    }
+}
+
 /// PT against YT is not a market edge: minting and redeeming PY is the yield token's business, and
 /// SY is one side of every market swap.
 #[test]

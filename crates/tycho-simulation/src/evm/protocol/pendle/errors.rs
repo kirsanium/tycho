@@ -31,7 +31,8 @@ impl From<PendleError> for SimulationError {
             PendleError::MarketProportionTooHigh { .. } |
             PendleError::MarketExchangeRateBelowOne { .. } |
             PendleError::ApproxRangeOverflow |
-            PendleError::ApproxExhausted { .. } => SimulationError::InvalidInput(message, None),
+            PendleError::ApproxExhausted { .. } |
+            PendleError::YtSaleCannotRepay { .. } => SimulationError::InvalidInput(message, None),
 
             // Too small to price, which is also the caller's input.
             PendleError::ApproxRangeUnderflow => SimulationError::InvalidInput(message, None),

@@ -53,6 +53,10 @@ pub enum PendleError {
     ApproxRangeOverflow,
     /// The search range inverted, which means the bounds were built wrong.
     ApproxInvalidBounds { lower: String, upper: String },
+    /// Selling YT borrows PT from the market and repays it from the PY the YT redeems. Past the
+    /// edge's depth, buying that PT back costs more PY than the sale has, and the router's
+    /// callback reverts on the subtraction.
+    YtSaleCannotRepay { yt_in: String, py_to_repay: String },
 }
 
 impl fmt::Display for PendleError {
@@ -66,6 +70,11 @@ impl fmt::Display for PendleError {
             PendleError::LogarithmOutOfBounds { a } => {
                 write!(f, "ln({a}) is undefined; the argument must be strictly positive")
             }
+            PendleError::YtSaleCannotRepay { yt_in, py_to_repay } => write!(
+                f,
+                "selling {yt_in} YT cannot repay the {py_to_repay} PY its borrowed PT costs; the \
+                 trade is past what the market can absorb"
+            ),
             PendleError::NegativeResult { a, b } => {
                 write!(f, "{a} - {b} would be negative, which subNoNeg forbids")
             }

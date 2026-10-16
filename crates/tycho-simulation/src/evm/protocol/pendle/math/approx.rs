@@ -254,12 +254,32 @@ fn calc_sy_out(
 /// The trailing `× 999/1000` is the contract's own precision headroom, not a safety margin added
 /// here. Reporting the un-haircut value hands a router a size the swap then rejects.
 pub fn calc_max_pt_out(comp: &MarketPreCompute, total_pt: I256) -> PendleResult<U256> {
+    Ok(calc_max_pt_out_unhaircut(comp, total_pt)? * U256::from(999) / U256::from(1000))
+}
+
+/// [`calc_max_pt_out`] before the router's 999/1000 haircut: the PT the market can send out
+/// before its exchange rate falls below par, as the contract's closed form estimates it.
+///
+/// Selling YT borrows PT from the market outside the router's search, so this, not the haircut
+/// one, is that edge's bound. The closed form rounds, so it can land a little either side of the
+/// exact boundary.
+pub fn calc_max_pt_out_unhaircut(comp: &MarketPreCompute, total_pt: I256) -> PendleResult<U256> {
     let logit_p =
         log_exp_math::exp(pmath::mul_down_i(comp.fee_rate - comp.rate_anchor, comp.rate_scalar)?)?;
     let proportion = pmath::div_down_i(logit_p, logit_p + i_one())?;
     let numerator = pmath::mul_down_i(proportion, total_pt + comp.total_asset)?;
-    let max_pt_out = total_pt - numerator;
-    Ok(pmath::to_u256(max_pt_out)? * U256::from(999) / U256::from(1000))
+    pmath::to_u256(total_pt - numerator)
+}
+
+/// The largest exact input the search accepts, given the input that costs exactly its hard
+/// bound. The search accepts a guess whose cost is within `eps` below the request, so a request
+/// up to `exact_fill / (1 - eps)` still lands on the bound. Rounding can leave the true maximum a
+/// wei above this.
+pub fn with_eps_slack(exact_fill: U256) -> PendleResult<U256> {
+    let scaled = exact_fill
+        .checked_mul(pmath::one())
+        .ok_or(PendleError::Overflow { operation: "the search's slack-inclusive input" })?;
+    Ok(scaled / (pmath::one() - default_eps()))
 }
 
 /// The most PT the market will absorb before the 96% proportion cap binds.
@@ -277,8 +297,7 @@ pub fn calc_soft_max_pt_in(market: &MarketState, comp: &MarketPreCompute) -> Pen
 /// and accepts, not an extrapolation of one.
 ///
 /// The `eps` slack means an input slightly above this still fills, since the loop accepts a guess
-/// whose cost is within `eps` *below* the request. Reporting the exact-fill point rather than the
-/// slack-inclusive one keeps `get_limits` on the safe side of the boundary.
+/// whose cost is within `eps` *below* the request; [`with_eps_slack`] gives that larger input.
 pub fn max_sy_in_for_pt(
     market: &MarketState,
     index: U256,
