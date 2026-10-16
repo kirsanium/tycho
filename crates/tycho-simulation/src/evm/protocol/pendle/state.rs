@@ -966,6 +966,11 @@ fn unquotable_pair(token_in: &Token, token_out: &Token) -> SimulationError {
 /// The soft limit this repo uses for an edge with no reserve behind it, matching
 /// `native_wrapper`. Large enough not to constrain any real trade, small enough that a caller can
 /// multiply by it without overflowing.
+///
+/// An uncapped SY's deposit reports it. Depositing the SY's own yield token has no limit at all:
+/// on a mainnet fork, 51 of 53 such deposits took a trillion whole tokens. A deposit converted
+/// through the protocol the SY wraps can be limited there (17 of 47 were, by an ERC-4626
+/// `maxDeposit`, Lido's stake limit and others), which nothing here can see.
 fn unbounded_soft_limit() -> U256 {
     U256::from(u128::MAX)
 }

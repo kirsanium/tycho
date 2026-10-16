@@ -1072,12 +1072,19 @@ fn redeeming_is_bounded_by_supply_and_depositing_is_not() {
         .unwrap();
     assert_eq!(steth_out, quoted.amount);
 
-    // Depositing is unbounded, and reported as the soft limit rather than a U256 sentinel that
-    // would overflow the first multiplication a router did with it.
+    // An uncapped SY has no deposit limit of its own, so it reports the repo's unbounded soft
+    // limit, whatever the entry token's decimals.
     let (deposit_in, _) = wsteth_sy()
         .get_limits(wsteth, sy)
         .unwrap();
     assert_eq!(deposit_in, BigUint::from(u128::MAX));
+    let (six_decimal_in, _) = six_decimal_asset_sy()
+        .get_limits(
+            Bytes::from_str(SIX_DECIMAL_TOKEN).unwrap(),
+            Bytes::from_str(SIX_DECIMAL_SY).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(six_decimal_in, BigUint::from(u128::MAX));
 }
 
 /// A redemption past the limit is refused rather than quoted: on chain the burn reverts once it
