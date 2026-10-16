@@ -105,6 +105,7 @@ tests:
           asset_address: "0xae7ab96520de3a18e5e111b5eaab095312d7fe84"
           asset_decimals: "0x12"
           sy_decimals: "0x12"
+          yield_token: "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0"
         creation_tx: "0x952d4c25142e16032afd36d6be525aeed374517ec0942a7e879221db6ef3e032"
         skip_simulation: true
         skip_execution: true
@@ -249,6 +250,7 @@ tests:
           asset_address: "0xae7ab96520de3a18e5e111b5eaab095312d7fe84"
           asset_decimals: "0x12"
           sy_decimals: "0x12"
+          yield_token: "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0"
         creation_tx: "0xf5022404495cff175a5b4c45864e372f0fa2344cc8aa14298987e4ccdf6e5daa"
         skip_simulation: true
         skip_execution: true

@@ -145,6 +145,11 @@ pub(crate) struct SyProfile {
     pub(crate) holdings: Vec<(Vec<u8>, BigInt)>,
     /// `paused()` at the creation block; `Paused` / `Unpaused` move it afterwards.
     pub(crate) paused: bool,
+    /// `yieldToken()`, the token the SY holds as its backing, when it answers.
+    pub(crate) yield_token: Option<Vec<u8>>,
+    /// The cap on the SY's own supply at the creation block, when it has one. See
+    /// [`own_supply_cap`].
+    pub(crate) supply_cap: Option<BigInt>,
 }
 
 /// State attribute carrying an SY's share supply, which bounds every redemption from it.
@@ -169,6 +174,14 @@ pub const CREATION_SY_PAUSED: &str = "creation_sy_paused";
 /// State attribute on a market: whether its SY is paused. A paused SY reverts every transfer, and
 /// every market swap moves SY, so this refuses every quote against the market.
 pub const SY_PAUSED: &str = "sy_paused";
+/// Static attribute: the token the SY holds as its backing (`yieldToken()`).
+pub const YIELD_TOKEN: &str = "yield_token";
+/// Static attribute carrying the cap on an SY's own supply at creation. Consumed by
+/// `map_sy_state` and stripped before the component is emitted.
+pub const CREATION_SUPPLY_CAP: &str = "creation_supply_cap";
+/// State attribute: the most SY shares the SY lets exist. A deposit that would mint past it
+/// reverts with `SupplyCapExceeded`. Absent for an SY without such a cap.
+pub const SY_SUPPLY_CAP: &str = "sy_supply_cap";
 /// Prefixes of the per-token class attributes, followed by the token's hex address. Emitted as
 /// state, since an upgrade can change how a token converts.
 pub const TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
@@ -179,6 +192,7 @@ pub fn is_creation_seed(name: &str) -> bool {
     name == CREATION_TOTAL_SUPPLY ||
         name == CREATION_PAUSED ||
         name == CREATION_SY_PAUSED ||
+        name == CREATION_SUPPLY_CAP ||
         name.starts_with(CREATION_BALANCE_PREFIX)
 }
 
@@ -250,6 +264,12 @@ impl SyProfile {
         ];
         attributes.extend(class_attributes(&self.tokens_in, &self.tokens_out));
         attributes.push((CREATION_PAUSED.to_string(), vec![u8::from(self.paused)]));
+        if let Some(yield_token) = &self.yield_token {
+            attributes.push((YIELD_TOKEN.to_string(), yield_token.clone()));
+        }
+        if let Some(cap) = &self.supply_cap {
+            attributes.push((CREATION_SUPPLY_CAP.to_string(), cap.to_signed_bytes_be()));
+        }
         attributes
             .push((CREATION_TOTAL_SUPPLY.to_string(), self.total_supply.to_signed_bytes_be()));
         for (token, balance) in &self.holdings {
@@ -271,7 +291,9 @@ pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
         classify_sy(sy_address)?;
 
     let tokens = component_tokens(sy_address, &tokens_in, &tokens_out);
-    let Some(Seeds { total_supply, holdings, paused }) = read_seeds(sy_address, &tokens) else {
+    let Some(Seeds { total_supply, holdings, paused, yield_token, supply_cap }) =
+        read_seeds(sy_address, &tokens)
+    else {
         log::info!("SY 0x{} did not answer totalSupply()", hex::encode(sy_address));
         return None;
     };
@@ -286,6 +308,8 @@ pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
         total_supply,
         holdings,
         paused,
+        yield_token,
+        supply_cap,
     })
 }
 
@@ -404,6 +428,30 @@ struct Seeds {
     total_supply: BigInt,
     holdings: Vec<(Vec<u8>, BigInt)>,
     paused: bool,
+    yield_token: Option<Vec<u8>>,
+    supply_cap: Option<BigInt>,
+}
+
+/// The cap an SY puts on its own supply, from `getAbsoluteSupplyCap()` and
+/// `getAbsoluteTotalSupply()`; `None` when it has none.
+///
+/// Pendle's capped SYs revert a mint that takes `totalSupply()` past the cap, so the room left is
+/// the cap less the supply this package already follows from mints and burns. That holds only
+/// when the "absolute" supply the cap is checked against is the SY's own; some SYs cap a vault's
+/// supply instead, which moves outside the SY and would need a read every block, so those are
+/// left uncapped. `type(uint256).max` is how an uncapped SY answers.
+pub fn own_supply_cap(
+    cap: Option<BigInt>,
+    absolute_supply: Option<BigInt>,
+    supply: &BigInt,
+) -> Option<BigInt> {
+    let (cap, absolute_supply) = (cap?, absolute_supply?);
+    (absolute_supply == *supply && !is_uncapped(&cap)).then_some(cap)
+}
+
+/// Whether a supply cap is `type(uint256).max`, which is how an uncapped SY answers.
+pub fn is_uncapped(cap: &BigInt) -> bool {
+    *cap == BigInt::from(2).pow(256) - BigInt::from(1)
 }
 
 /// Reads whether the SY is paused, for a market whose SY did not profile. An SY without a
@@ -425,7 +473,10 @@ pub(crate) fn read_paused(sy_address: &[u8]) -> bool {
 fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
     let mut batch = RpcBatch::new()
         .add(erc20::functions::TotalSupply {}, sy_address.to_vec())
-        .add(pendle_sy::functions::Paused {}, sy_address.to_vec());
+        .add(pendle_sy::functions::Paused {}, sy_address.to_vec())
+        .add(pendle_sy::functions::YieldToken {}, sy_address.to_vec())
+        .add(pendle_sy::functions::GetAbsoluteSupplyCap {}, sy_address.to_vec())
+        .add(pendle_sy::functions::GetAbsoluteTotalSupply {}, sy_address.to_vec());
     for token in tokens {
         batch =
             batch.add(erc20::functions::BalanceOf { owner: sy_address.to_vec() }, token.clone());
@@ -441,10 +492,23 @@ fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
         .get(1)
         .and_then(RpcBatch::decode::<_, pendle_sy::functions::Paused>)
         .unwrap_or(false);
+    let yield_token = responses
+        .get(2)
+        .and_then(RpcBatch::decode::<_, pendle_sy::functions::YieldToken>)
+        .filter(|token| token.iter().any(|byte| *byte != 0));
+    let supply_cap = own_supply_cap(
+        responses
+            .get(3)
+            .and_then(RpcBatch::decode::<_, pendle_sy::functions::GetAbsoluteSupplyCap>),
+        responses
+            .get(4)
+            .and_then(RpcBatch::decode::<_, pendle_sy::functions::GetAbsoluteTotalSupply>),
+        &total_supply,
+    );
     let mut holdings = Vec::new();
     for (token, response) in tokens
         .iter()
-        .zip(responses.iter().skip(2))
+        .zip(responses.iter().skip(5))
     {
         let Some(balance) = RpcBatch::decode::<_, erc20::functions::BalanceOf>(response) else {
             log::info!(
@@ -456,7 +520,7 @@ fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
         };
         holdings.push((token.clone(), balance));
     }
-    Some(Seeds { total_supply, holdings, paused })
+    Some(Seeds { total_supply, holdings, paused, yield_token, supply_cap })
 }
 
 fn decode_decimals(response: &RpcResponse) -> Option<u32> {
@@ -604,6 +668,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     /// Every fixture below is a value read from Ethereum mainnet, not one computed from this
@@ -802,5 +868,27 @@ mod tests {
         let observed = pow10(18);
         assert_eq!(classify_deposit(&observed, 18, 18, &BigInt::zero()), None);
         assert_eq!(classify_redeem(&observed, 18, 18, 18, &BigInt::zero()), None);
+    }
+
+    /// SY-sUSDe `0xbf98...5d02` on mainnet: a cap of 2.5e27 on its own supply, 2.26e25 minted.
+    #[test]
+    fn a_cap_on_the_sys_own_supply_is_kept() {
+        let supply = BigInt::from_str("22606883884338964498272371").unwrap();
+        let cap = BigInt::from_str("2500000000000000000000000000").unwrap();
+        assert_eq!(own_supply_cap(Some(cap.clone()), Some(supply.clone()), &supply), Some(cap));
+    }
+
+    /// An SY that caps a vault's supply rather than its own would need that supply read every
+    /// block; an uncapped SY answers `type(uint256).max`; one without the getters has no cap.
+    #[test]
+    fn caps_on_another_supply_or_none_at_all_are_dropped() {
+        let supply = BigInt::from(1_000);
+        let cap = BigInt::from(5_000);
+        assert_eq!(own_supply_cap(Some(cap.clone()), Some(BigInt::from(2_000)), &supply), None);
+        let uncapped = BigInt::from(2).pow(256) - BigInt::from(1);
+        assert!(is_uncapped(&uncapped));
+        assert_eq!(own_supply_cap(Some(uncapped), Some(supply.clone()), &supply), None);
+        assert_eq!(own_supply_cap(None, None, &supply), None);
+        assert_eq!(own_supply_cap(Some(cap), None, &supply), None);
     }
 }

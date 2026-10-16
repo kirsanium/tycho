@@ -3,18 +3,21 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::Result;
 use substreams::{
     hex, log,
+    scalar::BigInt,
     store::{StoreGet, StoreGetRaw, StoreGetString},
 };
-use substreams_ethereum::pb::eth::v2 as eth;
+use substreams_ethereum::{pb::eth::v2 as eth, Event};
 use tycho_substreams::prelude::*;
 
 use crate::{
+    abi::pendle_sy,
     consts::PENDLE_MARKET,
     keys::{contract_id, MARKET_REGISTRY},
     registry::markets_of_sy,
     sy::{
-        class_attributes, classify_sy, is_class_attribute, Classification, CREATION_PAUSED,
-        CREATION_SY_PAUSED, PAUSED, SY_PAUSED, TOKEN_IN_CLASS_PREFIX, TOKEN_OUT_CLASS_PREFIX,
+        class_attributes, classify_sy, is_class_attribute, is_uncapped, Classification,
+        CREATION_PAUSED, CREATION_SUPPLY_CAP, CREATION_SY_PAUSED, PAUSED, SY_PAUSED, SY_SUPPLY_CAP,
+        TOKEN_IN_CLASS_PREFIX, TOKEN_OUT_CLASS_PREFIX,
     },
     transfers::{is_market, new_sy_components},
 };
@@ -98,6 +101,16 @@ pub fn map_sy_state(
             {
                 continue;
             }
+            if let Some(cap) = pendle_sy::events::SupplyCapUpdated::match_and_decode(log) {
+                record(
+                    &tx.into(),
+                    EntityChanges {
+                        component_id: sy_id,
+                        attributes: vec![supply_cap_change(&cap.new_supply_cap)],
+                    },
+                );
+                continue;
+            }
             let paused = if topic.as_slice() == PAUSED_TOPIC {
                 true
             } else if topic.as_slice() == UNPAUSED_TOPIC {
@@ -167,7 +180,23 @@ fn creation_state(component: &ProtocolComponent) -> EntityChanges {
         .get_attribute_value(CREATION_PAUSED)
         .unwrap_or_else(|| panic!("SY {} was created without its pause seed", component.id));
     attributes.push(update(PAUSED, paused));
+    if let Some(cap) = component.get_attribute_value(CREATION_SUPPLY_CAP) {
+        attributes.push(update(SY_SUPPLY_CAP, cap));
+    }
     EntityChanges { component_id: component.id.clone(), attributes }
+}
+
+/// The supply cap an SY's `SupplyCapUpdated` sets: the new cap, or a deletion when it lifts the cap
+/// by setting `type(uint256).max`.
+fn supply_cap_change(new_cap: &BigInt) -> Attribute {
+    if is_uncapped(new_cap) {
+        return Attribute {
+            name: SY_SUPPLY_CAP.to_string(),
+            value: vec![],
+            change: ChangeType::Deletion.into(),
+        };
+    }
+    update(SY_SUPPLY_CAP, new_cap.to_signed_bytes_be())
 }
 
 /// `sy_paused` on every market of each SY that paused or unpaused, in event order, leaving out the
@@ -457,5 +486,58 @@ mod tests {
             .find(|a| a.name == PAUSED)
             .unwrap();
         assert_eq!(paused.value, vec![1u8]);
+    }
+
+    /// `SupplyCapUpdated(uint256)` as a capped SY emits it: topic0 only, the new cap as data.
+    fn supply_cap_updated(new_cap: &BigInt) -> eth::Log {
+        let mut data = vec![0u8; 32];
+        let bytes = new_cap.to_bytes_be().1;
+        data[32 - bytes.len()..].copy_from_slice(&bytes);
+        eth::Log {
+            address: SY.to_vec(),
+            topics: vec![hex::decode(
+                "4e44c8be34d12f1b7f56b13b4bbe97e64ca37a91916f86c73412da80c21748e2",
+            )
+            .unwrap()],
+            data,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_cap_update_sets_the_new_cap() {
+        let cap = BigInt::from(74_800_000u64) * BigInt::from(10u64).pow(18);
+        let event = pendle_sy::events::SupplyCapUpdated::match_and_decode(supply_cap_updated(&cap))
+            .expect("the event decodes");
+        let change = supply_cap_change(&event.new_supply_cap);
+        assert_eq!(change.name, SY_SUPPLY_CAP);
+        assert_eq!(change.change, i32::from(ChangeType::Update));
+        assert_eq!(BigInt::from_signed_bytes_be(&change.value), cap);
+    }
+
+    /// Setting the cap to `type(uint256).max` lifts it, so the attribute goes.
+    #[test]
+    fn lifting_the_cap_deletes_it() {
+        let uncapped = BigInt::from(2).pow(256) - BigInt::from(1);
+        let event =
+            pendle_sy::events::SupplyCapUpdated::match_and_decode(supply_cap_updated(&uncapped))
+                .expect("the event decodes");
+        assert_eq!(
+            supply_cap_change(&event.new_supply_cap).change,
+            i32::from(ChangeType::Deletion)
+        );
+    }
+
+    #[test]
+    fn creation_state_carries_the_supply_cap() {
+        let component = ProtocolComponent::new("0xcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcb")
+            .with_attributes(&[(CREATION_PAUSED, vec![0u8]), (CREATION_SUPPLY_CAP, vec![0x10, 0])]);
+        let state = creation_state(&component);
+        let cap = state
+            .attributes
+            .iter()
+            .find(|a| a.name == SY_SUPPLY_CAP)
+            .expect("the cap is carried");
+        assert_eq!(cap.value, vec![0x10, 0]);
     }
 }

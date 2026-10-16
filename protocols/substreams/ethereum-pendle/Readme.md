@@ -60,6 +60,8 @@ paused SY reverts every transfer, so none of those markets can trade either.
 | Classes, `paused` | Once, at creation | `Upgraded`, `Paused`, `Unpaused` |
 | Market `sy_paused` | The SY's `paused()`, at market creation (from the SY profile) | The SY's `Paused`, `Unpaused` |
 | SY supply | `totalSupply()` once, at creation | The SY's own mints and burns |
+| SY supply cap | `getAbsoluteSupplyCap()` once, at creation, kept only when it caps the SY's own supply | `SupplyCapUpdated` |
+| Yield token | `yieldToken()` once, at creation | — |
 | SY balances | `balanceOf` once per token, at creation | `Transfer`s |
 | Exchange rate | Every refresh block | — |
 

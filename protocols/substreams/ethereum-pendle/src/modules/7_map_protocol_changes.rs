@@ -585,6 +585,7 @@ mod tests {
                 ),
                 (crate::sy::CREATION_PAUSED, vec![0u8]),
                 (crate::sy::CREATION_SY_PAUSED, vec![0u8]),
+                (crate::sy::CREATION_SUPPLY_CAP, vec![1u8]),
             ]);
         let names: Vec<String> = as_emitted(&component)
             .static_att
