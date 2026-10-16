@@ -90,9 +90,9 @@ tests:
         skip_simulation: true
         skip_execution: true
 
-      # SY-wstETH: three quotable entry tokens across both classes, and the one component whose
-      # balances forced the switch from transfer-derived to read balances — it holds stETH, which
-      # rebases without emitting Transfer. Its balance check is the regression test for that.
+      # SY-wstETH: three quotable entry tokens across both classes. It holds stETH, which rebases
+      # without emitting Transfer, so its balance check covers the per-block re-read of SYs behind
+      # a live market.
       - id: "0xcbc72d92b2dc8187414f6734718563898740c0bc"
         tokens:
           - "0xcbc72d92b2dc8187414f6734718563898740c0bc" # SY

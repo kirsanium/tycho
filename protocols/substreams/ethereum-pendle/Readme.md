@@ -60,8 +60,10 @@ token list is fixed at creation. `Paused` and `Unpaused` set the `paused` attrib
 
 All creation reads ride one batch. The rate is read for the SY of each live market and for SYs
 with an `index_rate` token; an SY whose tokens are all `one_to_one` and whose markets have expired
-is never read again. A rebasing token moves an SY's balance without a `Transfer`, so its reported
-balance drifts between transfers wherever it is not re-read; no quote reads a balance.
+is never read again. A rebasing token moves an SY's balance without a `Transfer`. A re-read replaces
+the reported balance but not the running total kept from creation, so a block that moves the
+balance without re-reading it reports that total, which has missed every rebase since creation. No
+quote reads a balance.
 
 ## The refresh, and its one parameter
 
@@ -101,7 +103,8 @@ same order.
 ```bash
 cargo test                      # unit tests, native target
 cargo build --target wasm32-unknown-unknown --release
-substreams-tycho-test           # range tests, see integration_test.tycho.yaml
+# range tests, see integration_test.tycho.yaml; from protocols/testing:
+cargo run -- range --package ethereum-pendle
 ```
 
 The range tests cover three windows: the original factory's first markets (2022), the reference
