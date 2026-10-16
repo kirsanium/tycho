@@ -798,13 +798,10 @@ impl ProtocolSim for PendleState {
                     // A capped SY mints only up to its cap. An uncapped one has no limit of its
                     // own; what the protocol it wraps accepts is not visible here.
                     Direction::Deposit => {
+                        let unbounded = unbounded_soft_limit();
                         match state.deposit_headroom() {
-                            // A real cap can sit far above the soft bound, so it is searched up to
-                            // the largest amount any token could have.
-                            Some(room) => {
-                                largest_input_within(room, unbounded_soft_limit(), convert)?
-                            }
-                            None => unbounded_soft_limit(),
+                            None => unbounded,
+                            Some(room) => largest_input_within(room, unbounded, convert)?,
                         }
                     }
                     Direction::Redeem => state.max_redeem_sy(token, class, token_decimals)?,
