@@ -59,6 +59,7 @@ fn wsteth_market(rate_sampled_at: u64) -> PendleState {
         sy_address: Bytes::from_str(SY).unwrap(),
         pt_address: Bytes::from_str(PT).unwrap(),
         yt_address: Bytes::from_str(YT).unwrap(),
+        sy_paused: false,
     })
 }
 
@@ -525,6 +526,52 @@ fn a_delta_re_classifies_and_moves_supply_and_pause() {
     assert!(state.paused);
 }
 
+/// A paused SY reverts every transfer, so a market priced against it refuses every edge, reports
+/// no depth and has no spot price, until an `Unpaused` delta clears the flag.
+#[test]
+fn a_market_refuses_every_edge_while_its_sy_is_paused() {
+    let edges = [(SY, PT), (PT, SY), (SY, YT), (YT, SY)];
+    let mut state = wsteth_market(1_700_000_000);
+    let set_sy_paused = |state: &mut PendleState, paused: u8| {
+        let delta = ProtocolStateDelta {
+            component_id: "0x34280882267ffa6383b363e278b027be083bbe3b".to_string(),
+            updated_attributes: HashMap::from([(
+                "sy_paused".to_string(),
+                Bytes::from(vec![paused]),
+            )]),
+            deleted_attributes: Default::default(),
+        };
+        state
+            .delta_transition(delta, &HashMap::new(), &Balances::default())
+            .unwrap();
+    };
+
+    set_sy_paused(&mut state, 1);
+    for (from, to) in edges {
+        let error = state
+            .get_amount_out(BigUint::from(10u64.pow(18)), &token(from, 18), &token(to, 18))
+            .unwrap_err();
+        assert!(matches!(error, SimulationError::RecoverableError(_)), "{from}->{to}: {error:?}");
+        let (max_in, max_out) = state
+            .get_limits(Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap())
+            .unwrap();
+        assert_eq!((max_in, max_out), (BigUint::ZERO, BigUint::ZERO), "{from}->{to}");
+        assert!(
+            state
+                .spot_price(&token(from, 18), &token(to, 18))
+                .is_err(),
+            "{from}->{to}"
+        );
+    }
+
+    set_sy_paused(&mut state, 0);
+    for (from, to) in edges {
+        state
+            .get_amount_out(BigUint::from(10u64.pow(18)), &token(from, 18), &token(to, 18))
+            .unwrap_or_else(|e| panic!("{from}->{to} after unpause: {e:?}"));
+    }
+}
+
 /// PT against YT is not a market edge: minting and redeeming PY is the yield token's business, and
 /// SY is one side of every market swap.
 #[test]
@@ -966,6 +1013,7 @@ fn wsteth_market_at_block_25_800_000() -> PendleState {
         sy_address: Bytes::from_str(SY).unwrap(),
         pt_address: Bytes::from_str(PT).unwrap(),
         yt_address: Bytes::from_str(YT).unwrap(),
+        sy_paused: false,
     })
 }
 

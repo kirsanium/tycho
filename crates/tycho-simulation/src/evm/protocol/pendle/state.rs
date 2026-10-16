@@ -123,6 +123,9 @@ pub struct PendleMarketState {
     pub sy_address: Bytes,
     pub pt_address: Bytes,
     pub yt_address: Bytes,
+    /// Whether the market's SY is paused. A paused SY reverts every transfer, and every market
+    /// edge moves SY, so this refuses every quote against the market.
+    pub sy_paused: bool,
 }
 
 /// The ERC-5115 wrapper, and the conversions it supports per token.
@@ -186,6 +189,18 @@ impl PendleMarketState {
                 block_time: self.latest_known_time(),
             }
             .into());
+        }
+        Ok(())
+    }
+
+    /// Refuses every edge while the SY is paused: the swap would revert moving SY. Recoverable,
+    /// since an `Unpaused` brings the market back.
+    fn guard_sy_unpaused(&self) -> Result<(), SimulationError> {
+        if self.sy_paused {
+            return Err(SimulationError::RecoverableError(format!(
+                "Pendle SY {} is paused, so its market cannot move SY",
+                self.sy_address
+            )));
         }
         Ok(())
     }
@@ -453,6 +468,7 @@ impl ProtocolSim for PendleState {
         let (out, gas, new_state) = match self {
             PendleState::Market(state) => {
                 state.guard_live()?;
+                state.guard_sy_unpaused()?;
                 state.guard_current()?;
                 let from = state
                     .role(&token_in.address)
@@ -525,6 +541,10 @@ impl ProtocolSim for PendleState {
             PendleState::Market(state) => {
                 if state.expired() {
                     // Dead, not merely empty. Zero depth in both directions.
+                    return Ok(no_depth());
+                }
+                // Every edge moves SY, which a paused SY refuses to transfer.
+                if state.sy_paused {
                     return Ok(no_depth());
                 }
                 // A bound this state cannot quote against is not a bound. Reported as no depth
@@ -917,6 +937,9 @@ impl PendleMarketState {
         if let Some(value) = attribute_u256(attributes, "rate_sampled_at")? {
             self.rate_sampled_at = value.saturating_to();
         }
+        if let Some(value) = attribute_u256(attributes, SY_PAUSED)? {
+            self.sy_paused = !value.is_zero();
+        }
         // The Substreams refresh emits this on every refresh block whether or not the rate
         // resolved, which is what lets a delta move the head at all — a `ProtocolStateDelta`
         // carries no header. It therefore advances only as often as `sy_rate_refresh_blocks`
@@ -998,6 +1021,8 @@ impl PendleSyState {
 pub(super) const SY_TOTAL_SUPPLY: &str = "sy_total_supply";
 /// State attribute: whether the SY is paused.
 pub(super) const PAUSED: &str = "paused";
+/// State attribute on a market: whether its SY is paused.
+pub(super) const SY_PAUSED: &str = "sy_paused";
 /// Prefixes of the per-token class attributes, followed by the token's hex address.
 pub(super) const TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
 pub(super) const TOKEN_OUT_CLASS_PREFIX: &str = "token_out_class_0x";

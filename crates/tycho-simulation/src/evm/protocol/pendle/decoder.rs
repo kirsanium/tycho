@@ -26,7 +26,7 @@ use super::{
     math::market::MarketState,
     state::{
         attribute_i256, attribute_u256, class_attribute_token, Direction, PendleMarketState,
-        PendleState, PendleSyState, TokenClass, ValueTooWide, PAUSED, SY_TOTAL_SUPPLY,
+        PendleState, PendleSyState, TokenClass, ValueTooWide, PAUSED, SY_PAUSED, SY_TOTAL_SUPPLY,
     },
 };
 use crate::protocol::{
@@ -125,6 +125,11 @@ fn decode_market(
     // the contract will actually use, so quoting off it is quietly wrong between interactions.
     let (py_index, rate_sampled_at) = rate_reading(state, ATTR_PY_INDEX_CURRENT)?;
 
+    // Emitted with the market at creation, from the SY's `paused()` as read then.
+    let sy_paused = !attribute_u256(state, SY_PAUSED)?
+        .ok_or_else(|| missing(SY_PAUSED))?
+        .is_zero();
+
     Ok(PendleMarketState {
         market: MarketState {
             total_pt,
@@ -156,6 +161,7 @@ fn decode_market(
                 .ok_or_else(|| missing(ATTR_YT_ADDRESS))?,
             ATTR_YT_ADDRESS,
         )?,
+        sy_paused,
     })
 }
 
@@ -364,6 +370,7 @@ mod tests {
             HashMap::from([
                 (ATTR_LN_FEE_RATE_ROOT.to_string(), word(499_875_041_000_000)),
                 (ATTR_RESERVE_FEE_PERCENT.to_string(), word(80)),
+                (SY_PAUSED.to_string(), Bytes::from(vec![0])),
             ]),
         )
     }
@@ -392,6 +399,21 @@ mod tests {
         );
         sy.component.tokens = vec![address_bytes(SY), address_bytes(WSTETH)];
         sy
+    }
+
+    /// A market cannot tell whether it can trade without its SY's pause flag, which it is
+    /// created with.
+    #[tokio::test]
+    async fn a_market_without_its_sy_pause_flag_is_rejected() {
+        let mut market = created_market();
+        market
+            .state
+            .attributes
+            .remove(SY_PAUSED);
+        assert!(matches!(
+            decode(market).await,
+            Err(InvalidSnapshotError::MissingAttribute(name)) if name == SY_PAUSED
+        ));
     }
 
     /// Supply bounds every redemption, so an SY without it cannot be decoded.
