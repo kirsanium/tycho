@@ -147,7 +147,7 @@ pub fn map_sy_state(
             &tx,
             EntityChanges {
                 component_id: sy_id,
-                attributes: reclassified(&tokens, &classification),
+                attributes: reclassified(&address, &tokens, &classification),
             },
         );
     }
@@ -229,7 +229,10 @@ fn new_market_components(
 /// Every class attribute of the listed tokens after a re-classification: an update for each token
 /// that classified, a deletion for each listed token and direction that answered its probe and no
 /// longer matches, and nothing for one that did not answer, which keeps its class.
-fn reclassified(listed: &[Vec<u8>], classification: &Classification) -> Vec<Attribute> {
+///
+/// The SY itself is on its own token list but is never one of its entry or exit tokens, so it
+/// gets no attribute at all.
+fn reclassified(sy: &[u8], listed: &[Vec<u8>], classification: &Classification) -> Vec<Attribute> {
     let Classification { tokens_in, tokens_out, undetermined_in, undetermined_out, .. } =
         classification;
     let keep = |classes: &[(Vec<u8>, crate::sy::TokenClass)]| {
@@ -242,7 +245,10 @@ fn reclassified(listed: &[Vec<u8>], classification: &Classification) -> Vec<Attr
     let classified = class_attributes(&keep(tokens_in), &keep(tokens_out));
 
     let mut attributes = Vec::new();
-    for token in listed {
+    for token in listed
+        .iter()
+        .filter(|token| token.as_slice() != sy)
+    {
         for (prefix, undetermined) in
             [(TOKEN_IN_CLASS_PREFIX, undetermined_in), (TOKEN_OUT_CLASS_PREFIX, undetermined_out)]
         {
@@ -303,11 +309,13 @@ mod tests {
     }
 
     /// A token that stops matching either closed form after an upgrade loses its class rather than
-    /// keeping the one it had, and a token that never had one is deleted harmlessly.
+    /// keeping the one it had, and a token that never had one is deleted harmlessly. The SY itself
+    /// is never classified, so it gets nothing.
     #[test]
     fn a_reclassification_deletes_what_no_longer_classifies() {
         let listed = vec![SY.to_vec(), WSTETH.to_vec(), STETH.to_vec()];
         let attributes = reclassified(
+            &SY,
             &listed,
             &classification(
                 &[(WSTETH.to_vec(), TokenClass::OneToOne)],
@@ -317,16 +325,13 @@ mod tests {
         );
         let wsteth = hex::encode(WSTETH);
         let steth = hex::encode(STETH);
-        let sy = hex::encode(SY);
         assert_eq!(
             by_name(&attributes),
             vec![
                 (format!("token_in_class_0x{wsteth}"), false),
                 (format!("token_in_class_0x{steth}"), true),
-                (format!("token_in_class_0x{sy}"), true),
                 (format!("token_out_class_0x{wsteth}"), false),
                 (format!("token_out_class_0x{steth}"), true),
-                (format!("token_out_class_0x{sy}"), true),
             ]
         );
     }
@@ -335,6 +340,7 @@ mod tests {
     #[test]
     fn a_reclassification_ignores_tokens_the_component_does_not_list() {
         let attributes = reclassified(
+            &SY,
             &[WSTETH.to_vec()],
             &classification(
                 &[(STETH.to_vec(), TokenClass::IndexRate), (WSTETH.to_vec(), TokenClass::OneToOne)],
@@ -354,6 +360,7 @@ mod tests {
     fn a_token_whose_probe_did_not_answer_keeps_its_class() {
         let listed = vec![SY.to_vec(), WSTETH.to_vec(), STETH.to_vec()];
         let attributes = reclassified(
+            &SY,
             &listed,
             &classification(
                 &[(WSTETH.to_vec(), TokenClass::OneToOne)],
@@ -362,15 +369,7 @@ mod tests {
             ),
         );
         let wsteth = hex::encode(WSTETH);
-        let sy = hex::encode(SY);
-        assert_eq!(
-            by_name(&attributes),
-            vec![
-                (format!("token_in_class_0x{wsteth}"), false),
-                (format!("token_in_class_0x{sy}"), true),
-                (format!("token_out_class_0x{sy}"), true),
-            ]
-        );
+        assert_eq!(by_name(&attributes), vec![(format!("token_in_class_0x{wsteth}"), false)]);
     }
 
     /// A pause reaches every market of its SY, an unpause clears it, and a market created this
