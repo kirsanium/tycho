@@ -5,7 +5,7 @@ use tycho_common::{models::Chain, Bytes};
 
 use crate::encoding::{
     errors::EncodingError,
-    evm::utils::bytes_to_address,
+    evm::{constants::ROUTER_ETH_ADDRESS, utils::bytes_to_address},
     models::{EncodingContext, Swap},
     swap_encoder::SwapEncoder,
 };
@@ -117,10 +117,11 @@ impl SwapEncoder for PendleSwapEncoder {
         let token_in = &swap.token_in().address;
         let token_out = &swap.token_out().address;
         // Some SYs mint from native ETH, which the indexer drops because it has no `decimals()`
-        // and so never classifies. Nothing downstream would catch a native leg that arrived
-        // anyway: the executor would hand `address(0)` to `SY.deposit` and revert.
+        // and so never classifies. The executor refuses a native leg by either name it can
+        // carry, the chain's native address and the router's `0xEeee…` sentinel, so it is refused
+        // here too rather than encoded into a revert.
         for token in [token_in, token_out] {
-            if token == &self.native_token_address || token == &Bytes::zero(20) {
+            if token == &self.native_token_address || token == &*ROUTER_ETH_ADDRESS {
                 return Err(EncodingError::InvalidInput(
                     "Pendle native ETH legs are not supported; wrap first".to_string(),
                 ));
@@ -306,11 +307,12 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, EncodingError::FatalError(_)));
     }
-    #[test]
-    fn test_encode_rejects_native_eth() {
-        // SY-wstETH lists native ETH among its `tokensIn`; the integration quotes the wrapped
-        // legs only, so a native leg must be refused rather than encoded into a revert.
-        let native = Chain::Ethereum.native_token().address;
+    // SY-wstETH lists native ETH among its `tokensIn`; the integration quotes the wrapped legs
+    // only, so a native leg must be refused rather than encoded into a revert, by either name.
+    #[rstest::rstest]
+    #[case::chain_native_address(Chain::Ethereum.native_token().address)]
+    #[case::router_sentinel(ROUTER_ETH_ADDRESS.clone())]
+    fn test_encode_rejects_native_eth(#[case] native: Bytes) {
         let swap = Swap::new(
             sy_component(),
             default_token(native.clone()),
