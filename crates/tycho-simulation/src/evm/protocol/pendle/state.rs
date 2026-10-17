@@ -49,6 +49,14 @@ use super::{
 };
 use crate::evm::protocol::u256_num::{biguint_to_u256, u256_to_biguint, u256_to_f64};
 
+/// How far the PY index may move between the sampled and the execution block while a market
+/// limit still holds: 1e-6, as a fraction of [`ONE_E18`]. A yield token accruing 3% a year moves
+/// the index about 1e-9 a block, so this covers hundreds of blocks of ordinary accrual, or one
+/// block at any plausible rate; it costs the SY-in limits under 1e-5 of their size. A discrete
+/// jump past it, such as a rebase report landing between the two blocks, is not covered.
+const INDEX_DRIFT: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]);
+const ONE_E18: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
+
 /// Gas for a swap routed through Router V4.
 ///
 /// Measured per edge on a mainnet fork at block 25 800 000 against the wstETH market, each edge in
@@ -595,12 +603,15 @@ impl ProtocolSim for PendleState {
                 // A quote is computed at the sampled block but the swap executes at the execution
                 // block (`apply_block`), where the bounds have moved: the SY-in bounds shrink by
                 // about 1.5e-9 a block, so a limit exact at the sampled block reverts a block
-                // later. An input counts as filling only if it fills at both, and each closed form
-                // starts from the smaller of the two.
+                // later. An input counts as filling only if it fills at the sampled block and at
+                // the execution block with the index anywhere within `INDEX_DRIFT`, and each
+                // closed form starts from the smallest of them.
                 let at_execution = state.at_execution();
-                let states = [Some(state), at_execution.as_ref()];
+                let states: Vec<&PendleMarketState> = std::iter::once(state)
+                    .chain(&at_execution)
+                    .collect();
                 let fills = |amount: U256| {
-                    states.iter().flatten().all(|state| {
+                    states.iter().all(|state| {
                         state
                             .amount_out(amount, from, to)
                             .is_ok()
@@ -609,7 +620,6 @@ impl ProtocolSim for PendleState {
                 let smallest = |bound: &dyn Fn(&PendleMarketState) -> Result<U256, PendleError>| {
                     states
                         .iter()
-                        .flatten()
                         .map(|state| bound(state))
                         .try_fold(U256::MAX, |smallest, bound| bound.map(|b| smallest.min(b)))
                 };
@@ -653,15 +663,19 @@ impl ProtocolSim for PendleState {
                             smallest(&|state| state.max_pt_out())?,
                             fills,
                         );
-                        most_output_within(fillable, |amount| {
-                            if !fills(amount) {
-                                return None;
-                            }
+                        // Everything up to `fillable` fills at every state, so the search follows
+                        // the sampled state's output alone, and only its answer is checked again.
+                        let peak = most_output_within(fillable, |amount| {
                             state
                                 .amount_out(amount, from, to)
                                 .ok()
                                 .map(|swap| swap.amount_out)
-                        })
+                        });
+                        if fills(peak) {
+                            peak
+                        } else {
+                            fillable
+                        }
                     }
                     // PT against YT, or either against itself: not an edge of this market.
                     _ => return Ok(no_depth()),
@@ -860,12 +874,32 @@ impl PendleMarketState {
         approx::calc_max_pt_out(&comp, self.market.total_pt)
     }
 
-    /// The same market evaluated at the execution block's time, when `apply_block` has recorded one
-    /// later than the sampled block; `None` otherwise. Only the clock moves: the curve and the rate
-    /// stay as sampled.
-    fn at_execution(&self) -> Option<Self> {
-        (self.execution_timestamp > self.rate_sampled_at)
-            .then(|| Self { rate_sampled_at: self.execution_timestamp, ..self.clone() })
+    /// The market as it may stand at the execution block, when `apply_block` has recorded one later
+    /// than the sampled block; empty otherwise.
+    ///
+    /// The clock moves to that block, and the PY index may have moved too: it accrues with the
+    /// yield token, and nothing here projects it. So the market is taken at the execution block's
+    /// time with the index as sampled and [`INDEX_DRIFT`] above and below it. The SY-in bounds
+    /// fall as the index rises and PT→SY's as it falls, so the two ends of the range are where a
+    /// limit is tightest; the tests check points in between too.
+    fn at_execution(&self) -> Vec<Self> {
+        if self.execution_timestamp <= self.rate_sampled_at {
+            return Vec::new();
+        }
+        let later = Self { rate_sampled_at: self.execution_timestamp, ..self.clone() };
+        // Rounded up, so it is never zero: an index below 1e12 wei would otherwise get no drift at
+        // all, though it moves in whole wei.
+        let drift = self
+            .py_index
+            .saturating_mul(INDEX_DRIFT)
+            .div_ceil(ONE_E18);
+        let mut states =
+            vec![Self { py_index: later.py_index.saturating_add(drift), ..later.clone() }];
+        if let Some(lower) = later.py_index.checked_sub(drift) {
+            states.push(Self { py_index: lower, ..later.clone() });
+        }
+        states.push(later);
+        states
     }
 
     /// The most PT the market itself will send out before its exchange rate falls below par.

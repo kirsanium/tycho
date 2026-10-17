@@ -986,27 +986,51 @@ fn a_malformed_balance_leaves_the_holding_unknown() {
     assert!(!inner.holding_backs_supply);
 }
 
-/// A swap executes a block after it is quoted, where the bounds have moved. With the execution
-/// block recorded, every market limit still fills when the market is evaluated at that block.
+/// A swap executes a block after it is quoted, where the bounds have moved: the clock, and the PY
+/// index, which accrues with the yield token (a block of a 3%/yr token is about 1e-9) and can step
+/// down to its stored floor. With the execution block recorded, every market limit still fills at
+/// that block with the index anywhere within `INDEX_DRIFT` (1e-6) of the sampled one, on three
+/// market shapes, from four years to a minute before expiry.
 #[test]
 fn market_limits_still_fill_at_the_execution_block() {
+    let PendleState::Market(reference) = wsteth_market(0) else { unreachable!() };
+    let PendleState::Market(fork) = wsteth_market_at_block_25_800_000() else { unreachable!() };
+    let mut shallow = reference.clone();
+    shallow.market.total_pt /= I256::try_from(1_000_000).unwrap();
+    shallow.market.total_sy /= I256::try_from(1_000_000).unwrap();
     let expiry = 1_830_124_800u64;
-    for sampled in [1_700_000_000u64, 1_787_273_051, expiry - 86_400] {
-        let mut state = wsteth_market(sampled);
-        state.apply_block(&BlockContext::new(1, sampled + 12));
-        let PendleState::Market(mut later) = wsteth_market(sampled) else { unreachable!() };
-        later.rate_sampled_at = sampled + 12;
-        later.head_timestamp = sampled + 12;
-        let later = PendleState::Market(later);
-        for (from, to) in [(SY, PT), (PT, SY), (SY, YT), (YT, SY)] {
-            let (max_in, _) = state
-                .get_limits(Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap())
-                .unwrap();
-            later
-                .get_amount_out(max_in.clone(), &token(from, 18), &token(to, 18))
-                .unwrap_or_else(|e| {
-                    panic!("{from}->{to} at {sampled}: {max_in} fails later: {e:?}")
-                });
+    for (name, market) in [("reference", reference), ("fork", fork), ("shallow", shallow)] {
+        for sampled in
+            [1_700_000_000u64, 1_787_273_051, expiry - 86_400, expiry - 3_600, expiry - 60]
+        {
+            let at = |timestamp: u64, py_index: U256| {
+                PendleState::Market(PendleMarketState {
+                    rate_sampled_at: timestamp,
+                    head_timestamp: timestamp,
+                    py_index,
+                    ..market.clone()
+                })
+            };
+            let mut state = at(sampled, market.py_index);
+            state.apply_block(&BlockContext::new(1, sampled + 12));
+            for (from, to) in [(SY, PT), (PT, SY), (SY, YT), (YT, SY)] {
+                let (max_in, _) = state
+                    .get_limits(Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap())
+                    .unwrap();
+                for drift_ppb in [-1000i64, -999, -500, -1, 0, 1, 500, 999, 1000] {
+                    let moved = I256::try_from(market.py_index).unwrap() *
+                        I256::try_from(1_000_000_000 + drift_ppb).unwrap() /
+                        I256::try_from(1_000_000_000i64).unwrap();
+                    at(sampled + 12, moved.into_raw())
+                        .get_amount_out(max_in.clone(), &token(from, 18), &token(to, 18))
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "{name} {from}->{to} at {sampled}, index {drift_ppb:+} ppb: \
+                                 {max_in} fails later: {e:?}"
+                            )
+                        });
+                }
+            }
         }
     }
 }
