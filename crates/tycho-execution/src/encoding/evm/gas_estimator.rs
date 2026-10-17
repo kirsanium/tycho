@@ -39,9 +39,11 @@ pub const PROTOCOLS_CALLBACK: &[&str] = &[
     "vm:balancer_v3",
 ];
 
-/// Exact-name protocols where the router-to-pool input transfer is skipped (funds are sent
-/// directly without an intermediate router hop). The input transfer cost is therefore not
-/// double-counted — it is only charged once, on the first hop or when the optimized path applies.
+/// Exact-name protocols whose input transfer the estimator does not charge separately: the funds
+/// reach the pool without a router-to-pool transfer of their own, or the pool pulls them inside
+/// the swap that `get_amount_out` already costs. Under the split strategy the input still passes
+/// through the router first, so the estimator adds that transfer back. The list affects only the
+/// gas estimate, not how a swap is encoded.
 ///
 /// This list is incomplete on its own: whole protocol families can qualify too. Use
 /// [`optimizable_transfer_in`] for the full classification.

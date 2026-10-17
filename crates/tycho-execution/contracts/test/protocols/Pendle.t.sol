@@ -581,6 +581,19 @@ contract TychoRouterPendleTest is TychoRouterTestSetup {
 
         assertTrue(success, "Call Failed");
         received = IERC20(tokenOut).balanceOf(ALICE) - balanceBefore;
+
+        // The Dispatcher approves each leg's exact amount and revokes what is left, so the
+        // router keeps no allowance to Router V4 or to the SY after any edge.
+        assertEq(
+            IERC20(tokenIn).allowance(tychoRouterAddr, PENDLE_ROUTER_V4),
+            0,
+            "allowance left to Router V4"
+        );
+        assertEq(
+            IERC20(tokenIn).allowance(tychoRouterAddr, tokenOut),
+            0,
+            "allowance left to the SY"
+        );
     }
 
     function testRouterSyForPt() public {
@@ -633,7 +646,10 @@ contract TychoRouterPendleTest is TychoRouterTestSetup {
         assertEq(received, 1000000000000000000);
     }
 
+    /// A redemption burns the router's own shares, so the SY is never approved: no `Approval`
+    /// with the router as owner appears in the swap's logs.
     function testRouterSyForToken() public {
+        vm.recordLogs();
         uint256 received = _runEdge(
             "test_single_encoding_strategy_pendle_sy_for_token",
             PENDLE_WSTETH_SY,
@@ -641,5 +657,15 @@ contract TychoRouterPendleTest is TychoRouterTestSetup {
             1e18
         );
         assertEq(received, 1000000000000000000);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 approval = keccak256("Approval(address,address,uint256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            bool routerApproves = logs[i].emitter == PENDLE_WSTETH_SY
+                && logs[i].topics.length == 3 && logs[i].topics[0] == approval
+                && address(uint160(uint256(logs[i].topics[1])))
+                    == tychoRouterAddr;
+            assertFalse(routerApproves, "the router approved the SY");
+        }
     }
 }
