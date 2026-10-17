@@ -58,6 +58,15 @@ impl PriceLevelStreamProcessor {
         info!("Starting price level stream processor for chain {:?}", self.chain);
         // The default venues are served under their names, auto-detection additionally serves
         // any newly streamed pAMM under its address.
+        //
+        // Venues go through `TychoFallbackRouter`, as they do for consumers. The venue itself
+        // fills whenever execution overrides its registry slot (see `oracle_overrides`). Without
+        // those overrides the venue reverts and the router fills on the fallback pool instead,
+        // which reads as a quote mismatch rather than a stale quote — so every swap that lacks
+        // them is counted, by `tycho_integration_price_level_oracle_override_misses_total` when
+        // Titan published nothing for the venue at that block, and by
+        // `tycho_integration_price_level_oracle_override_unserved_total` for Metric, TaurusFi and
+        // auto-detected venues, which Titan's override stream does not serve at all.
         let stream = PriceLevelStreamBuilder::new()
             .with_known_pamms()
             .auto_detect(true)

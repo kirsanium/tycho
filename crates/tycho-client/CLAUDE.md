@@ -7,9 +7,13 @@ Consumer library implementing the snapshot + deltas pattern for real-time protoc
 ```
 rpc.rs              HTTP snapshot client — fetches protocol state at a block height
 deltas.rs           WebSocket client — streams real-time state deltas
-stream.rs           Builder entry point — wires RPC + WS clients into a TychoStream
+stream.rs           Builder entry point — wires RPC + WS clients into a TychoStream.
+                    build() eagerly loads and validates the chain registry before any network I/O
+client_metadata.rs  X-Tycho-Client-Metadata header (CLIENT_METADATA_HEADER, size caps);
+                    TychoStreamBuilder::add_client_metadata. Server half: indexer services/client_metadata.rs
 feed/
   mod.rs            BlockSynchronizer — aligns N synchronizers by block, emits FeedMessage
+  dto.rs            Consumer-facing feed types: ComponentWithState, Snapshot, StateSyncMessage, FeedMessage
   synchronizer.rs   ProtocolStateSynchronizer — manages snapshot + delta sync for one extractor
   component_tracker.rs  Filters components by TVL threshold or explicit ID list
   block_history.rs  Validates block chain continuity; classifies incoming blocks
@@ -30,7 +34,12 @@ TychoStreamBuilder (stream.rs)
 
 ## Sync Lifecycle
 
-1. `WsDeltasClient` subscribes; first message determines snapshot block
+1. `WsDeltasClient` subscribes; first message determines snapshot block.
+   On a restart after a synced block that requests a snapshot (snapshots on and at least one
+   tracked component), the synchronizer discards deltas for a random delay in
+   `[0, snapshot_jitter]` (default `DEFAULT_SNAPSHOT_JITTER`, 60 s; at least
+   `MIN_SNAPSHOT_JITTER`, 5 s) to spread snapshot requests across clients; the first block after
+   the delay sets the snapshot.
 2. `HttpRPCClient` fetches initial snapshot at that block synchronously; all subsequent new
    components are fetched via background tasks (`spawn_snapshot_task`) so the delta loop never
    blocks on RPC. Each component moves through `SnapshotStatus` (`Deferred` → `InFlight`

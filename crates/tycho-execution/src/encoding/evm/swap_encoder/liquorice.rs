@@ -9,7 +9,10 @@ use tycho_common::{
 
 use crate::encoding::{
     errors::EncodingError,
-    evm::utils::{bytes_to_address, create_encoding_runtime, on_blocking_thread, SafeRuntime},
+    evm::utils::{
+        bytes_to_address, check_signed_quote, create_encoding_runtime, on_blocking_thread,
+        SafeRuntime,
+    },
     models::{EncodingContext, Swap},
     swap_encoder::SwapEncoder,
 };
@@ -75,6 +78,7 @@ impl SwapEncoder for LiquoriceSwapEncoder {
             token_out: swap.token_out().address.clone(),
             sender: router_address.clone(),
             receiver: router_address.clone(),
+            origin: None,
         };
 
         let signed_quote = on_blocking_thread(|| {
@@ -89,6 +93,7 @@ impl SwapEncoder for LiquoriceSwapEncoder {
                     .map_err(|e| EncodingError::FatalError(e.to_string()))
             })
         })??;
+        check_signed_quote(swap, protocol_state.as_ref(), &signed_quote)?;
 
         let liquorice_calldata = signed_quote
             .quote_attributes
@@ -150,6 +155,10 @@ impl SwapEncoder for LiquoriceSwapEncoder {
         &self.executor_address
     }
 
+    fn blocks_on_quote(&self) -> bool {
+        true
+    }
+
     fn clone_box(&self) -> Box<dyn SwapEncoder> {
         Box::new(self.clone())
     }
@@ -209,6 +218,7 @@ mod tests {
             .to_vec();
 
         let liquorice_state = MockRFQState {
+            quote_amount_in: None,
             quote_amount_out,
             quote_data: HashMap::from([
                 ("calldata".to_string(), liquorice_calldata.clone()),
@@ -216,6 +226,7 @@ mod tests {
                 ("min_base_token_amount".to_string(), Bytes::from(min_base_token_amount)),
                 ("partial_fill_offset".to_string(), Bytes::from(vec![12u8])),
             ]),
+            ..Default::default()
         };
 
         let token_in = Bytes::from("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
@@ -234,6 +245,7 @@ mod tests {
             router_address: Some(Bytes::zero(20)),
             group_token_in: token_in.clone(),
             group_token_out: token_out.clone(),
+            origin: None,
         };
 
         let encoder = LiquoriceSwapEncoder::new(

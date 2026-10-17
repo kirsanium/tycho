@@ -158,8 +158,12 @@ V2 used a `NativeAction` enum on the `Solution` with `Wrap` and `Unwrap` variant
 flags.
 
 **V3 removes this entirely.** Instead, a WETH executor handles wrapping and unwrapping as regular swap steps. Include a
-swap on the `native_wrapper` protocol wherever the route crosses between ETH and WETH — the Tycho stream injects a
-`native_wrapper` component you can route through like any other pool.
+swap on the `native_wrapper` protocol wherever the route crosses between ETH and WETH — the Tycho stream injects that
+component only on chains with a wrapper contract, and you route through it like any other pool.
+
+Arc has no wrapper: native USDC and ERC-20 USDC at
+<code>0x3600000000000000000000000000000000000000</code> share one balance. Route through that ERC-20
+address directly; do not add a <code>native_wrapper</code> step. See <a href="https://docs.arc.network/arc/concepts/stablecoin-native-model" target="_blank" rel="noopener noreferrer">Arc's stablecoin-native model</a>.
 
 ```rust
 // V2
@@ -378,20 +382,6 @@ singleSwap(amountIn, tokenIn, tokenOut, expectedAmountOut, minAmountOut, receive
 `sequentialSwap`, `splitSwap`, and their `Permit2` and `UsingVault` variants take it in the same
 position. `splitSwap` keeps `nTokens` between `minAmountOut` and `receiver`.
 
-#### Slippage Bounds
-
-V3.0 accepted any non-zero `minAmountOut`, including `1`. V3.1 requires it to sit inside a window
-anchored on `expectedAmountOut`:
-
-```
-expectedAmountOut * (10_000 - MAX_SLIPPAGE_TOLERANCE_BPS) / 10_000  <=  minAmountOut  <=  expectedAmountOut
-```
-
-`MAX_SLIPPAGE_TOLERANCE_BPS` is `2_000`, which puts the floor 20% below the quote. Two things follow
-from this. Calldata that used to pass `minAmountOut = 1` now reverts, so compute a real floor from your
-slippage tolerance. And because `expectedAmountOut` sets both ends of the window, inflating it raises
-your floor rather than relaxing it — pass the amount your simulation actually returned.
-
 #### Client Fee Signature
 
 The `ClientFee` typehash gains `expectedAmountOut` and widens `clientFeeBps`, so every V3.0 signature
@@ -457,7 +447,7 @@ struct FeeInput {
 
 | Error                                                                | Cause                                                     |
 |----------------------------------------------------------------------|-----------------------------------------------------------|
-| `TychoRouter__InvalidMinAmountOut(minAmountOut, expectedAmountOut)`   | `minAmountOut` outside the slippage window, or zero       |
+| `TychoRouter__InvalidMinAmountOut(minAmountOut, expectedAmountOut)`   | `minAmountOut` zero, or above `expectedAmountOut` — see [Slippage bounds](encoding/#slippage-bounds) |
 | `TychoRouter__AmountOutZero()`                                       | `expectedAmountOut` is zero                               |
 | `TychoRouter__FeesExceedOutput(totalFees, actualAmountOut)`          | Calculated fees exceed the swap output                    |
 
