@@ -403,7 +403,8 @@ impl Executor {
                         // `redeem` burns the router's own shares, so nothing is approved.
                         PENDLE_SY_FOR_TOKEN => Address::Router,
                         // A deposit approves the SY the calldata chose.
-                        _ => target,
+                        PENDLE_TOKEN_FOR_SY => target,
+                        other => unreachable!("{other} is not a Pendle edge class"),
                     },
                     token_in,
                     token_out,

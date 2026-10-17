@@ -136,8 +136,17 @@ impl SwapEncoder for PendleSwapEncoder {
             ))
         })?;
 
-        // An SY component is itself one of the two traded tokens; a market never is.
-        let edge = if token_in == &target || token_out == &target {
+        // A market carries its SY, PT and YT as static attributes; an SY carries none of them and
+        // is itself one of the two tokens it trades. The attributes decide first: a market is also
+        // an ERC-20, its own LP token, so a pair naming the market would otherwise read as an SY
+        // edge and revert on chain. A component with neither is taken as a market, whose edge
+        // names the attribute it is missing.
+        let attributes = &swap.component().static_attributes;
+        let has_market_layout = ["sy_address", "pt_address", "yt_address"]
+            .iter()
+            .any(|name| attributes.contains_key(*name));
+        let names_itself = token_in == &target || token_out == &target;
+        let edge = if !has_market_layout && names_itself {
             Self::sy_edge(&target, token_in, token_out)?
         } else {
             Self::market_edge(swap, token_in, token_out)?
@@ -307,6 +316,31 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, EncodingError::FatalError(_)));
     }
+    /// A market is also its own LP token. A pair naming it on a market component is not an SY
+    /// edge, which would encode and then revert on chain; it is refused as no edge of the market.
+    #[test]
+    fn test_encode_rejects_the_market_lp_token_on_a_market() {
+        let swap = Swap::new(
+            market_component(),
+            default_token(Bytes::from_str(MARKET).unwrap()),
+            default_token(Bytes::from_str(SY).unwrap()),
+            BigUint::ZERO,
+        );
+        let encoder = PendleSwapEncoder::new(Bytes::zero(20), Chain::Ethereum, None).unwrap();
+        let error = encoder
+            .encode_swap(
+                &swap,
+                &EncodingContext {
+                    router_address: Some(Bytes::zero(20)),
+                    group_token_in: Bytes::from_str(MARKET).unwrap(),
+                    group_token_out: Bytes::from_str(SY).unwrap(),
+                    origin: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, EncodingError::InvalidInput(_)), "{error:?}");
+    }
+
     // SY-wstETH lists native ETH among its `tokensIn`; the integration quotes the wrapped legs
     // only, so a native leg must be refused rather than encoded into a revert, by either name.
     #[rstest::rstest]
