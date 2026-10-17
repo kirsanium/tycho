@@ -1223,6 +1223,80 @@ fn an_sy_in_limit_of_dust_has_no_depth_at_execution() {
     );
 }
 
+/// Where the implied rate sits on the fee floor, SY→PT's whole depth is a small difference of the
+/// reserves, which a wei of rounding in the rate anchor moves by a large share. Here, 2.3 days and
+/// 10 hours before expiry, the bound swings by up to a thousandth as the index rises 4e-11 and
+/// 1e-9, ten to a hundred times `BOUND_MARGIN`. The limit keeps clear of `ANCHOR_NOISE`.
+#[rstest::rstest]
+#[case::days_before_expiry(
+    [
+        "106025040478981328994304",
+        "15630542653613299084640",
+        "187391880338219",
+        "187391879947682",
+        "8018284678340328448",
+        "2",
+        "1480437058153351168",
+    ],
+    1_829_925_939
+)]
+#[case::hours_before_expiry(
+    [
+        "919625788013335543808",
+        "1407863053710254718867",
+        "141366356533720",
+        "141366356077238",
+        "5686617717805697024",
+        "94",
+        "1348676432448877568",
+    ],
+    1_830_088_382
+)]
+fn an_sy_in_limit_at_the_fee_floor_holds_at_execution(
+    #[case] shape: [&str; 7],
+    #[case] sampled: u64,
+) {
+    let [pt, sy, rate, fee, scalar, reserve_fee, index] = shape;
+    let market = shaped_market(pt, sy, rate, fee, scalar, reserve_fee, index);
+    let drift = market.py_index / U256::from(1_000_000u64);
+    assert_limit_holds_at_rises(
+        &market,
+        sampled,
+        12,
+        (SY, PT),
+        (0..=1_000u64).map(|k| drift * U256::from(k) / U256::from(1_000u64)),
+    );
+}
+
+/// A bound the execution block cannot evaluate means the edge does not fill there, not that the
+/// quote is broken: here the reference market, bought to its SY→PT limit five times, has its rate
+/// so close to the fee floor that 12 s later its closed form would put the exchange rate below
+/// par. The sampled block still quotes it.
+#[test]
+fn a_bound_the_execution_block_cannot_evaluate_is_no_depth() {
+    let market = shaped_market(
+        "15678057691949226403",
+        "1484444859453893147647",
+        "499875041000046",
+        "499875041000000",
+        "86364560000000000000",
+        "80",
+        "1241884000000000000",
+    );
+    let at = PendleState::Market(PendleMarketState {
+        rate_sampled_at: 1_812_844_788,
+        head_timestamp: 1_812_844_788,
+        ..market
+    });
+    let (sy, pt) = (Bytes::from_str(SY).unwrap(), Bytes::from_str(PT).unwrap());
+    assert!(at
+        .get_limits(sy.clone(), pt.clone())
+        .is_ok());
+    let mut later = at;
+    later.apply_block(&BlockContext::new(1, 1_812_844_800));
+    assert_eq!(later.get_limits(sy, pt).unwrap(), (BigUint::ZERO, BigUint::ZERO));
+}
+
 /// `get_amount_out` refuses any amount above `u128::MAX`, so a limit past it would not be
 /// quotable. With 7.6e12 SY of reserves at 1e8 asset per SY, PT→SY's bound is past it.
 #[test]

@@ -51,17 +51,27 @@ use crate::evm::protocol::u256_num::{biguint_to_u256, u256_to_biguint, u256_to_f
 
 /// How far the PY index may move between the sampled and the execution block while a market
 /// limit still holds: 1e-6, as a fraction of [`ONE_E18`]. A yield token accruing 3% a year moves
-/// the index about 1e-9 a block, so this covers hundreds of blocks of ordinary accrual, or one
-/// block at any plausible rate. A discrete jump past it, such as a rebase report landing between
-/// the two blocks, is not covered.
+/// the index about 1.1e-8 a block, so this covers some 90 blocks of ordinary accrual, or one block
+/// at any plausible rate. A discrete jump past it, such as a rebase report landing between the two
+/// blocks, is not covered.
 const INDEX_DRIFT: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]);
 const ONE_E18: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 
 /// How far inside a market edge's bound its limit sits once it must hold at the execution block,
 /// as a fraction of [`ONE_E18`]: 1e-5. Next to the bound, whether a trade fills flips with the
 /// index, so a limit there can fail at an index within [`INDEX_DRIFT`] that the checked states do
-/// not cover. See [`sy_in_limit`].
+/// not cover. A bound at the exchange-rate floor also keeps clear of [`ANCHOR_NOISE`]. See
+/// [`sy_in_limit`].
 const BOUND_MARGIN: U256 = U256::from_limbs([10_000_000_000_000, 0, 0, 0]);
+
+/// The rounding in a market's rate anchor that a bound at the exchange-rate floor must absorb
+/// once it must hold at the execution block: 100 wei of [`ONE_E18`]. The anchor is recomputed from
+/// the index through `ln` and `exp`, each rounding by a wei or so, and the floor's PT bound,
+/// `total_pt − p·(total_pt + total_asset)` with `p` the sigmoid of `(fee − anchor)·rate_scalar`,
+/// moves by about `total_pt·total_asset / (total_pt + total_asset) · rate_scalar` per unit of
+/// anchor. Near the fee floor, where the bound is a small difference of large reserves, that is
+/// most of it. See [`PendleMarketState::clear_of_anchor_noise`].
+const ANCHOR_NOISE: U256 = U256::from_limbs([100, 0, 0, 0]);
 
 /// Gas for a swap routed through Router V4.
 ///
@@ -569,8 +579,8 @@ impl ProtocolSim for PendleState {
     /// the proportion cap, and PT→SY by the 96% proportion cap itself; each is the largest input
     /// that fills. YT→SY is the trader's output peak, short of where the sale stops filling. With
     /// an execution block recorded, an input must also fill at that block, with the index as
-    /// sampled and [`INDEX_DRIFT`] above it, and an edge whose limit is dust there reports no
-    /// depth.
+    /// sampled and [`INDEX_DRIFT`] above it, and an edge whose limit is dust there, or whose bound
+    /// the execution block cannot evaluate, reports no depth.
     ///
     /// A pair this component does not trade — PT against YT, or a token that is not one of its
     /// three — reports **zero depth rather than an error**. A caller enumerating the pairs of a
@@ -625,25 +635,34 @@ impl ProtocolSim for PendleState {
                             .is_ok()
                     })
                 };
+                // A bound the execution block cannot evaluate, such as a rate floor the clock has
+                // carried the market past, means the edge does not fill there: no depth. Only the
+                // sampled state's own failure is an error.
                 let smallest = |bound: &dyn Fn(&PendleMarketState) -> Result<U256, PendleError>| {
-                    states
-                        .iter()
-                        .map(|state| bound(state))
-                        .try_fold(U256::MAX, |smallest, bound| bound.map(|b| smallest.min(b)))
+                    let mut smallest = bound(state)?;
+                    for later in &at_execution {
+                        smallest = smallest.min(bound(later).unwrap_or(U256::ZERO));
+                    }
+                    Ok::<_, PendleError>(smallest)
                 };
+                let for_execution = !at_execution.is_empty();
                 let max_in = match (from, to) {
                     // The router's search stops at the haircut rate floor, and accepts a request
                     // up to `eps` above what that bound costs.
                     (MarketToken::Sy, MarketToken::Pt) => {
                         let exact = smallest(&|state| {
-                            approx::max_sy_in_for_pt(
+                            let (sy_in, pt_out) = approx::max_sy_in_for_pt(
                                 &state.market,
                                 state.py_index,
                                 state.quote_time(),
-                            )
-                            .map(|(sy_in, _)| sy_in)
+                            )?;
+                            if for_execution {
+                                state.clear_of_anchor_noise(sy_in, pt_out)
+                            } else {
+                                Ok(sy_in)
+                            }
                         })?;
-                        sy_in_limit(exact, !at_execution.is_empty(), fills)?
+                        sy_in_limit(exact, for_execution, fills)?
                     }
                     // The same search, bounded by the proportion cap the minted PT is sold into.
                     (MarketToken::Sy, MarketToken::Yt) => {
@@ -655,7 +674,7 @@ impl ProtocolSim for PendleState {
                             )
                             .map(|(sy_in, _)| sy_in)
                         })?;
-                        sy_in_limit(exact, !at_execution.is_empty(), fills)?
+                        sy_in_limit(exact, for_execution, fills)?
                     }
                     // Selling PT hands PT *to* the market, so the 96% proportion cap binds, and the
                     // market checks it directly: the closed form is the boundary.
@@ -674,14 +693,21 @@ impl ProtocolSim for PendleState {
                     // sale executes but returns less.
                     (MarketToken::Yt, MarketToken::Sy) => {
                         let fillable = largest_fill(
-                            smallest(&|state| state.max_pt_out_unhaircut())?,
+                            smallest(&|state| {
+                                let bound = state.max_pt_out_unhaircut()?;
+                                if for_execution {
+                                    state.clear_of_anchor_noise(bound, bound)
+                                } else {
+                                    Ok(bound)
+                                }
+                            })?,
                             smallest(&|state| state.max_pt_out())?,
                             fills,
                         );
                         // Where the output still rises at the bound, the peak lands on it, so it
                         // keeps the same margin as the SY-in limits.
                         let fillable =
-                            if at_execution.is_empty() { fillable } else { inside_bound(fillable) };
+                            if for_execution { inside_bound(fillable) } else { fillable };
                         let output = |amount: U256| {
                             state
                                 .amount_out(amount, from, to)
@@ -956,6 +982,29 @@ impl PendleMarketState {
         let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
         approx::calc_max_pt_out_unhaircut(&comp, self.market.total_pt)
     }
+
+    /// `amount`, a bound whose trade takes `pt` PT to the exchange-rate floor, less the share of
+    /// it that [`ANCHOR_NOISE`] can move: zero when the noise is all of `pt`.
+    fn clear_of_anchor_noise(&self, amount: U256, pt: U256) -> Result<U256, PendleError> {
+        let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
+        let total_pt = pmath::to_u256(self.market.total_pt)?;
+        let total_asset = pmath::to_u256(comp.total_asset)?;
+        let reserves = total_pt.saturating_add(total_asset);
+        if reserves.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        let noise = (total_pt.saturating_mul(total_asset) / reserves)
+            .saturating_mul(pmath::to_u256(comp.rate_scalar)?)
+            .saturating_mul(ANCHOR_NOISE)
+            .div_ceil(ONE_E18 * ONE_E18);
+        if noise >= pt {
+            return Ok(U256::ZERO);
+        }
+        Ok(amount -
+            amount
+                .saturating_mul(noise)
+                .div_ceil(pt))
+    }
 }
 
 impl PendleSyState {
@@ -1153,12 +1202,15 @@ fn sy_in_limit(
 /// few wei, the search lands or runs out of iterations depending on the index: probes found such
 /// failures up to a window of 4 wei. Two million wei gives a window of 100. Only an SY-in edge
 /// whose whole depth is dust has less, as near the proportion cap or in the last hour to expiry.
+/// Where an asset wei is worth many SY wei (an index far below 1e18), costs move in steps that
+/// size, and a larger limit can miss them too: it then fails its fill check and reports no depth.
 const SY_IN_DUST: U256 = U256::from_limbs([2_000_000, 0, 0, 0]);
 
 /// The least SY a YT sale must pay at the execution block, in wei, for its limit to hold there.
 /// Selling YT repays borrowed PT out of the PY the sale frees, through conversions that each round
 /// by a wei of SY, so a sale paying a few wei fills or not depending on the index. In any SY, a
-/// thousand wei is dust.
+/// thousand wei is dust. The repayment also rounds by a wei of PY, which at an index far below
+/// 1e18 is worth many SY wei; a sale paying less than that fails its fill check instead.
 const YT_SALE_DUST: U256 = U256::from_limbs([1_000, 0, 0, 0]);
 
 /// `bound` less [`BOUND_MARGIN`] of it.
