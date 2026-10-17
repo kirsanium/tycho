@@ -52,15 +52,15 @@ use crate::evm::protocol::u256_num::{biguint_to_u256, u256_to_biguint, u256_to_f
 /// How far the PY index may move between the sampled and the execution block while a market
 /// limit still holds: 1e-6, as a fraction of [`ONE_E18`]. A yield token accruing 3% a year moves
 /// the index about 1e-9 a block, so this covers hundreds of blocks of ordinary accrual, or one
-/// block at any plausible rate; it costs the SY-in limits under 1e-5 of their size. A discrete
-/// jump past it, such as a rebase report landing between the two blocks, is not covered.
+/// block at any plausible rate. A discrete jump past it, such as a rebase report landing between
+/// the two blocks, is not covered.
 const INDEX_DRIFT: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]);
 const ONE_E18: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 
 /// How far inside a market edge's bound its limit sits once it must hold at the execution block,
 /// as a fraction of [`ONE_E18`]: 1e-5. Next to the bound, whether a trade fills flips with the
 /// index, so a limit there can fail at an index within [`INDEX_DRIFT`] that the checked states do
-/// not cover; a limit this far inside did not in any probe. See [`sy_in_limit`].
+/// not cover. See [`sy_in_limit`].
 const BOUND_MARGIN: U256 = U256::from_limbs([10_000_000_000_000, 0, 0, 0]);
 
 /// Gas for a swap routed through Router V4.
@@ -568,7 +568,9 @@ impl ProtocolSim for PendleState {
     /// another: SY→PT is bounded by the router search's rate floor, SY→YT by the search's bound at
     /// the proportion cap, and PT→SY by the 96% proportion cap itself; each is the largest input
     /// that fills. YT→SY is the trader's output peak, short of where the sale stops filling. With
-    /// an execution block recorded, an input must fill at both that block and the sampled one.
+    /// an execution block recorded, an input must also fill at that block, with the index as
+    /// sampled and [`INDEX_DRIFT`] above it, and an edge whose limit is dust there reports no
+    /// depth.
     ///
     /// A pair this component does not trade — PT against YT, or a token that is not one of its
     /// three — reports **zero depth rather than an error**. A caller enumerating the pairs of a
@@ -729,11 +731,16 @@ impl ProtocolSim for PendleState {
                     .amount_out;
                 // An input that fills but yields nothing is no depth, not a trade. A YT sale that
                 // must hold at the execution block also needs to pay more than the repayment's
-                // rounding, which comes in whole wei of SY: below that, a sale that fills at the
-                // checked states can fail at an index between them.
+                // rounding there, which comes in whole wei of SY: below that, a sale that fills at
+                // the checked states can fail at an index between them. What it pays at the
+                // sampled block says nothing about this: a sale paying a thousand wei an hour
+                // before expiry pays none a second before it.
                 let dust = (from, to) == (MarketToken::Yt, MarketToken::Sy) &&
-                    !at_execution.is_empty() &&
-                    max_out < YT_SALE_DUST;
+                    at_execution.iter().any(|state| {
+                        state
+                            .amount_out(max_in, from, to)
+                            .map_or(true, |swap| swap.amount_out < YT_SALE_DUST)
+                    });
                 if max_out.is_zero() || dust {
                     return Ok(no_depth());
                 }
@@ -1125,8 +1132,9 @@ fn unbounded_soft_limit() -> U256 {
 /// Without an execution block, the limit is exact: the largest input the search accepts, `eps`
 /// slack included. With one, the request must also fill a block later with the index risen by up
 /// to [`INDEX_DRIFT`], and next to the bound the search's verdict flips back and forth with the
-/// index. So the limit steps [`BOUND_MARGIN`] inside the bound, where it does not. An input there
-/// that still fails to fill reports no depth: walking down from it lands on another such edge.
+/// index. So the limit gives up the slack and steps [`BOUND_MARGIN`] inside the bound, about 6e-5
+/// of its size in all. An input there that still fails to fill reports no depth: walking down from
+/// it lands on another such edge. So does one under [`SY_IN_DUST`].
 fn sy_in_limit(
     exact: U256,
     for_execution: bool,
@@ -1136,13 +1144,21 @@ fn sy_in_limit(
         return Ok(largest_fill(approx::with_eps_slack(exact)?, exact, fills));
     }
     let inside = inside_bound(exact);
-    Ok(if fills(inside) { inside } else { U256::ZERO })
+    Ok(if inside >= SY_IN_DUST && fills(inside) { inside } else { U256::ZERO })
 }
 
-/// The least SY a YT sale must pay, in wei, for its limit to hold at the execution block. Selling
-/// YT repays borrowed PT out of the PY the sale frees, through conversions that each round by a
-/// wei of SY, and a sale paying about that much fills or not depending on the index. Probes found
-/// such failures only at payouts of 104 wei and below. In any SY, a thousand wei is dust.
+/// The least SY, in wei, an SY-in limit must take to hold at the execution block. The search
+/// accepts a guess whose cost lands within `eps` (5e-5) below the request, and each guess's cost
+/// rounds by a few wei of SY, which shift with the index. On a request whose window spans only a
+/// few wei, the search lands or runs out of iterations depending on the index: probes found such
+/// failures up to a window of 4 wei. Two million wei gives a window of 100. Only an SY-in edge
+/// whose whole depth is dust has less, as near the proportion cap or in the last hour to expiry.
+const SY_IN_DUST: U256 = U256::from_limbs([2_000_000, 0, 0, 0]);
+
+/// The least SY a YT sale must pay at the execution block, in wei, for its limit to hold there.
+/// Selling YT repays borrowed PT out of the PY the sale frees, through conversions that each round
+/// by a wei of SY, so a sale paying a few wei fills or not depending on the index. In any SY, a
+/// thousand wei is dust.
 const YT_SALE_DUST: U256 = U256::from_limbs([1_000, 0, 0, 0]);
 
 /// `bound` less [`BOUND_MARGIN`] of it.

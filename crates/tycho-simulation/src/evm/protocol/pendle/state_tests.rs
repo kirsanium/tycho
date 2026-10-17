@@ -1072,8 +1072,22 @@ fn assert_limit_holds_at_execution(
     market: &PendleMarketState,
     sampled: u64,
     delay: u64,
-    (from, to): (&str, &str),
+    edge: (&str, &str),
     drifts_ppt: &[u64],
+) {
+    let rises = drifts_ppt
+        .iter()
+        .map(|drift| market.py_index * U256::from(*drift) / U256::from(1_000_000_000_000u64));
+    assert_limit_holds_at_rises(market, sampled, delay, edge, rises);
+}
+
+/// As [`assert_limit_holds_at_execution`], with the index risen by every listed amount in wei.
+fn assert_limit_holds_at_rises(
+    market: &PendleMarketState,
+    sampled: u64,
+    delay: u64,
+    (from, to): (&str, &str),
+    rises: impl IntoIterator<Item = U256>,
 ) {
     let at = |timestamp: u64, py_index: U256| {
         PendleState::Market(PendleMarketState {
@@ -1091,12 +1105,10 @@ fn assert_limit_holds_at_execution(
     if max_in == BigUint::ZERO {
         return;
     }
-    for drift in drifts_ppt {
-        let moved = market.py_index +
-            market.py_index * U256::from(*drift) / U256::from(1_000_000_000_000u64);
-        at(sampled + delay, moved)
+    for rise in rises {
+        at(sampled + delay, market.py_index + rise)
             .get_amount_out(max_in.clone(), &token(from, 18), &token(to, 18))
-            .unwrap_or_else(|e| panic!("{from}->{to}, index +{drift} ppt: {max_in} fails: {e:?}"));
+            .unwrap_or_else(|e| panic!("{from}->{to}, index +{rise} wei: {max_in} fails: {e:?}"));
     }
 }
 
@@ -1161,6 +1173,53 @@ fn a_yt_sale_paying_dust_has_no_depth_at_execution() {
         31,
         (YT, SY),
         &[50_000, 200_000, 257_739, 297_958],
+    );
+}
+
+/// What a YT sale pays at the sampled block says nothing about what it pays at the execution block:
+/// here the peak sale pays 1323 wei of SY 53 minutes before expiry, and none a second before it,
+/// where it fills at some indices between the checked states and not at others.
+#[test]
+fn a_yt_sale_is_dust_by_what_it_pays_at_execution() {
+    let market = shaped_market(
+        "322760082594980495360",
+        "326566283156562",
+        "2351298711647608",
+        "2127031505991566",
+        "3368677611678347264",
+        "64",
+        "41181032800451869802496",
+    );
+    let drift = market.py_index / U256::from(1_000_000u64);
+    assert_limit_holds_at_rises(
+        &market,
+        1_830_121_656,
+        3_143,
+        (YT, SY),
+        (0..=1_000u64).map(|k| drift * U256::from(k) / U256::from(1_000u64)),
+    );
+}
+
+/// An SY-in request whose `eps` window spans a few wei of SY lands or exhausts the search depending
+/// on the index: here SY→YT at the 96% proportion cap, where the whole depth is 223 wei, fails at
+/// 38 wei above the sampled index. The limit is dust and reports no depth.
+#[test]
+fn an_sy_in_limit_of_dust_has_no_depth_at_execution() {
+    let market = shaped_market(
+        "2603547584329881088",
+        "589388881545565732",
+        "40955002355374024",
+        "7182686133247823",
+        "180796900341603008512",
+        "63",
+        "184057000000000000",
+    );
+    assert_limit_holds_at_rises(
+        &market,
+        1_830_123_560,
+        51,
+        (SY, YT),
+        (0..2_000u64).map(U256::from),
     );
 }
 
