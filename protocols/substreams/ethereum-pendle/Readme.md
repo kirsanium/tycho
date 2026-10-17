@@ -60,9 +60,11 @@ paused SY reverts every transfer, so none of those markets can trade either.
 | Classes, `paused` | Once, at creation | `Upgraded`, `Paused`, `Unpaused` |
 | Market `sy_paused` | The SY's `paused()`, at market creation (from the SY profile) | The SY's `Paused`, `Unpaused` |
 | SY supply | `totalSupply()` once, at creation | The SY's own mints and burns |
-| SY supply cap | `getAbsoluteSupplyCap()` once, at creation, kept only when it caps the SY's own supply | `SupplyCapUpdated` |
+| SY supply cap | `getAbsoluteSupplyCap()` (or `supplyCap()`) once, at creation, kept only when it caps the SY's own supply | `SupplyCapUpdated` |
 | Yield token | `yieldToken()` once, at creation | — |
-| SY balances | `balanceOf` once per token, at creation | `Transfer`s |
+| SY balances | `balanceOf` once per token, at creation | `Transfer`s, and WETH9's `Deposit` / `Withdrawal` |
+| Market `pyIndexStored` | `pyIndexStored()` on the YT, once, at market creation | `NewInterestIndex` |
+| Market fees | `getMarketConfig` once, at market creation | The factories' fee events |
 | Exchange rate | Every refresh block | — |
 
 Creation reads are batched per kind (market, SY units, decimals, probes, seeds). The rate is read
@@ -73,9 +75,10 @@ not answer.
 
 Balances are never re-read. A rebasing token (stETH, aTokens) moves an SY's balance without a
 `Transfer`, so the reported holding of one misses every rebase since creation, and one whose
-withdrawals outrun the accounted total is reported as zero. Quotes bound redemptions by supply
-and never read a balance, so this affects only the reported balances and anything derived from
-them, such as TVL.
+withdrawals outrun the accounted total is reported as zero. The simulation reads one balance:
+an SY's holding of its own yield token, which bounds a redemption to that token. Every other
+redemption is bounded by supply. So a missed rebase affects that bound, the reported balances
+and anything derived from them, such as TVL.
 
 ## The refresh, and its one parameter
 
@@ -119,6 +122,7 @@ cargo run -- range --package ethereum-pendle
 ```
 
 The range tests cover three windows: the original factory's first markets (2022), the reference
-wstETH market's creation (2023), and the current V6 factory (2025). Execution is skipped on the two
-historical windows — Pendle Router V4 has no code before block 19759272, and no window contains both
-one of those markets being created and a live router.
+wstETH market's creation (2023), and the current V6 factory (2026). This package's yaml runs indexing
+only; the simulation and execution PRs switch the rest on. Execution stays off on the two historical
+windows: the planted router needs Cancun (transient storage), Pendle Router V4 has no code before
+block 19759272, and no window contains both one of those markets being created and a live router.

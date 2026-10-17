@@ -18,10 +18,10 @@ mod map_protocol_components;
 // Stage 4
 #[path = "4_store_market_registry.rs"]
 mod store_market_registry;
-#[path = "4_store_markets_by_yt.rs"]
-mod store_markets_by_yt;
 #[path = "4_store_protocol_components.rs"]
 mod store_protocol_components;
+#[path = "4_store_markets_by_yt.rs"]
+mod store_markets_by_yt;
 
 // Stage 5
 #[path = "5_map_relative_component_balance.rs"]

@@ -12,7 +12,8 @@ generations where the storage layout is not. Fees are read back from each factor
 probing `previewDeposit` and `previewRedeem`, and re-classified on the SY's `Upgraded` and
 `Unpaused`; a token matching neither is left out. Classes and `paused` are state, and each market
 carries its SY's pause as `sy_paused`. An SY that caps its own supply carries the cap as
-`sy_supply_cap`, and every SY its `yield_token`. An SY's supply and balances are read once at
-creation and followed from events afterwards. `SY.exchangeRate()` and the PY index are read every
-`sy_rate_refresh_blocks` blocks (default 1), for the SYs of live markets and for SYs with an
-`index_rate` token only.
+`sy_supply_cap`, and every SY whose `yieldToken()` answers its `yield_token`. An SY's supply and
+balances are read once at creation and followed from events afterwards. `SY.exchangeRate()` is read
+every `sy_rate_refresh_blocks` blocks (default 1), for the SYs of live markets and for SYs that have
+ever had an `index_rate` token, and each market's PY index is derived from it and the stored index
+its YT reports.
