@@ -103,7 +103,7 @@ pub fn map_protocol_changes(
                             component_id,
                             attributes: vec![state_attribute(
                                 SY_TOTAL_SUPPLY,
-                                change.balance.clone(),
+                                signed_bytes(&change.balance),
                             )],
                         });
                 }
@@ -118,7 +118,7 @@ pub fn map_protocol_changes(
                         token if *token == sy => TOTAL_SY,
                         _ => return None,
                     };
-                    Some(state_attribute(name, change.balance.clone()))
+                    Some(state_attribute(name, signed_bytes(&change.balance)))
                 })
                 .collect::<Vec<_>>();
             if attributes.is_empty() {
@@ -132,7 +132,14 @@ pub fn map_protocol_changes(
         }
     }
 
-    for (tx, change) in absolute_state_changes(&block, &components_store, &markets_by_yt) {
+    let created: HashSet<String> = new_components
+        .tx_components
+        .iter()
+        .flat_map(|tx| &tx.components)
+        .map(|component| component.id.clone())
+        .collect();
+    for (tx, change) in absolute_state_changes(&block, &components_store, &markets_by_yt, &created)
+    {
         transaction_changes
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(&tx))
@@ -195,6 +202,7 @@ fn absolute_state_changes(
     block: &eth::Block,
     components_store: &StoreGetRaw,
     markets_by_yt: &StoreGetString,
+    created: &HashSet<String>,
 ) -> Vec<(Transaction, EntityChanges)> {
     let mut changes = Vec::new();
     for tx in block.transactions() {
@@ -207,9 +215,12 @@ fn absolute_state_changes(
                     vec![]
                 }
             } else if let Some(index) = py_index_stored(log) {
-                // The index belongs to the yield token, so every market it backs takes it.
+                // The index belongs to the yield token, so every market it backs takes it. A market
+                // created this block is left out: its creation carries the end-of-block value, and
+                // an earlier transaction would otherwise update it before it exists.
                 markets_backed_by(markets_by_yt, &log.address)
                     .into_iter()
+                    .filter(|market| !created.contains(market))
                     .map(|market| (market, PY_INDEX_STORED, index.clone()))
                     .collect()
             } else {
@@ -563,6 +574,13 @@ fn as_emitted(component: &ProtocolComponent) -> ProtocolComponent {
     emitted
 }
 
+/// An accumulated reserve or supply as the signed big-endian bytes every other numeric attribute
+/// uses. `aggregate_balances_changes` hands back the unsigned magnitude, whose top bit can be set,
+/// which a signed reader takes as negative: 10e18 is `0x8ac7…`.
+fn signed_bytes(unsigned: &[u8]) -> Vec<u8> {
+    BigInt::from_unsigned_bytes_be(unsigned).to_signed_bytes_be()
+}
+
 fn state_attribute(name: &str, value: Vec<u8>) -> Attribute {
     Attribute { name: name.to_string(), value, change: ChangeType::Update.into() }
 }
@@ -572,6 +590,20 @@ mod tests {
     use super::*;
 
     /// The seeds feed the stores and the classes are state; everything else is emitted unchanged.
+    /// 10e18 as the aggregation hands it back has its top bit set; it must reach the consumer as a
+    /// positive value.
+    #[test]
+    fn a_reserve_with_its_top_bit_set_is_emitted_positive() {
+        let ten = hex::decode("8ac7230489e80000").unwrap();
+        let emitted = signed_bytes(&ten);
+        assert_eq!(emitted, hex::decode("008ac7230489e80000").unwrap());
+        assert_eq!(
+            BigInt::from_signed_bytes_be(&emitted),
+            BigInt::from(10_000_000_000_000_000_000u64)
+        );
+        assert_eq!(signed_bytes(&[0x01, 0x00]), vec![0x01, 0x00]);
+    }
+
     #[test]
     fn the_emitted_component_drops_the_seeds_and_the_classes() {
         let component = ProtocolComponent::new("0xcbc72d92b2dc8187414f6734718563898740c0bc")

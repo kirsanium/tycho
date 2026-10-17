@@ -87,6 +87,13 @@
     "outputs": [{ "name": "", "type": "uint256" }]
   },
   {
+    "type": "function",
+    "name": "supplyCap",
+    "stateMutability": "view",
+    "inputs": [],
+    "outputs": [{ "name": "", "type": "uint256" }]
+  },
+  {
     "type": "event",
     "name": "SupplyCapUpdated",
     "anonymous": false,

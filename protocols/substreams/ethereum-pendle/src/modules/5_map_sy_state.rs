@@ -262,8 +262,15 @@ fn new_market_components(
 /// The SY itself is on its own token list but is never one of its entry or exit tokens, so it
 /// gets no attribute at all.
 fn reclassified(sy: &[u8], listed: &[Vec<u8>], classification: &Classification) -> Vec<Attribute> {
-    let Classification { tokens_in, tokens_out, undetermined_in, undetermined_out, .. } =
-        classification;
+    let Classification {
+        tokens_in,
+        tokens_out,
+        undetermined_in,
+        undetermined_out,
+        entry_list_unread,
+        exit_list_unread,
+        ..
+    } = classification;
     let keep = |classes: &[(Vec<u8>, crate::sy::TokenClass)]| {
         classes
             .iter()
@@ -278,16 +285,17 @@ fn reclassified(sy: &[u8], listed: &[Vec<u8>], classification: &Classification) 
         .iter()
         .filter(|token| token.as_slice() != sy)
     {
-        for (prefix, undetermined) in
-            [(TOKEN_IN_CLASS_PREFIX, undetermined_in), (TOKEN_OUT_CLASS_PREFIX, undetermined_out)]
-        {
+        for (prefix, undetermined, list_unread) in [
+            (TOKEN_IN_CLASS_PREFIX, undetermined_in, entry_list_unread),
+            (TOKEN_OUT_CLASS_PREFIX, undetermined_out, exit_list_unread),
+        ] {
             let name = format!("{prefix}{}", hex::encode(token));
             match classified
                 .iter()
                 .find(|(classified_name, _)| *classified_name == name)
             {
                 Some((_, value)) => attributes.push(update(&name, value.clone())),
-                None if undetermined.contains(token) => {}
+                None if *list_unread || undetermined.contains(token) => {}
                 None => attributes.push(Attribute {
                     name,
                     value: vec![],
@@ -325,6 +333,8 @@ mod tests {
             tokens_out: tokens_out.to_vec(),
             undetermined_in: undetermined.to_vec(),
             undetermined_out: undetermined.to_vec(),
+            entry_list_unread: false,
+            exit_list_unread: false,
         }
     }
 
@@ -399,6 +409,24 @@ mod tests {
         );
         let wsteth = hex::encode(WSTETH);
         assert_eq!(by_name(&attributes), vec![(format!("token_in_class_0x{wsteth}"), false)]);
+    }
+
+    /// An SY whose `getTokensOut()` does not answer on a re-profile has an unknown exit list, not
+    /// an empty one: its exit tokens keep their classes rather than all being deleted.
+    #[test]
+    fn an_unread_token_list_keeps_that_directions_classes() {
+        let mut unread = classification(&[(WSTETH.to_vec(), TokenClass::OneToOne)], &[], &[]);
+        unread.exit_list_unread = true;
+        let attributes = reclassified(&SY, &[WSTETH.to_vec(), STETH.to_vec()], &unread);
+        let wsteth = hex::encode(WSTETH);
+        let steth = hex::encode(STETH);
+        assert_eq!(
+            by_name(&attributes),
+            vec![
+                (format!("token_in_class_0x{wsteth}"), false),
+                (format!("token_in_class_0x{steth}"), true),
+            ]
+        );
     }
 
     /// A pause reaches every market of its SY, an unpause clears it, and a market created this

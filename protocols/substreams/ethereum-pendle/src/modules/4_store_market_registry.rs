@@ -51,7 +51,12 @@ pub fn store_market_registry(
             let entry = MarketEntry {
                 id: component.id.clone(),
                 sy: contract_id(&sy),
-                expiry: BigInt::from_signed_bytes_be(&expiry).to_u64(),
+                // A market's expiry fits a u64 by far; an out-of-range answer would panic
+                // converting, so it saturates to "never expires" instead.
+                expiry: BigInt::from_signed_bytes_be(&expiry)
+                    .to_string()
+                    .parse()
+                    .unwrap_or(u64::MAX),
                 factory: hex::encode(&factory),
                 ln_fee_rate_root_at_creation: BigInt::from_signed_bytes_be(&at_creation)
                     .to_string(),

@@ -327,6 +327,10 @@ pub(crate) struct Classification {
     pub(crate) undetermined_in: Vec<Vec<u8>>,
     /// Exit tokens whose decimals or probe did not answer.
     pub(crate) undetermined_out: Vec<Vec<u8>>,
+    /// Whether `getTokensIn()` did not answer, which leaves every entry token undetermined.
+    pub(crate) entry_list_unread: bool,
+    /// Whether `getTokensOut()` did not answer, which leaves every exit token undetermined.
+    pub(crate) exit_list_unread: bool,
 }
 
 /// Classifies each token the SY lists by probing `previewDeposit` / `previewRedeem` against the
@@ -350,17 +354,18 @@ pub(crate) fn classify_sy(sy_address: &[u8]) -> Option<Classification> {
         .get(2)
         .and_then(RpcBatch::decode::<_, pendle_sy::functions::ExchangeRate>)?;
     // The token lists are optional: an SY that will not enumerate them still yields a quotable
-    // market, it just contributes no wrap edges.
+    // market, it just contributes no wrap edges. A list that does not answer is unknown, not
+    // empty, which matters on a re-profile: its tokens keep their classes.
     let tokens_in = responses
         .get(3)
-        .and_then(RpcBatch::decode::<_, pendle_sy::functions::GetTokensIn>)
-        .unwrap_or_default();
+        .and_then(RpcBatch::decode::<_, pendle_sy::functions::GetTokensIn>);
     let tokens_out = responses
         .get(4)
-        .and_then(RpcBatch::decode::<_, pendle_sy::functions::GetTokensOut>)
-        .unwrap_or_default();
+        .and_then(RpcBatch::decode::<_, pendle_sy::functions::GetTokensOut>);
+    let (entry_list_unread, exit_list_unread) = (tokens_in.is_none(), tokens_out.is_none());
+    let (tokens_in, tokens_out) = (tokens_in.unwrap_or_default(), tokens_out.unwrap_or_default());
 
-    let asset_decimals = asset_decimals.to_u64() as u32;
+    let asset_decimals = bounded_decimals(&asset_decimals)?;
     let token_decimals = read_token_decimals(&tokens_in, &tokens_out);
 
     let mut quotable_in = Vec::new();
@@ -399,6 +404,8 @@ pub(crate) fn classify_sy(sy_address: &[u8]) -> Option<Classification> {
         tokens_out: quotable_out,
         undetermined_in,
         undetermined_out,
+        entry_list_unread,
+        exit_list_unread,
     })
 }
 
@@ -432,21 +439,30 @@ struct Seeds {
     supply_cap: Option<BigInt>,
 }
 
-/// The cap an SY puts on its own supply, from `getAbsoluteSupplyCap()` and
-/// `getAbsoluteTotalSupply()`; `None` when it has none.
+/// The cap an SY puts on its own supply; `None` when it has none.
 ///
 /// Pendle's capped SYs revert a mint that takes `totalSupply()` past the cap, so the room left is
-/// the cap less the supply this package already follows from mints and burns. That holds only
-/// when the "absolute" supply the cap is checked against is the SY's own; some SYs cap a vault's
-/// supply instead, which moves outside the SY and would need a read every block, so those are
-/// left uncapped. `type(uint256).max` is how an uncapped SY answers.
+/// the cap less the supply this package already follows from mints and burns. Two shapes answer:
+/// - `getAbsoluteSupplyCap()` with `getAbsoluteTotalSupply()`. The cap counts only when the
+///   "absolute" supply it is checked against is the SY's own; some SYs cap a vault's supply
+///   instead, which moves outside the SY and would need a read every block, so those are left
+///   uncapped.
+/// - A plain `supplyCap()`, on SYs without the absolute getters (`PendleERC20WithSupplyCapSY`,
+///   `PendleZtakeUSDESY`), which check it against their own `totalSupply()`.
+///
+/// `type(uint256).max` is how an uncapped SY answers either.
 pub fn own_supply_cap(
     cap: Option<BigInt>,
     absolute_supply: Option<BigInt>,
+    plain_cap: Option<BigInt>,
     supply: &BigInt,
 ) -> Option<BigInt> {
-    let (cap, absolute_supply) = (cap?, absolute_supply?);
-    (absolute_supply == *supply && !is_uncapped(&cap)).then_some(cap)
+    let cap = match (cap, absolute_supply) {
+        (Some(cap), Some(absolute_supply)) => (absolute_supply == *supply).then_some(cap)?,
+        (Some(_), None) => return None,
+        (None, _) => plain_cap?,
+    };
+    (!is_uncapped(&cap)).then_some(cap)
 }
 
 /// Whether a supply cap is `type(uint256).max`, which is how an uncapped SY answers.
@@ -476,7 +492,8 @@ fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
         .add(pendle_sy::functions::Paused {}, sy_address.to_vec())
         .add(pendle_sy::functions::YieldToken {}, sy_address.to_vec())
         .add(pendle_sy::functions::GetAbsoluteSupplyCap {}, sy_address.to_vec())
-        .add(pendle_sy::functions::GetAbsoluteTotalSupply {}, sy_address.to_vec());
+        .add(pendle_sy::functions::GetAbsoluteTotalSupply {}, sy_address.to_vec())
+        .add(pendle_sy::functions::SupplyCap {}, sy_address.to_vec());
     for token in tokens {
         batch =
             batch.add(erc20::functions::BalanceOf { owner: sy_address.to_vec() }, token.clone());
@@ -503,12 +520,15 @@ fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
         responses
             .get(4)
             .and_then(RpcBatch::decode::<_, pendle_sy::functions::GetAbsoluteTotalSupply>),
+        responses
+            .get(5)
+            .and_then(RpcBatch::decode::<_, pendle_sy::functions::SupplyCap>),
         &total_supply,
     );
     let mut holdings = Vec::new();
     for (token, response) in tokens
         .iter()
-        .zip(responses.iter().skip(5))
+        .zip(responses.iter().skip(6))
     {
         let Some(balance) = RpcBatch::decode::<_, erc20::functions::BalanceOf>(response) else {
             log::info!(
@@ -523,8 +543,24 @@ fn read_seeds(sy_address: &[u8], tokens: &[Vec<u8>]) -> Option<Seeds> {
     Some(Seeds { total_supply, holdings, paused, yield_token, supply_cap })
 }
 
+/// The most decimals a token can have and still be priced: `10^77` is the largest power of ten a
+/// 256-bit integer holds.
+const MAX_DECIMALS: u32 = 77;
+
+/// A `decimals()` answer as a small integer, or `None` past [`MAX_DECIMALS`]. ABI decoding does not
+/// range-check a `uint8`, and converting an out-of-range answer would panic and halt the stream, so
+/// a token answering one is skipped instead.
+pub fn bounded_decimals(value: &BigInt) -> Option<u32> {
+    value
+        .to_string()
+        .parse::<u32>()
+        .ok()
+        .filter(|decimals| *decimals <= MAX_DECIMALS)
+}
+
 fn decode_decimals(response: &RpcResponse) -> Option<u32> {
-    RpcBatch::decode::<_, pendle_sy::functions::Decimals>(response).map(|d| d.to_u64() as u32)
+    RpcBatch::decode::<_, pendle_sy::functions::Decimals>(response)
+        .and_then(|decimals| bounded_decimals(&decimals))
 }
 
 /// Reads `decimals()` for every token either side of the SY in one batch.
@@ -554,10 +590,12 @@ fn read_token_decimals(tokens_in: &[Vec<u8>], tokens_out: &[Vec<u8>]) -> Vec<(Ve
 
     let mut decimals = Vec::new();
     for (token, response) in unique.into_iter().zip(responses.iter()) {
-        let Some(value) = RpcBatch::decode::<_, erc20::functions::Decimals>(response) else {
+        let Some(value) = RpcBatch::decode::<_, erc20::functions::Decimals>(response)
+            .and_then(|decimals| bounded_decimals(&decimals))
+        else {
             continue;
         };
-        decimals.push((token, value.to_u64() as u32));
+        decimals.push((token, value));
     }
     decimals
 }
@@ -875,7 +913,10 @@ mod tests {
     fn a_cap_on_the_sys_own_supply_is_kept() {
         let supply = BigInt::from_str("22606883884338964498272371").unwrap();
         let cap = BigInt::from_str("2500000000000000000000000000").unwrap();
-        assert_eq!(own_supply_cap(Some(cap.clone()), Some(supply.clone()), &supply), Some(cap));
+        assert_eq!(
+            own_supply_cap(Some(cap.clone()), Some(supply.clone()), None, &supply),
+            Some(cap)
+        );
     }
 
     /// An SY that caps a vault's supply rather than its own would need that supply read every
@@ -884,11 +925,36 @@ mod tests {
     fn caps_on_another_supply_or_none_at_all_are_dropped() {
         let supply = BigInt::from(1_000);
         let cap = BigInt::from(5_000);
-        assert_eq!(own_supply_cap(Some(cap.clone()), Some(BigInt::from(2_000)), &supply), None);
+        assert_eq!(
+            own_supply_cap(Some(cap.clone()), Some(BigInt::from(2_000)), None, &supply),
+            None
+        );
         let uncapped = BigInt::from(2).pow(256) - BigInt::from(1);
         assert!(is_uncapped(&uncapped));
-        assert_eq!(own_supply_cap(Some(uncapped), Some(supply.clone()), &supply), None);
-        assert_eq!(own_supply_cap(None, None, &supply), None);
-        assert_eq!(own_supply_cap(Some(cap), None, &supply), None);
+        assert_eq!(
+            own_supply_cap(Some(uncapped.clone()), Some(supply.clone()), None, &supply),
+            None
+        );
+        assert_eq!(own_supply_cap(None, None, None, &supply), None);
+        assert_eq!(own_supply_cap(Some(cap), None, None, &supply), None);
+        assert_eq!(own_supply_cap(None, None, Some(uncapped), &supply), None);
+    }
+
+    /// `PendleERC20WithSupplyCapSY` has no absolute getters, only `supplyCap()`, which it checks
+    /// against its own `totalSupply()`.
+    #[test]
+    fn a_plain_supply_cap_counts_when_the_absolute_getters_are_missing() {
+        let supply = BigInt::from(1_000);
+        let cap = BigInt::from(5_000);
+        assert_eq!(own_supply_cap(None, None, Some(cap.clone()), &supply), Some(cap));
+    }
+
+    /// An absurd `decimals()` answer would panic converting and halt the stream; it is skipped.
+    #[test]
+    fn decimals_past_what_can_be_priced_are_rejected() {
+        assert_eq!(bounded_decimals(&BigInt::from(18)), Some(18));
+        assert_eq!(bounded_decimals(&BigInt::from(77)), Some(77));
+        assert_eq!(bounded_decimals(&BigInt::from(78)), None);
+        assert_eq!(bounded_decimals(&(BigInt::from(2).pow(255))), None);
     }
 }
