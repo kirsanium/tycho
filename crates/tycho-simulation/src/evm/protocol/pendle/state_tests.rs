@@ -987,10 +987,10 @@ fn a_malformed_balance_leaves_the_holding_unknown() {
 }
 
 /// A swap executes a block after it is quoted, where the bounds have moved: the clock, and the PY
-/// index, which accrues with the yield token (a block of a 3%/yr token is about 1e-9) and can step
-/// down to its stored floor. With the execution block recorded, every market limit still fills at
-/// that block with the index anywhere within `INDEX_DRIFT` (1e-6) of the sampled one, on three
-/// market shapes, from four years to a minute before expiry.
+/// index, which accrues with the yield token (a block of a 3%/yr token is about 1e-9) and never
+/// falls. With the execution block recorded, every market limit still fills at that block with the
+/// index anywhere up to `INDEX_DRIFT` (1e-6) above the sampled one, on three market shapes, from
+/// four years to a minute before expiry. The tests after this one pin each part of how.
 #[test]
 fn market_limits_still_fill_at_the_execution_block() {
     let PendleState::Market(reference) = wsteth_market(0) else { unreachable!() };
@@ -1000,9 +1000,14 @@ fn market_limits_still_fill_at_the_execution_block() {
     shallow.market.total_sy /= I256::try_from(1_000_000).unwrap();
     let expiry = 1_830_124_800u64;
     for (name, market) in [("reference", reference), ("fork", fork), ("shallow", shallow)] {
-        for sampled in
-            [1_700_000_000u64, 1_787_273_051, expiry - 86_400, expiry - 3_600, expiry - 60]
-        {
+        for sampled in [
+            1_700_000_000u64,
+            1_787_273_051,
+            expiry - 30 * 86_400,
+            expiry - 86_400,
+            expiry - 3_600,
+            expiry - 60,
+        ] {
             let at = |timestamp: u64, py_index: U256| {
                 PendleState::Market(PendleMarketState {
                     rate_sampled_at: timestamp,
@@ -1017,15 +1022,18 @@ fn market_limits_still_fill_at_the_execution_block() {
                 let (max_in, _) = state
                     .get_limits(Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap())
                     .unwrap();
-                for drift_ppb in [-1000i64, -999, -500, -1, 0, 1, 500, 999, 1000] {
-                    let moved = I256::try_from(market.py_index).unwrap() *
-                        I256::try_from(1_000_000_000 + drift_ppb).unwrap() /
-                        I256::try_from(1_000_000_000i64).unwrap();
-                    at(sampled + 12, moved.into_raw())
+                for drift_ppt in (0..=1_000_000u64)
+                    .step_by(10_000)
+                    .chain([1, 2, 3, 999_999])
+                {
+                    let moved = market.py_index +
+                        market.py_index * U256::from(drift_ppt) /
+                            U256::from(1_000_000_000_000u64);
+                    at(sampled + 12, moved)
                         .get_amount_out(max_in.clone(), &token(from, 18), &token(to, 18))
                         .unwrap_or_else(|e| {
                             panic!(
-                                "{name} {from}->{to} at {sampled}, index {drift_ppb:+} ppb: \
+                                "{name} {from}->{to} at {sampled}, index +{drift_ppt} ppt: \
                                  {max_in} fails later: {e:?}"
                             )
                         });
@@ -1033,6 +1041,160 @@ fn market_limits_still_fill_at_the_execution_block() {
             }
         }
     }
+}
+
+/// A market of the given shape for the execution-block regressions below, keeping the reference
+/// market's tokens and expiry.
+fn shaped_market(
+    total_pt: &str,
+    total_sy: &str,
+    last_ln_implied_rate: &str,
+    ln_fee_rate_root: &str,
+    scalar_root: &str,
+    reserve_fee_percent: &str,
+    py_index: &str,
+) -> PendleMarketState {
+    let PendleState::Market(mut market) = wsteth_market(0) else { unreachable!() };
+    market.market.total_pt = s(total_pt);
+    market.market.total_sy = s(total_sy);
+    market.market.last_ln_implied_rate = u(last_ln_implied_rate);
+    market.market.ln_fee_rate_root = u(ln_fee_rate_root);
+    market.market.scalar_root = s(scalar_root);
+    market.market.reserve_fee_percent = u(reserve_fee_percent);
+    market.py_index = u(py_index);
+    market
+}
+
+/// Asserts that `from`→`to`'s limit, taken at `sampled` with the execution block `delay` seconds
+/// later, still fills at the execution block with the index risen by every listed amount, in parts
+/// per trillion.
+fn assert_limit_holds_at_execution(
+    market: &PendleMarketState,
+    sampled: u64,
+    delay: u64,
+    (from, to): (&str, &str),
+    drifts_ppt: &[u64],
+) {
+    let at = |timestamp: u64, py_index: U256| {
+        PendleState::Market(PendleMarketState {
+            rate_sampled_at: timestamp,
+            head_timestamp: timestamp,
+            py_index,
+            ..market.clone()
+        })
+    };
+    let mut state = at(sampled, market.py_index);
+    state.apply_block(&BlockContext::new(1, sampled + delay));
+    let (max_in, _) = state
+        .get_limits(Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap())
+        .unwrap();
+    if max_in == BigUint::ZERO {
+        return;
+    }
+    for drift in drifts_ppt {
+        let moved = market.py_index +
+            market.py_index * U256::from(*drift) / U256::from(1_000_000_000_000u64);
+        at(sampled + delay, moved)
+            .get_amount_out(max_in.clone(), &token(from, 18), &token(to, 18))
+            .unwrap_or_else(|e| panic!("{from}->{to}, index +{drift} ppt: {max_in} fails: {e:?}"));
+    }
+}
+
+/// A YT sale whose output still rises at the fill bound has its peak on the bound, where whether it
+/// fills flips with the index: here, PT at the 96% cap 75 s before expiry, a 1e-12 rise in the
+/// index puts the exchange rate below par. The limit keeps `BOUND_MARGIN` from the bound.
+#[test]
+fn a_yt_sale_whose_peak_is_its_bound_holds_at_execution() {
+    let market = shaped_market(
+        "48032100000000000000000000000",
+        "1967900000000000000000000000",
+        "6031030000000000",
+        "220000000000000",
+        "4630000000000000000",
+        "22",
+        "1000000000000000000",
+    );
+    assert_limit_holds_at_execution(&market, 1_830_124_725, 74, (YT, SY), &[1, 2, 3, 1_000_000]);
+}
+
+/// Next to the router search's bound, whether a request fills flips with the index, so an SY-in
+/// limit there fails at some index between the checked states: here the reference market at a
+/// 95.99% PT proportion, a minute before expiry, with the index 1e-6 higher. The limit keeps
+/// `BOUND_MARGIN` from the bound.
+#[test]
+fn an_sy_in_limit_keeps_clear_of_the_search_bound() {
+    let market = shaped_market(
+        "1452690582300000000000",
+        "60686417700000000000",
+        "20211000000000000",
+        "499875041000000",
+        "86364560000000000000",
+        "80",
+        "1241884000000000000",
+    );
+    assert_limit_holds_at_execution(
+        &market,
+        1_830_124_740,
+        12,
+        (SY, PT),
+        &[1, 500_000, 999_999, 1_000_000],
+    );
+}
+
+/// A YT sale that pays about as much as the repayment's rounding, a few wei of SY, fills or not
+/// depending on the index, so a limit that must hold at execution reports no depth for it. Here,
+/// 26 s before expiry, the peak sale of a thin market pays a few wei.
+#[test]
+fn a_yt_sale_paying_dust_has_no_depth_at_execution() {
+    let market = shaped_market(
+        "6363000000000000",
+        "8993637000000000000",
+        "370245000000000",
+        "170000000000000",
+        "267000000000000000000",
+        "48",
+        "15580716062387469786442",
+    );
+    assert_limit_holds_at_execution(
+        &market,
+        1_830_124_800 - 57,
+        31,
+        (YT, SY),
+        &[50_000, 200_000, 257_739, 297_958],
+    );
+}
+
+/// `get_amount_out` refuses any amount above `u128::MAX`, so a limit past it would not be
+/// quotable. With 7.6e12 SY of reserves at 1e8 asset per SY, PT→SY's bound is past it.
+#[test]
+fn a_limit_past_u128_is_clamped_to_a_quotable_amount() {
+    let market = shaped_market(
+        "405992000000000000000000000000",
+        "7594008000000000000000000000000",
+        "12198070000000000",
+        "81500000000000000",
+        "1070000000000000000000",
+        "33",
+        "100000000000000000000206358",
+    );
+    assert_limit_holds_at_execution(&market, 1_830_124_699, 100, (PT, SY), &[0, 1_000_000]);
+}
+
+/// The margin alone covers the index drift at an ordinary index, but not where the drift is large
+/// in wei: at 1e8 asset per SY, SY→PT's limit at the sampled index exhausts the search once the
+/// index has risen 1e-6. The execution state with the risen index catches it.
+#[test]
+fn a_limit_holds_against_the_full_drift_at_a_large_index() {
+    let market = shaped_market(
+        "621600000000000000000",
+        "799378400000000000000000",
+        "1625573000000000",
+        "974000000000000",
+        "780000000000000000",
+        "61",
+        "100000000000000000000324951",
+    );
+    assert_limit_holds_at_execution(&market, 1_830_124_674, 6, (SY, PT), &[1_000_000]);
 }
 
 /// PT against YT is not a market edge: minting and redeeming PY is the yield token's business, and

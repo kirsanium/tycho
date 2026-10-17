@@ -57,6 +57,12 @@ use crate::evm::protocol::u256_num::{biguint_to_u256, u256_to_biguint, u256_to_f
 const INDEX_DRIFT: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]);
 const ONE_E18: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 
+/// How far inside a market edge's bound its limit sits once it must hold at the execution block,
+/// as a fraction of [`ONE_E18`]: 1e-5. Next to the bound, whether a trade fills flips with the
+/// index, so a limit there can fail at an index within [`INDEX_DRIFT`] that the checked states do
+/// not cover; a limit this far inside did not in any probe. See [`sy_in_limit`].
+const BOUND_MARGIN: U256 = U256::from_limbs([10_000_000_000_000, 0, 0, 0]);
+
 /// Gas for a swap routed through Router V4.
 ///
 /// Measured per edge on a mainnet fork at block 25 800 000 against the wstETH market, each edge in
@@ -635,7 +641,7 @@ impl ProtocolSim for PendleState {
                             )
                             .map(|(sy_in, _)| sy_in)
                         })?;
-                        largest_fill(approx::with_eps_slack(exact)?, exact, fills)
+                        sy_in_limit(exact, !at_execution.is_empty(), fills)?
                     }
                     // The same search, bounded by the proportion cap the minted PT is sold into.
                     (MarketToken::Sy, MarketToken::Yt) => {
@@ -647,11 +653,18 @@ impl ProtocolSim for PendleState {
                             )
                             .map(|(sy_in, _)| sy_in)
                         })?;
-                        largest_fill(approx::with_eps_slack(exact)?, exact, fills)
+                        sy_in_limit(exact, !at_execution.is_empty(), fills)?
                     }
                     // Selling PT hands PT *to* the market, so the 96% proportion cap binds, and the
                     // market checks it directly: the closed form is the boundary.
-                    (MarketToken::Pt, MarketToken::Sy) => smallest(&|state| state.max_pt_in())?,
+                    (MarketToken::Pt, MarketToken::Sy) => {
+                        let bound = smallest(&|state| state.max_pt_in())?;
+                        if fills(bound) {
+                            bound
+                        } else {
+                            U256::ZERO
+                        }
+                    }
                     // Selling YT flash-*borrows* PT from the market and buys it back, fee included,
                     // so each extra YT pays less, and past some size it pays nothing or costs SY:
                     // the trader's output peaks well before the market's rate floor stops the
@@ -663,22 +676,50 @@ impl ProtocolSim for PendleState {
                             smallest(&|state| state.max_pt_out())?,
                             fills,
                         );
-                        // Everything up to `fillable` fills at every state, so the search follows
-                        // the sampled state's output alone, and only its answer is checked again.
-                        let peak = most_output_within(fillable, |amount| {
+                        // Where the output still rises at the bound, the peak lands on it, so it
+                        // keeps the same margin as the SY-in limits.
+                        let fillable =
+                            if at_execution.is_empty() { fillable } else { inside_bound(fillable) };
+                        let output = |amount: U256| {
                             state
                                 .amount_out(amount, from, to)
                                 .ok()
                                 .map(|swap| swap.amount_out)
-                        });
+                        };
+                        // Below `fillable` the sale usually fills at every state, so the search
+                        // follows the sampled state's output alone and checks only its answer.
+                        // Where that answer does not fill, the search runs again over inputs
+                        // that fill everywhere, and finding none reports no depth.
+                        let peak = most_output_within(fillable, output);
                         if fills(peak) {
                             peak
                         } else {
-                            fillable
+                            let peak = most_output_within(fillable, |amount| {
+                                fills(amount)
+                                    .then(|| output(amount))
+                                    .flatten()
+                            });
+                            if fills(peak) {
+                                peak
+                            } else {
+                                U256::ZERO
+                            }
                         }
                     }
                     // PT against YT, or either against itself: not an edge of this market.
                     _ => return Ok(no_depth()),
+                };
+                // `get_amount_out` refuses any amount above `u128::MAX`, so a limit past it would
+                // not be quotable; it is clamped there, where it must still fill.
+                let max_in = if max_in > unbounded_soft_limit() {
+                    let clamped = unbounded_soft_limit();
+                    if fills(clamped) {
+                        clamped
+                    } else {
+                        U256::ZERO
+                    }
+                } else {
+                    max_in
                 };
                 if max_in.is_zero() {
                     return Ok(no_depth());
@@ -686,8 +727,14 @@ impl ProtocolSim for PendleState {
                 let max_out = state
                     .amount_out(max_in, from, to)?
                     .amount_out;
-                // An input that fills but yields nothing is no depth, not a trade.
-                if max_out.is_zero() {
+                // An input that fills but yields nothing is no depth, not a trade. A YT sale that
+                // must hold at the execution block also needs to pay more than the repayment's
+                // rounding, which comes in whole wei of SY: below that, a sale that fills at the
+                // checked states can fail at an index between them.
+                let dust = (from, to) == (MarketToken::Yt, MarketToken::Sy) &&
+                    !at_execution.is_empty() &&
+                    max_out < YT_SALE_DUST;
+                if max_out.is_zero() || dust {
                     return Ok(no_depth());
                 }
                 Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
@@ -877,11 +924,12 @@ impl PendleMarketState {
     /// The market as it may stand at the execution block, when `apply_block` has recorded one later
     /// than the sampled block; empty otherwise.
     ///
-    /// The clock moves to that block, and the PY index may have moved too: it accrues with the
-    /// yield token, and nothing here projects it. So the market is taken at the execution block's
-    /// time with the index as sampled and [`INDEX_DRIFT`] above and below it. The SY-in bounds
-    /// fall as the index rises and PT→SY's as it falls, so the two ends of the range are where a
-    /// limit is tightest; the tests check points in between too.
+    /// The clock moves to that block, and the PY index may have risen: it accrues with the yield
+    /// token, and nothing here projects it. It never falls, since the YT reports
+    /// `max(SY.exchangeRate(), pyIndexStored)` and stores it. So the market is taken at the
+    /// execution block's time with the index as sampled and [`INDEX_DRIFT`] above it. Whether a
+    /// trade fills is not monotone in the index near a bound, so these two states alone do not
+    /// cover the indices between them; [`BOUND_MARGIN`] keeps the limits clear of the bound.
     fn at_execution(&self) -> Vec<Self> {
         if self.execution_timestamp <= self.rate_sampled_at {
             return Vec::new();
@@ -893,13 +941,7 @@ impl PendleMarketState {
             .py_index
             .saturating_mul(INDEX_DRIFT)
             .div_ceil(ONE_E18);
-        let mut states =
-            vec![Self { py_index: later.py_index.saturating_add(drift), ..later.clone() }];
-        if let Some(lower) = later.py_index.checked_sub(drift) {
-            states.push(Self { py_index: lower, ..later.clone() });
-        }
-        states.push(later);
-        states
+        vec![Self { py_index: later.py_index.saturating_add(drift), ..later.clone() }, later]
     }
 
     /// The most PT the market itself will send out before its exchange rate falls below par.
@@ -1076,6 +1118,36 @@ fn unquotable_pair(token_in: &Token, token_out: &Token) -> SimulationError {
 /// `maxDeposit`, Lido's stake limit and others), which nothing here can see.
 fn unbounded_soft_limit() -> U256 {
     U256::from(u128::MAX)
+}
+
+/// The SY-in limit (SY→PT, SY→YT) from `exact`, the input that costs the search's hard bound.
+///
+/// Without an execution block, the limit is exact: the largest input the search accepts, `eps`
+/// slack included. With one, the request must also fill a block later with the index risen by up
+/// to [`INDEX_DRIFT`], and next to the bound the search's verdict flips back and forth with the
+/// index. So the limit steps [`BOUND_MARGIN`] inside the bound, where it does not. An input there
+/// that still fails to fill reports no depth: walking down from it lands on another such edge.
+fn sy_in_limit(
+    exact: U256,
+    for_execution: bool,
+    fills: impl Fn(U256) -> bool,
+) -> Result<U256, PendleError> {
+    if !for_execution {
+        return Ok(largest_fill(approx::with_eps_slack(exact)?, exact, fills));
+    }
+    let inside = inside_bound(exact);
+    Ok(if fills(inside) { inside } else { U256::ZERO })
+}
+
+/// The least SY a YT sale must pay, in wei, for its limit to hold at the execution block. Selling
+/// YT repays borrowed PT out of the PY the sale frees, through conversions that each round by a
+/// wei of SY, and a sale paying about that much fills or not depending on the index. Probes found
+/// such failures only at payouts of 104 wei and below. In any SY, a thousand wei is dust.
+const YT_SALE_DUST: U256 = U256::from_limbs([1_000, 0, 0, 0]);
+
+/// `bound` less [`BOUND_MARGIN`] of it.
+fn inside_bound(bound: U256) -> U256 {
+    bound - bound * BOUND_MARGIN / ONE_E18
 }
 
 /// The largest input a market edge fills, found from `candidate`, a closed form for the edge's
