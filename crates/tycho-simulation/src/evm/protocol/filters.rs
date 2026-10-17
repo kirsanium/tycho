@@ -249,6 +249,28 @@ fn has_unsupported_asset_type(attrs: &HashMap<String, Bytes>) -> bool {
     false
 }
 
+/// Drops Pendle SY components with no quotable conversion in either direction.
+///
+/// An SY the indexer could not classify contributes no wrap edges at all, so it would decode and
+/// then fail on every call. The classes are state, since an upgrade can change them; this looks
+/// at them as the snapshot holds them.
+///
+/// Expired markets are deliberately **not** filtered here. Expiry is state, not configuration: it
+/// depends on the block being quoted, and a filter only sees the component. Testing it against
+/// wall-clock time would drop live markets during a historical replay and keep dead ones in a
+/// snapshot of the past. `PendleState` handles it instead — every edge errors and `get_limits`
+/// reports zero depth once `block_timestamp >= expiry`.
+pub fn pendle_filter(component: &ComponentWithState) -> bool {
+    if component.component.protocol_type_name != "pendle_sy" {
+        return true;
+    }
+    component
+        .state
+        .attributes
+        .keys()
+        .any(|name| name.starts_with("token_in_class_") || name.starts_with("token_out_class_"))
+}
+
 /// Filters out ERC4626 vaults that cannot be quoted correctly.
 ///
 /// FIXME: spETH, sUSDS and sUSDC are knowingly left in, and are correct only where `vm:curve` is
