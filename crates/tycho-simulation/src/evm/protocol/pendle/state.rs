@@ -57,21 +57,30 @@ use crate::evm::protocol::u256_num::{biguint_to_u256, u256_to_biguint, u256_to_f
 const INDEX_DRIFT: U256 = U256::from_limbs([1_000_000_000_000, 0, 0, 0]);
 const ONE_E18: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 
-/// How far inside a market edge's bound its limit sits once it must hold at the execution block,
-/// as a fraction of [`ONE_E18`]: 1e-5. Next to the bound, whether a trade fills flips with the
-/// index, so a limit there can fail at an index within [`INDEX_DRIFT`] that the checked states do
-/// not cover. A bound at the exchange-rate floor also keeps clear of [`ANCHOR_NOISE`]. See
-/// [`sy_in_limit`].
-const BOUND_MARGIN: U256 = U256::from_limbs([10_000_000_000_000, 0, 0, 0]);
+/// The share of a market edge's bound its limit gives up once it must hold at the execution block,
+/// as a fraction of [`ONE_E18`]: 1%.
+///
+/// The limit is not wei-exact there, on purpose. Next to a bound, whether a trade fills is not
+/// monotone in the index: the router's search, the anchor's `ln` and `exp`, and the SY↔asset
+/// conversions all round, and a limit within about 1e-3 of its bound filled at the checked indices
+/// and reverted at some index between them. No finite set of checked indices covers the rest, so
+/// the limit stays far enough inside that the rounding cannot reach it. A trade a hundredth short
+/// of a market's whole depth already moves its rate to the floor or the cap, so the share given up
+/// is depth no route would use.
+const EXECUTION_HAIRCUT: U256 = U256::from_limbs([10_000_000_000_000_000, 0, 0, 0]);
 
 /// The rounding in a market's rate anchor that a bound at the exchange-rate floor must absorb
-/// once it must hold at the execution block: 100 wei of [`ONE_E18`]. The anchor is recomputed from
-/// the index through `ln` and `exp`, each rounding by a wei or so, and the floor's PT bound,
-/// `total_pt − p·(total_pt + total_asset)` with `p` the sigmoid of `(fee − anchor)·rate_scalar`,
-/// moves by about `total_pt·total_asset / (total_pt + total_asset) · rate_scalar` per unit of
-/// anchor. Near the fee floor, where the bound is a small difference of large reserves, that is
-/// most of it. See [`PendleMarketState::clear_of_anchor_noise`].
-const ANCHOR_NOISE: U256 = U256::from_limbs([100, 0, 0, 0]);
+/// once it must hold at the execution block, beyond [`EXECUTION_HAIRCUT`]: 1e5 wei of
+/// [`ONE_E18`]. The anchor is recomputed from the index through `ln` and `exp`, which round, and
+/// the floor's PT bound, `total_pt − p·(total_pt + total_asset)` with `p` the sigmoid of
+/// `(fee − anchor)·rate_scalar`, moves by about
+/// `total_pt·total_asset / (total_pt + total_asset) · rate_scalar` per unit of anchor. Near the fee
+/// floor, where the bound is a small difference of large reserves, that is most of it. Probes
+/// found errors of a few thousand wei on markets within 1e-13 of the floor; the allowance is
+/// forty times that. Away from the floor the exchange rate clears it by billions of wei even a
+/// second before expiry, so it costs nothing there. See
+/// [`PendleMarketState::clear_of_anchor_noise`].
+const ANCHOR_NOISE: U256 = U256::from_limbs([100_000, 0, 0, 0]);
 
 /// Gas for a swap routed through Router V4.
 ///
@@ -577,10 +586,13 @@ impl ProtocolSim for PendleState {
     /// Each market direction has its own binding constraint and they do not follow from one
     /// another: SY→PT is bounded by the router search's rate floor, SY→YT by the search's bound at
     /// the proportion cap, and PT→SY by the 96% proportion cap itself; each is the largest input
-    /// that fills. YT→SY is the trader's output peak, short of where the sale stops filling. With
-    /// an execution block recorded, an input must also fill at that block, with the index as
-    /// sampled and [`INDEX_DRIFT`] above it, and an edge whose limit is dust there, or whose bound
-    /// the execution block cannot evaluate, reports no depth.
+    /// that fills. YT→SY is the trader's output peak, short of where the sale stops filling.
+    ///
+    /// Without an execution block these are exact. With one recorded, each limit gives up 1% of
+    /// its bound ([`EXECUTION_HAIRCUT`]) and must fill at that block with the index as sampled and
+    /// [`INDEX_DRIFT`] above it: near a bound, rounding makes filling flip with the index, so an
+    /// exact limit there is not reliable a block later. An edge whose limit is dust, or whose
+    /// bound the execution block cannot evaluate, reports no depth.
     ///
     /// A pair this component does not trade — PT against YT, or a token that is not one of its
     /// three — reports **zero depth rather than an error**. A caller enumerating the pairs of a
@@ -616,14 +628,14 @@ impl ProtocolSim for PendleState {
                     return Ok(no_depth());
                 };
 
-                // Each limit is the largest input the edge actually fills: a closed form for the
-                // boundary, checked against the quote, which replicates the router to the wei.
-                // A quote is computed at the sampled block but the swap executes at the execution
-                // block (`apply_block`), where the bounds have moved: the SY-in bounds shrink by
-                // about 1.5e-9 a block, so a limit exact at the sampled block reverts a block
-                // later. An input counts as filling only if it fills at the sampled block and at
-                // the execution block with the index anywhere within `INDEX_DRIFT`, and each
-                // closed form starts from the smallest of them.
+                // Each limit starts from a closed form for the edge's boundary, checked against
+                // the quote, which replicates the router to the wei. Without an execution block
+                // the limit is that boundary, exact. With one (`apply_block`), the swap executes
+                // later than the quote, where the bounds have moved: the SY-in bounds shrink by
+                // about 1.5e-9 a block, and the index may have risen. Each closed form then starts
+                // from the smallest of its values at the sampled block and at the execution block
+                // with the index as sampled and `INDEX_DRIFT` above it, gives up
+                // `EXECUTION_HAIRCUT`, and must still fill at all three.
                 let at_execution = state.at_execution();
                 let states: Vec<&PendleMarketState> = std::iter::once(state)
                     .chain(&at_execution)
@@ -647,8 +659,8 @@ impl ProtocolSim for PendleState {
                 };
                 let for_execution = !at_execution.is_empty();
                 let max_in = match (from, to) {
-                    // The router's search stops at the haircut rate floor, and accepts a request
-                    // up to `eps` above what that bound costs.
+                    // The router's search stops at the haircut rate floor, and without an execution
+                    // block accepts a request up to `eps` above what that bound costs.
                     (MarketToken::Sy, MarketToken::Pt) => {
                         let exact = smallest(&|state| {
                             let (sy_in, pt_out) = approx::max_sy_in_for_pt(
@@ -680,6 +692,7 @@ impl ProtocolSim for PendleState {
                     // market checks it directly: the closed form is the boundary.
                     (MarketToken::Pt, MarketToken::Sy) => {
                         let bound = smallest(&|state| state.max_pt_in())?;
+                        let bound = if for_execution { haircut(bound) } else { bound };
                         if fills(bound) {
                             bound
                         } else {
@@ -704,34 +717,22 @@ impl ProtocolSim for PendleState {
                             smallest(&|state| state.max_pt_out())?,
                             fills,
                         );
-                        // Where the output still rises at the bound, the peak lands on it, so it
-                        // keeps the same margin as the SY-in limits.
-                        let fillable =
-                            if for_execution { inside_bound(fillable) } else { fillable };
+                        // Where the output still rises at the bound, the peak lands on it, so the
+                        // search keeps to the haircut bound.
+                        let fillable = if for_execution { haircut(fillable) } else { fillable };
                         let output = |amount: U256| {
                             state
                                 .amount_out(amount, from, to)
                                 .ok()
                                 .map(|swap| swap.amount_out)
                         };
-                        // Below `fillable` the sale usually fills at every state, so the search
+                        // Within `fillable` the sale fills at every checked state, so the search
                         // follows the sampled state's output alone and checks only its answer.
-                        // Where that answer does not fill, the search runs again over inputs
-                        // that fill everywhere, and finding none reports no depth.
                         let peak = most_output_within(fillable, output);
                         if fills(peak) {
                             peak
                         } else {
-                            let peak = most_output_within(fillable, |amount| {
-                                fills(amount)
-                                    .then(|| output(amount))
-                                    .flatten()
-                            });
-                            if fills(peak) {
-                                peak
-                            } else {
-                                U256::ZERO
-                            }
+                            U256::ZERO
                         }
                     }
                     // PT against YT, or either against itself: not an edge of this market.
@@ -962,7 +963,7 @@ impl PendleMarketState {
     /// `max(SY.exchangeRate(), pyIndexStored)` and stores it. So the market is taken at the
     /// execution block's time with the index as sampled and [`INDEX_DRIFT`] above it. Whether a
     /// trade fills is not monotone in the index near a bound, so these two states alone do not
-    /// cover the indices between them; [`BOUND_MARGIN`] keeps the limits clear of the bound.
+    /// cover the indices between them; [`EXECUTION_HAIRCUT`] keeps the limits clear of the bound.
     fn at_execution(&self) -> Vec<Self> {
         if self.execution_timestamp <= self.rate_sampled_at {
             return Vec::new();
@@ -1179,11 +1180,8 @@ fn unbounded_soft_limit() -> U256 {
 /// The SY-in limit (SY→PT, SY→YT) from `exact`, the input that costs the search's hard bound.
 ///
 /// Without an execution block, the limit is exact: the largest input the search accepts, `eps`
-/// slack included. With one, the request must also fill a block later with the index risen by up
-/// to [`INDEX_DRIFT`], and next to the bound the search's verdict flips back and forth with the
-/// index. So the limit gives up the slack and steps [`BOUND_MARGIN`] inside the bound, about 6e-5
-/// of its size in all. An input there that still fails to fill reports no depth: walking down from
-/// it lands on another such edge. So does one under [`SY_IN_DUST`].
+/// slack included. With one, it is the bound less [`EXECUTION_HAIRCUT`], and reports no depth if
+/// that is under [`SY_IN_DUST`] or does not fill at every checked state.
 fn sy_in_limit(
     exact: U256,
     for_execution: bool,
@@ -1192,8 +1190,8 @@ fn sy_in_limit(
     if !for_execution {
         return Ok(largest_fill(approx::with_eps_slack(exact)?, exact, fills));
     }
-    let inside = inside_bound(exact);
-    Ok(if inside >= SY_IN_DUST && fills(inside) { inside } else { U256::ZERO })
+    let limit = haircut(exact);
+    Ok(if limit >= SY_IN_DUST && fills(limit) { limit } else { U256::ZERO })
 }
 
 /// The least SY, in wei, an SY-in limit must take to hold at the execution block. The search
@@ -1213,9 +1211,12 @@ const SY_IN_DUST: U256 = U256::from_limbs([2_000_000, 0, 0, 0]);
 /// 1e18 is worth many SY wei; a sale paying less than that fails its fill check instead.
 const YT_SALE_DUST: U256 = U256::from_limbs([1_000, 0, 0, 0]);
 
-/// `bound` less [`BOUND_MARGIN`] of it.
-fn inside_bound(bound: U256) -> U256 {
-    bound - bound * BOUND_MARGIN / ONE_E18
+/// `bound` less [`EXECUTION_HAIRCUT`] of it.
+fn haircut(bound: U256) -> U256 {
+    bound -
+        bound
+            .saturating_mul(EXECUTION_HAIRCUT)
+            .div_ceil(ONE_E18)
 }
 
 /// The largest input a market edge fills, found from `candidate`, a closed form for the edge's

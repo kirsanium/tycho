@@ -1114,7 +1114,7 @@ fn assert_limit_holds_at_rises(
 
 /// A YT sale whose output still rises at the fill bound has its peak on the bound, where whether it
 /// fills flips with the index: here, PT at the 96% cap 75 s before expiry, a 1e-12 rise in the
-/// index puts the exchange rate below par. The limit keeps `BOUND_MARGIN` from the bound.
+/// index puts the exchange rate below par. The limit keeps `EXECUTION_HAIRCUT` from the bound.
 #[test]
 fn a_yt_sale_whose_peak_is_its_bound_holds_at_execution() {
     let market = shaped_market(
@@ -1132,7 +1132,7 @@ fn a_yt_sale_whose_peak_is_its_bound_holds_at_execution() {
 /// Next to the router search's bound, whether a request fills flips with the index, so an SY-in
 /// limit there fails at some index between the checked states: here the reference market at a
 /// 95.99% PT proportion, a minute before expiry, with the index 1e-6 higher. The limit keeps
-/// `BOUND_MARGIN` from the bound.
+/// `EXECUTION_HAIRCUT` from the bound.
 #[test]
 fn an_sy_in_limit_keeps_clear_of_the_search_bound() {
     let market = shaped_market(
@@ -1174,6 +1174,30 @@ fn a_yt_sale_paying_dust_has_no_depth_at_execution() {
         (YT, SY),
         &[50_000, 200_000, 257_739, 297_958],
     );
+}
+
+/// With an execution block recorded, a limit gives up a hundredth of its bound rather than sit on
+/// it, where rounding makes filling flip with the index. Without one it stays exact.
+#[test]
+fn an_execution_limit_gives_up_a_hundredth_of_the_bound() {
+    let PendleState::Market(market) = wsteth_market(0) else { unreachable!() };
+    let sampled = PendleState::Market(PendleMarketState {
+        rate_sampled_at: 1_787_273_051,
+        head_timestamp: 1_787_273_051,
+        ..market
+    });
+    let mut later = sampled.clone();
+    later.apply_block(&BlockContext::new(1, 1_787_273_063));
+    for (from, to) in [(SY, PT), (PT, SY), (SY, YT)] {
+        let (from, to) = (Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap());
+        let (exact, _) = sampled
+            .get_limits(from.clone(), to.clone())
+            .unwrap();
+        let (held, _) = later.get_limits(from, to).unwrap();
+        let share = u256_to_f64(biguint_to_u256(&held)).unwrap() /
+            u256_to_f64(biguint_to_u256(&exact)).unwrap();
+        assert!((0.989..0.991).contains(&share), "{share}");
+    }
 }
 
 /// What a YT sale pays at the sampled block says nothing about what it pays at the execution block:
@@ -1226,7 +1250,8 @@ fn an_sy_in_limit_of_dust_has_no_depth_at_execution() {
 /// Where the implied rate sits on the fee floor, SY→PT's whole depth is a small difference of the
 /// reserves, which a wei of rounding in the rate anchor moves by a large share. Here, 2.3 days and
 /// 10 hours before expiry, the bound swings by up to a thousandth as the index rises 4e-11 and
-/// 1e-9, ten to a hundred times `BOUND_MARGIN`. The limit keeps clear of `ANCHOR_NOISE`.
+/// 1e-9. `EXECUTION_HAIRCUT` covers that much; `ANCHOR_NOISE` covers a market whose whole
+/// depth is a smaller difference still.
 #[rstest::rstest]
 #[case::days_before_expiry(
     [
@@ -1251,6 +1276,18 @@ fn an_sy_in_limit_of_dust_has_no_depth_at_execution() {
         "1348676432448877568",
     ],
     1_830_088_382
+)]
+#[case::bought_down_to_the_floor(
+    [
+        "2313564182338614136302202",
+        "7687924261069278625891",
+        "91846189217668539",
+        "91846189217662944",
+        "1117110417598502912",
+        "3",
+        "518161302992038167852",
+    ],
+    1_737_746_720
 )]
 fn an_sy_in_limit_at_the_fee_floor_holds_at_execution(
     #[case] shape: [&str; 7],
