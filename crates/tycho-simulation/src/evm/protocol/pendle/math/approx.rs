@@ -263,12 +263,21 @@ pub fn calc_max_pt_out(comp: &MarketPreCompute, total_pt: I256) -> PendleResult<
 /// Selling YT borrows PT from the market outside the router's search, so this, not the haircut
 /// one, is that edge's bound. The closed form rounds, so it can land a little either side of the
 /// exact boundary.
+///
+/// Zero when the closed form goes negative: a market whose implied rate is at or below its fee
+/// rate is already past the point where PT can leave it at par, so no PT can be bought. The
+/// contract reverts there too; reporting no room keeps it a trade too large rather than a broken
+/// state.
 pub fn calc_max_pt_out_unhaircut(comp: &MarketPreCompute, total_pt: I256) -> PendleResult<U256> {
     let logit_p =
         log_exp_math::exp(pmath::mul_down_i(comp.fee_rate - comp.rate_anchor, comp.rate_scalar)?)?;
     let proportion = pmath::div_down_i(logit_p, logit_p + i_one())?;
     let numerator = pmath::mul_down_i(proportion, total_pt + comp.total_asset)?;
-    pmath::to_u256(total_pt - numerator)
+    let room = total_pt - numerator;
+    if room.is_negative() {
+        return Ok(U256::ZERO);
+    }
+    pmath::to_u256(room)
 }
 
 /// The largest exact input the search accepts, given the input that costs exactly its hard

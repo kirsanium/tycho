@@ -25,9 +25,9 @@ use super::{
     clock::NEVER_SAMPLED,
     math::market::MarketState,
     state::{
-        attribute_i256, attribute_u256, class_attribute_token, Direction, PendleMarketState,
-        PendleState, PendleSyState, TokenClass, ValueTooWide, PAUSED, SY_PAUSED, SY_SUPPLY_CAP,
-        SY_TOTAL_SUPPLY, YIELD_TOKEN,
+        attribute_i256, attribute_u256, class_attribute_token, u256_from_be, Direction,
+        PendleMarketState, PendleState, PendleSyState, TokenClass, ValueTooWide, PAUSED, SY_PAUSED,
+        SY_SUPPLY_CAP, SY_TOTAL_SUPPLY, YIELD_TOKEN,
     },
 };
 use crate::protocol::{
@@ -240,10 +240,10 @@ fn decode_sy(
             .state
             .balances
             .get(token)
-            .map(|balance| U256::from_be_slice(balance))
+            .and_then(|balance| u256_from_be(balance, YIELD_TOKEN).ok())
     });
 
-    Ok(PendleSyState {
+    let mut sy = PendleSyState {
         sy_address,
         total_supply,
         paused,
@@ -258,7 +258,10 @@ fn decode_sy(
         asset_decimals,
         tokens_in,
         tokens_out,
-    })
+        holding_backs_supply: false,
+    };
+    sy.judge_holding();
+    Ok(sy)
 }
 
 /// Reads a rate and the block timestamp it was read at, which the refresh emits together.
@@ -460,6 +463,21 @@ mod tests {
             panic!("not an SY")
         };
         assert_eq!((bare.supply_cap, bare.yield_token, bare.yield_token_held), (None, None, None));
+    }
+
+    /// A snapshot balance past 256 bits is malformed: the SY still decodes, with its holding
+    /// unknown.
+    #[tokio::test]
+    async fn a_malformed_snapshot_balance_leaves_the_holding_unknown() {
+        let mut sy = created_sy();
+        sy.component
+            .static_attributes
+            .insert(YIELD_TOKEN.to_string(), address_bytes(WSTETH));
+        sy.state
+            .balances
+            .insert(address_bytes(WSTETH), Bytes::from(vec![0x01; 33]));
+        let PendleState::Sy(state) = decode(sy).await.unwrap() else { panic!("not an SY") };
+        assert_eq!(state.yield_token_held, None);
     }
 
     /// Supply bounds every redemption, so an SY without it cannot be decoded.

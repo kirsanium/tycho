@@ -169,6 +169,10 @@ pub struct PendleSyState {
     /// reports. It follows transfers, so a rebasing yield token's balance lags its rebases.
     #[serde(default)]
     pub yield_token_held: Option<U256>,
+    /// Whether the SY pays a redemption to its yield token out of what it holds of it, judged from
+    /// the stream's state (see [`PendleSyState::judge_holding`]) and kept across quotes.
+    #[serde(default)]
+    pub holding_backs_supply: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -624,18 +628,34 @@ impl ProtocolSim for PendleState {
                     // Selling PT hands PT *to* the market, so the 96% proportion cap binds, and the
                     // market checks it directly: the closed form is the boundary.
                     (MarketToken::Pt, MarketToken::Sy) => state.max_pt_in()?,
-                    // Selling YT flash-*borrows* PT from the market, outside the router's search,
-                    // so the market's own rate floor binds without the search's haircut. Close to
-                    // expiry, repaying the borrowed PT can bind first; the walk finds whichever.
+                    // Selling YT flash-*borrows* PT from the market and buys it back, fee included,
+                    // so each extra YT pays less, and past some size it pays nothing or costs SY:
+                    // the trader's output peaks well before the market's rate floor stops the
+                    // trade. The limit is that peak, searched for within what fills; a larger
+                    // sale executes but returns less.
                     (MarketToken::Yt, MarketToken::Sy) => {
-                        largest_fill(state.max_pt_out_unhaircut()?, state.max_pt_out()?, fills)
+                        let fillable =
+                            largest_fill(state.max_pt_out_unhaircut()?, state.max_pt_out()?, fills);
+                        most_output_within(fillable, |amount| {
+                            state
+                                .amount_out(amount, from, to)
+                                .ok()
+                                .map(|swap| swap.amount_out)
+                        })
                     }
                     // PT against YT, or either against itself: not an edge of this market.
                     _ => return Ok(no_depth()),
                 };
+                if max_in.is_zero() {
+                    return Ok(no_depth());
+                }
                 let max_out = state
                     .amount_out(max_in, from, to)?
                     .amount_out;
+                // An input that fills but yields nothing is no depth, not a trade.
+                if max_out.is_zero() {
+                    return Ok(no_depth());
+                }
                 Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
             }
             PendleState::Sy(state) => {
@@ -694,6 +714,7 @@ impl ProtocolSim for PendleState {
             PendleState::Sy(state) => {
                 state.apply(&delta)?;
                 state.apply_balances(balances);
+                state.judge_holding();
                 Ok(())
             }
         }
@@ -873,15 +894,33 @@ impl PendleSyState {
         let (Some(yield_token), Some(held)) = (&self.yield_token, self.yield_token_held) else {
             return Ok(supply);
         };
-        if token != yield_token {
+        if token != yield_token || !self.holding_backs_supply {
             return Ok(supply);
         }
         let convert = |amount: U256| self.convert(amount, class, Direction::Redeem, token_decimals);
-        let payout = convert(supply)?;
-        if held >= payout || held < payout - payout / U256::from(1000) {
-            return Ok(supply);
-        }
         largest_input_within(held, supply, convert)
+    }
+
+    /// Judges whether the SY pays a redemption to its yield token out of its holding: it does when
+    /// the holding covers at least 999/1000 of what redeeming the whole supply pays. An SY that
+    /// keeps its yield token in a staking contract holds little of it and pays from there.
+    ///
+    /// Judged on the stream's state only, at decode and on each delta. A quote burns supply and
+    /// pays out of the holding, which leaves the shortfall as it was but makes it a larger share
+    /// of what remains; judging again there would flip an SY that is a few wei short to "pays from
+    /// elsewhere" and report more than it holds.
+    pub(super) fn judge_holding(&mut self) {
+        self.holding_backs_supply = (|| {
+            let yield_token = self.yield_token.as_ref()?;
+            let held = self.yield_token_held?;
+            let class = *self.tokens_out.get(yield_token)?;
+            let token_decimals = *self.token_decimals.get(yield_token)?;
+            let payout = self
+                .convert(self.total_supply, class, Direction::Redeem, token_decimals)
+                .ok()?;
+            Some(held >= payout - payout / U256::from(1000))
+        })()
+        .unwrap_or(false);
     }
 
     /// The SY a deposit can still mint before the supply cap; `None` for an uncapped SY.
@@ -902,7 +941,9 @@ impl PendleSyState {
             return;
         };
         if let Some(balance) = component.get(yield_token) {
-            self.yield_token_held = Some(U256::from_be_slice(balance));
+            // A balance past 256 bits is malformed; the holding is then unknown and supply alone
+            // bounds a redemption.
+            self.yield_token_held = u256_from_be(balance, "yield token balance").ok();
         }
     }
 
@@ -1027,6 +1068,50 @@ fn largest_input_within(
         }
     }
     Ok(within)
+}
+
+/// The input in `[0, upper]` that yields the most output, for an edge whose output rises with the
+/// input and then falls, as selling YT does once buying back the borrowed PT costs more than the
+/// PY it frees.
+///
+/// A golden-section search over the quote, which reuses one evaluation per step, stopped once the
+/// range is a hundred-thousandth of `upper`: the output is flat at its peak, so a closer input
+/// changes it by far less. An input that does not quote counts as no output. Returns the best
+/// input it evaluated, so the result always quotes, or zero when nothing in the range yields
+/// anything.
+fn most_output_within(upper: U256, output: impl Fn(U256) -> Option<U256>) -> U256 {
+    // 1 / golden ratio, to six places.
+    let section =
+        |low: U256, high: U256| (high - low) * U256::from(618_034u32) / U256::from(1_000_000u32);
+    let mut best = (U256::ZERO, U256::ZERO);
+    let mut evaluate = |amount: U256| {
+        let out = output(amount).unwrap_or(U256::ZERO);
+        if out > best.1 {
+            best = (amount, out);
+        }
+        out
+    };
+    evaluate(upper);
+    let tolerance = (upper / U256::from(100_000u32)).max(U256::from(3u8));
+    let (mut low, mut high) = (U256::ZERO, upper);
+    let (mut left, mut right) = (high - section(low, high), low + section(low, high));
+    let (mut left_out, mut right_out) = (evaluate(left), evaluate(right));
+    while high - low > tolerance && left < right {
+        if left_out < right_out {
+            low = left;
+            left = right;
+            left_out = right_out;
+            right = low + section(low, high);
+            right_out = evaluate(right);
+        } else {
+            high = right;
+            right = left;
+            right_out = left_out;
+            left = high - section(low, high);
+            left_out = evaluate(left);
+        }
+    }
+    best.0
 }
 
 /// What `get_limits` reports for a pair this component cannot trade.

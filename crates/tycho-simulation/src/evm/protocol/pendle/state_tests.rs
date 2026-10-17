@@ -92,6 +92,7 @@ fn wsteth_sy() -> PendleState {
         supply_cap: None,
         yield_token: Some(Bytes::from_str(WSTETH).unwrap()),
         yield_token_held: Some(u("3248104473502927520625")),
+        holding_backs_supply: true,
     })
 }
 
@@ -121,6 +122,7 @@ fn six_decimal_asset_sy() -> PendleState {
         supply_cap: None,
         yield_token: None,
         yield_token_held: None,
+        holding_backs_supply: false,
     })
 }
 
@@ -660,9 +662,10 @@ fn an_sy_ignores_the_execution_block() {
     assert_eq!(state, before);
 }
 
-/// Each market limit is the largest input the edge fills, not a bound safely below it: the limit
-/// fills, and anything a billionth past it is refused as too large, never as a broken state. The
-/// two SY-in edges are exact to the wei. Checked from four years out to a minute before expiry.
+/// The SY-in and PT-in market limits are the largest input the edge fills, not a bound safely
+/// below it: the limit fills, and anything a billionth past it is refused as too large, never as a
+/// broken state. The two SY-in edges are exact to the wei. Checked from four years out to a minute
+/// before expiry. Selling YT is checked against its output peak instead, below.
 #[test]
 fn market_limits_are_the_largest_input_that_fills() {
     let expiry = 1_830_124_800u64;
@@ -673,7 +676,7 @@ fn market_limits_are_the_largest_input_that_fills() {
         wsteth_market_at_block_25_800_000(),
     ];
     for state in &states {
-        for (from, to) in [(SY, PT), (PT, SY), (SY, YT), (YT, SY)] {
+        for (from, to) in [(SY, PT), (PT, SY), (SY, YT)] {
             let (token_in, token_out) = (token(from, 18), token(to, 18));
             let quote =
                 |amount: &BigUint| state.get_amount_out(amount.clone(), &token_in, &token_out);
@@ -692,8 +695,39 @@ fn market_limits_are_the_largest_input_that_fills() {
     }
 }
 
-/// Close to expiry, selling YT just past its depth fails on repaying the borrowed PT rather than on
-/// the market's rate floor. That is the caller's amount being too large, not a broken state.
+/// Selling YT borrows PT and buys it back, fee included, so the trader's output peaks well before
+/// the market stops the trade, and every YT past the peak returns less. The limit is that peak: it
+/// pays something even a day before expiry, and selling a hundredth more or less pays no more.
+#[test]
+fn the_yt_sale_limit_is_its_output_peak() {
+    let expiry = 1_830_124_800u64;
+    for state in [
+        wsteth_market(1_700_000_000),
+        wsteth_market(expiry - 86_400),
+        wsteth_market(expiry - 60),
+        wsteth_market_at_block_25_800_000(),
+    ] {
+        let (yt, sy) = (token(YT, 18), token(SY, 18));
+        let quote = |amount: &BigUint| {
+            state
+                .get_amount_out(amount.clone(), &yt, &sy)
+                .map(|r| r.amount)
+        };
+        let (max_in, max_out) = state
+            .get_limits(yt.address.clone(), sy.address.clone())
+            .unwrap();
+        assert!(max_out > BigUint::ZERO, "the peak pays something");
+        assert_eq!(quote(&max_in).unwrap(), max_out);
+        let step = &max_in / 100u32;
+        for neighbour in [&max_in - &step, &max_in + &step] {
+            let out = quote(&neighbour).unwrap_or_default();
+            assert!(out <= max_out, "{neighbour} pays {out}, more than the peak's {max_out}");
+        }
+    }
+}
+
+/// Close to expiry, selling YT just past what fills fails on repaying the borrowed PT rather than
+/// on the market's rate floor. That is the caller's amount being too large, not a broken state.
 #[test]
 fn selling_yt_just_past_its_depth_is_invalid_input() {
     let expiry = 1_830_124_800u64;
@@ -704,10 +738,12 @@ fn selling_yt_just_past_its_depth_is_invalid_input() {
                 .get_amount_out(amount.clone(), &yt, &sy)
                 .is_ok()
         };
+        // The limit is the output peak; what fills runs further, up to where repaying fails.
         let (mut fill, _) = state
             .get_limits(yt.address.clone(), sy.address.clone())
             .unwrap();
-        let mut refuse = &fill + &fill / 1_000_000_000u32 + 1u32;
+        let mut refuse = &fill * 2u32;
+        assert!(!fills(&refuse));
         while &refuse - &fill > BigUint::from(1u32) {
             let mid = (&fill + &refuse) / 2u32;
             if fills(&mid) {
@@ -726,6 +762,8 @@ fn selling_yt_just_past_its_depth_is_invalid_input() {
 fn with_sy(state: PendleState, change: impl FnOnce(&mut PendleSyState)) -> PendleState {
     let PendleState::Sy(mut sy) = state else { panic!("not an SY") };
     change(&mut sy);
+    // As the stream would after the change.
+    sy.judge_holding();
     PendleState::Sy(sy)
 }
 
@@ -867,6 +905,85 @@ fn the_yield_token_holding_follows_balances_and_quotes() {
             .yield_token_held
             .map(|h| h + U256::from(5u8))
     );
+}
+
+/// A market whose implied rate is at or below its fee rate cannot sell PT at par, so the PT bound
+/// is negative. The contract reverts there, and so do the quotes, but as a trade too large and with
+/// no depth on the edges that take PT out, never as a broken state that drops the market.
+#[test]
+fn a_market_below_its_fee_rate_reports_no_depth_where_pt_cannot_leave() {
+    let PendleState::Market(mut market) = wsteth_market(1_700_000_000) else { unreachable!() };
+    market.market.last_ln_implied_rate = u("400000000000000");
+    market.market.ln_fee_rate_root = u("5000000000000000");
+    let state = PendleState::Market(market);
+    for (from, to) in [(SY, PT), (PT, SY), (SY, YT), (YT, SY)] {
+        let limits = state
+            .get_limits(Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap())
+            .unwrap_or_else(|e| panic!("{from}->{to} limits: {e:?}"));
+        if matches!((from, to), (SY, PT) | (YT, SY)) {
+            assert_eq!(limits, (BigUint::ZERO, BigUint::ZERO), "{from}->{to}");
+        }
+        if let Err(error) =
+            state.get_amount_out(BigUint::from(10u64.pow(15)), &token(from, 18), &token(to, 18))
+        {
+            assert!(matches!(error, SimulationError::InvalidInput(..)), "{from}->{to}: {error:?}");
+        }
+    }
+}
+
+/// Whether the SY pays a redemption from its holding is judged on the stream's state and kept
+/// across quotes. A quote that burns most of the supply leaves the shortfall where it was but a
+/// larger share of what remains; judging again would fall back to supply and report more than the
+/// SY holds.
+#[test]
+fn a_chained_redemption_stays_bounded_by_the_holding() {
+    let state = with_sy(wsteth_sy(), |sy| {
+        sy.yield_token_held = Some(sy.total_supply - u("1000000000000000000"));
+    });
+    let (sy, wsteth) = (Bytes::from_str(SY).unwrap(), Bytes::from_str(WSTETH).unwrap());
+    let after = state
+        .get_amount_out(
+            BigUint::from(3000u32) * BigUint::from(10u64.pow(18)),
+            &token(SY, 18),
+            &token(WSTETH, 18),
+        )
+        .unwrap()
+        .new_state;
+    let PendleState::Sy(chained) = after
+        .as_any()
+        .downcast_ref::<PendleState>()
+        .unwrap()
+        .clone()
+    else {
+        unreachable!()
+    };
+    let (max_in, _) = after.get_limits(sy, wsteth).unwrap();
+    assert_eq!(max_in, u256_to_biguint(chained.yield_token_held.unwrap()));
+}
+
+/// A component balance past 256 bits is malformed. It leaves the holding unknown, so supply alone
+/// bounds a redemption, rather than panicking.
+#[test]
+fn a_malformed_balance_leaves_the_holding_unknown() {
+    let mut state = wsteth_sy();
+    let balances = Balances {
+        component_balances: HashMap::from([(
+            SY.to_string(),
+            HashMap::from([(Bytes::from_str(WSTETH).unwrap(), Bytes::from(vec![0x01; 33]))]),
+        )]),
+        account_balances: HashMap::new(),
+    };
+    let nothing = ProtocolStateDelta {
+        component_id: SY.to_string(),
+        updated_attributes: HashMap::new(),
+        deleted_attributes: Default::default(),
+    };
+    state
+        .delta_transition(nothing, &HashMap::new(), &balances)
+        .unwrap();
+    let PendleState::Sy(inner) = &state else { unreachable!() };
+    assert_eq!(inner.yield_token_held, None);
+    assert!(!inner.holding_backs_supply);
 }
 
 /// PT against YT is not a market edge: minting and redeeming PY is the yield token's business, and
