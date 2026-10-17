@@ -986,6 +986,31 @@ fn a_malformed_balance_leaves_the_holding_unknown() {
     assert!(!inner.holding_backs_supply);
 }
 
+/// A swap executes a block after it is quoted, where the bounds have moved. With the execution
+/// block recorded, every market limit still fills when the market is evaluated at that block.
+#[test]
+fn market_limits_still_fill_at_the_execution_block() {
+    let expiry = 1_830_124_800u64;
+    for sampled in [1_700_000_000u64, 1_787_273_051, expiry - 86_400] {
+        let mut state = wsteth_market(sampled);
+        state.apply_block(&BlockContext::new(1, sampled + 12));
+        let PendleState::Market(mut later) = wsteth_market(sampled) else { unreachable!() };
+        later.rate_sampled_at = sampled + 12;
+        later.head_timestamp = sampled + 12;
+        let later = PendleState::Market(later);
+        for (from, to) in [(SY, PT), (PT, SY), (SY, YT), (YT, SY)] {
+            let (max_in, _) = state
+                .get_limits(Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap())
+                .unwrap();
+            later
+                .get_amount_out(max_in.clone(), &token(from, 18), &token(to, 18))
+                .unwrap_or_else(|e| {
+                    panic!("{from}->{to} at {sampled}: {max_in} fails later: {e:?}")
+                });
+        }
+    }
+}
+
 /// PT against YT is not a market edge: minting and redeeming PY is the yield token's business, and
 /// SY is one side of every market swap.
 #[test]

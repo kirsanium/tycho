@@ -25,9 +25,9 @@ use super::{
     clock::NEVER_SAMPLED,
     math::market::MarketState,
     state::{
-        attribute_i256, attribute_u256, class_attribute_token, u256_from_be, Direction,
-        PendleMarketState, PendleState, PendleSyState, TokenClass, ValueTooWide, PAUSED, SY_PAUSED,
-        SY_SUPPLY_CAP, SY_TOTAL_SUPPLY, YIELD_TOKEN,
+        attribute_i256, attribute_reserve, attribute_u256, class_attribute_token, u256_from_be,
+        Direction, PendleMarketState, PendleState, PendleSyState, TokenClass, ValueTooWide, PAUSED,
+        SY_PAUSED, SY_SUPPLY_CAP, SY_TOTAL_SUPPLY, YIELD_TOKEN,
     },
 };
 use crate::protocol::{
@@ -113,8 +113,8 @@ fn decode_market(
 
     // Written only from Mint, Burn, Swap and UpdateImpliedRate, so a market that has not seen its
     // first liquidity yet carries none of them. The contract's storage is zero at that point too.
-    let total_pt = attribute_i256(state, ATTR_TOTAL_PT)?.unwrap_or(I256::ZERO);
-    let total_sy = attribute_i256(state, ATTR_TOTAL_SY)?.unwrap_or(I256::ZERO);
+    let total_pt = attribute_reserve(state, ATTR_TOTAL_PT)?.unwrap_or(I256::ZERO);
+    let total_sy = attribute_reserve(state, ATTR_TOTAL_SY)?.unwrap_or(I256::ZERO);
     let last_ln_implied_rate =
         attribute_u256(state, ATTR_LAST_LN_IMPLIED_RATE)?.unwrap_or(U256::ZERO);
     let ln_fee_rate_root = attribute_u256(state, ATTR_LN_FEE_RATE_ROOT)?
@@ -478,6 +478,37 @@ mod tests {
             .insert(address_bytes(WSTETH), Bytes::from(vec![0x01; 33]));
         let PendleState::Sy(state) = decode(sy).await.unwrap() else { panic!("not an SY") };
         assert_eq!(state.yield_token_held, None);
+    }
+
+    /// A reserve is never negative. The indexer's balance aggregation hands back an unsigned
+    /// magnitude, and 10e18 in that form, `0x8ac7…`, has its top bit set: it must decode positive,
+    /// as the signed form `0x008ac7…` does, in a snapshot and in a delta.
+    #[tokio::test]
+    async fn a_reserve_with_its_top_bit_set_decodes_positive() {
+        let ten = U256::from(10_000_000_000_000_000_000u64);
+        for raw in ["8ac7230489e80000", "008ac7230489e80000"] {
+            let bytes = Bytes::from(hex::decode(raw).unwrap());
+            let mut market = created_market();
+            market
+                .state
+                .attributes
+                .insert(ATTR_TOTAL_SY.to_string(), bytes.clone());
+            let PendleState::Market(decoded) = decode(market).await.unwrap() else {
+                panic!("not a market")
+            };
+            assert_eq!(decoded.market.total_sy, I256::try_from(ten).unwrap(), "{raw}");
+
+            let mut state = decode(created_market()).await.unwrap();
+            state
+                .delta_transition(
+                    delta(MARKET, vec![(ATTR_TOTAL_PT, bytes)]),
+                    &HashMap::new(),
+                    &Balances::default(),
+                )
+                .unwrap();
+            let PendleState::Market(moved) = state else { panic!("not a market") };
+            assert_eq!(moved.market.total_pt, I256::try_from(ten).unwrap(), "{raw}");
+        }
     }
 
     /// Supply bounds every redemption, so an SY without it cannot be decoded.

@@ -653,6 +653,18 @@ mod tests {
 
     /// The reported maximum is a size the search actually fills — checked by running the search at
     /// it, not by trusting the derivation. A bound that cannot be filled is worse than no bound.
+    /// On a market whose accounting asset has fewer decimals than the SY, one PT unit costs far
+    /// more SY wei than the search's `eps` window spans, so a small exact-SY-in request cannot land
+    /// inside it and the search exhausts. The router reverts the same way.
+    #[test]
+    fn a_small_request_on_a_coarse_asset_exhausts_the_search() {
+        let (market, index) = market_for("reusd");
+        let error =
+            approx_swap_exact_sy_for_pt(&market, index, u("1000000000000000"), 1_700_000_000)
+                .unwrap_err();
+        assert!(matches!(error, PendleError::ApproxExhausted { .. }), "{error:?}");
+    }
+
     #[test]
     fn the_reported_maximum_is_actually_fillable() {
         let market = wsteth_market();

@@ -438,17 +438,6 @@ impl ProtocolSim for PendleState {
         }
     }
 
-    /// The amount of `quote` needed to buy one unit of `base`.
-    ///
-    /// Quoted by **spending `quote` to buy `base`**, which is what the trait asks for. That
-    /// direction matters here beyond arithmetic: an SY's entry and exit token lists are not the
-    /// same set. SY-wstETH accepts WETH as a deposit but will not redeem to it, so pricing SY in
-    /// WETH is answerable only from the buying side — asking what selling SY yields in WETH has no
-    /// answer at all.
-    ///
-    /// Priced off a real trade rather than a closed form, so the number agrees with what a caller
-    /// would actually get, fee included. One whole unit of `quote` is small against every live
-    /// market's depth.
     /// The price of `base` in `quote`, from the buying side as the trait defines it: what a small
     /// trade of `quote` into `base` pays per unit.
     ///
@@ -456,6 +445,9 @@ impl ProtocolSim for PendleState {
     /// redemption the SY holds nothing for has no depth, while the other direction trades. When
     /// buying `base` does not quote, the price comes from selling it instead, as `quote` received
     /// per unit of `base`. A wrap edge charges no fee, so the two sides give the same price.
+    ///
+    /// Priced off a real trade rather than a closed form, so the number agrees with what a caller
+    /// would actually get, fee included.
     fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
         match self.marginal_rate(quote, base) {
             Ok(base_per_quote) => Ok(1.0 / base_per_quote),
@@ -559,10 +551,10 @@ impl ProtocolSim for PendleState {
     /// The largest trade that will not revert, per direction.
     ///
     /// Each market direction has its own binding constraint and they do not follow from one
-    /// another: SY→PT is bounded by the rate floor, PT→SY by the 96% proportion cap, and the YT
-    /// legs by the same cap mapped through the flash-swap identity. The SY→PT and SY→YT bounds are
-    /// obtained by inverting the router's own search bound, so the reported input is one the search
-    /// actually fills.
+    /// another: SY→PT is bounded by the router search's rate floor, SY→YT by the search's bound at
+    /// the proportion cap, and PT→SY by the 96% proportion cap itself; each is the largest input
+    /// that fills. YT→SY is the trader's output peak, short of where the sale stops filling. With
+    /// an execution block recorded, an input must fill at both that block and the sampled one.
     ///
     /// A pair this component does not trade — PT against YT, or a token that is not one of its
     /// three — reports **zero depth rather than an error**. A caller enumerating the pairs of a
@@ -600,43 +592,71 @@ impl ProtocolSim for PendleState {
 
                 // Each limit is the largest input the edge actually fills: a closed form for the
                 // boundary, checked against the quote, which replicates the router to the wei.
+                // A quote is computed at the sampled block but the swap executes at the execution
+                // block (`apply_block`), where the bounds have moved: the SY-in bounds shrink by
+                // about 1.5e-9 a block, so a limit exact at the sampled block reverts a block
+                // later. An input counts as filling only if it fills at both, and each closed form
+                // starts from the smaller of the two.
+                let at_execution = state.at_execution();
+                let states = [Some(state), at_execution.as_ref()];
                 let fills = |amount: U256| {
-                    state
-                        .amount_out(amount, from, to)
-                        .is_ok()
+                    states.iter().flatten().all(|state| {
+                        state
+                            .amount_out(amount, from, to)
+                            .is_ok()
+                    })
+                };
+                let smallest = |bound: &dyn Fn(&PendleMarketState) -> Result<U256, PendleError>| {
+                    states
+                        .iter()
+                        .flatten()
+                        .map(|state| bound(state))
+                        .try_fold(U256::MAX, |smallest, bound| bound.map(|b| smallest.min(b)))
                 };
                 let max_in = match (from, to) {
                     // The router's search stops at the haircut rate floor, and accepts a request
                     // up to `eps` above what that bound costs.
                     (MarketToken::Sy, MarketToken::Pt) => {
-                        let (exact, _) = approx::max_sy_in_for_pt(
-                            &state.market,
-                            state.py_index,
-                            state.quote_time(),
-                        )?;
+                        let exact = smallest(&|state| {
+                            approx::max_sy_in_for_pt(
+                                &state.market,
+                                state.py_index,
+                                state.quote_time(),
+                            )
+                            .map(|(sy_in, _)| sy_in)
+                        })?;
                         largest_fill(approx::with_eps_slack(exact)?, exact, fills)
                     }
                     // The same search, bounded by the proportion cap the minted PT is sold into.
                     (MarketToken::Sy, MarketToken::Yt) => {
-                        let (exact, _) = approx::max_sy_in_for_yt(
-                            &state.market,
-                            state.py_index,
-                            state.quote_time(),
-                        )?;
+                        let exact = smallest(&|state| {
+                            approx::max_sy_in_for_yt(
+                                &state.market,
+                                state.py_index,
+                                state.quote_time(),
+                            )
+                            .map(|(sy_in, _)| sy_in)
+                        })?;
                         largest_fill(approx::with_eps_slack(exact)?, exact, fills)
                     }
                     // Selling PT hands PT *to* the market, so the 96% proportion cap binds, and the
                     // market checks it directly: the closed form is the boundary.
-                    (MarketToken::Pt, MarketToken::Sy) => state.max_pt_in()?,
+                    (MarketToken::Pt, MarketToken::Sy) => smallest(&|state| state.max_pt_in())?,
                     // Selling YT flash-*borrows* PT from the market and buys it back, fee included,
                     // so each extra YT pays less, and past some size it pays nothing or costs SY:
                     // the trader's output peaks well before the market's rate floor stops the
                     // trade. The limit is that peak, searched for within what fills; a larger
                     // sale executes but returns less.
                     (MarketToken::Yt, MarketToken::Sy) => {
-                        let fillable =
-                            largest_fill(state.max_pt_out_unhaircut()?, state.max_pt_out()?, fills);
+                        let fillable = largest_fill(
+                            smallest(&|state| state.max_pt_out_unhaircut())?,
+                            smallest(&|state| state.max_pt_out())?,
+                            fills,
+                        );
                         most_output_within(fillable, |amount| {
+                            if !fills(amount) {
+                                return None;
+                            }
                             state
                                 .amount_out(amount, from, to)
                                 .ok()
@@ -838,6 +858,14 @@ impl PendleMarketState {
     fn max_pt_out(&self) -> Result<U256, PendleError> {
         let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
         approx::calc_max_pt_out(&comp, self.market.total_pt)
+    }
+
+    /// The same market evaluated at the execution block's time, when `apply_block` has recorded one
+    /// later than the sampled block; `None` otherwise. Only the clock moves: the curve and the rate
+    /// stay as sampled.
+    fn at_execution(&self) -> Option<Self> {
+        (self.execution_timestamp > self.rate_sampled_at)
+            .then(|| Self { rate_sampled_at: self.execution_timestamp, ..self.clone() })
     }
 
     /// The most PT the market itself will send out before its exchange rate falls below par.
@@ -1149,6 +1177,22 @@ impl From<ValueTooWide> for TransitionError {
     }
 }
 
+/// Reads a market reserve, which is never negative.
+///
+/// Read unsigned and then narrowed, so it decodes whether the indexer wrote signed bytes or the
+/// unsigned magnitude its balance aggregation produces. A signed read takes a magnitude whose top
+/// bit is set as negative: 10e18 is `0x8ac7…`. A reserve of 2^255 or more cannot be one.
+pub(super) fn attribute_reserve(
+    attributes: &HashMap<String, Bytes>,
+    name: &str,
+) -> Result<Option<I256>, ValueTooWide> {
+    let Some(raw) = attributes.get(name) else { return Ok(None) };
+    let value = u256_from_be(raw, name)?;
+    I256::try_from(value)
+        .map(Some)
+        .map_err(|_| ValueTooWide { name: name.to_string(), len: raw.len() })
+}
+
 /// Reads a big-endian unsigned value, which may carry leading zero bytes past 32: the indexer
 /// writes unsigned values with `to_signed_bytes_be`, so anything at or above 2^255 arrives as 33
 /// bytes with a leading zero.
@@ -1193,10 +1237,10 @@ pub(super) fn attribute_i256(
 impl PendleMarketState {
     fn apply(&mut self, delta: &ProtocolStateDelta) -> Result<(), TransitionError> {
         let attributes = &delta.updated_attributes;
-        if let Some(value) = attribute_i256(attributes, "total_pt")? {
+        if let Some(value) = attribute_reserve(attributes, "total_pt")? {
             self.market.total_pt = value;
         }
-        if let Some(value) = attribute_i256(attributes, "total_sy")? {
+        if let Some(value) = attribute_reserve(attributes, "total_sy")? {
             self.market.total_sy = value;
         }
         if let Some(value) = attribute_u256(attributes, "last_ln_implied_rate")? {
@@ -1217,10 +1261,11 @@ impl PendleMarketState {
         if let Some(value) = attribute_u256(attributes, SY_PAUSED)? {
             self.sy_paused = !value.is_zero();
         }
-        // The Substreams refresh emits this on every refresh block whether or not the rate
-        // resolved, which is what lets a delta move the head at all — a `ProtocolStateDelta`
-        // carries no header. It therefore advances only as often as `sy_rate_refresh_blocks`
-        // allows, so the staleness guard under-fires between refreshes at any coarser setting.
+        // The head. The Substreams refresh emits it on every refresh block whether or not the rate
+        // resolved, and the stream decoder also stamps it on every delta it passes on. So with
+        // `sy_rate_refresh_blocks` above 1, a market a block touches without a refresh has its
+        // head move past `rate_sampled_at` and refuses until the next refresh, while a market no
+        // delta touches keeps its old head and goes on quoting the sampled curve.
         if let Some(value) = attribute_u256(attributes, "block_timestamp")? {
             self.head_timestamp = value.saturating_to();
         }
