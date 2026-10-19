@@ -24,6 +24,9 @@ use crate::{
         TOTAL_SY,
     },
     registry::{expired_markets, live_markets, markets_of_yt, sy_components, MarketEntry},
+    shares::{
+        is_share_holder, ratio_pairs, share_balance_key, share_holders, share_ratio_key, ShareRatio,
+    },
     sy::{is_class_attribute, is_creation_seed, SY_TOTAL_SUPPLY},
     sy_rates::{
         encode_timestamp, py_index_current, RefreshParams, BLOCK_TIMESTAMP, PY_INDEX_CURRENT,
@@ -47,6 +50,9 @@ pub fn map_protocol_changes(
     sy_state: BlockChanges,
     rate_needed_store: StoreGetInt64,
     markets_by_yt: StoreGetString,
+    share_ratios: StoreGetString,
+    share_holders_store: StoreGetString,
+    share_balances: StoreGetBigInt,
 ) -> Result<BlockChanges, substreams::errors::Error> {
     let refresh = RefreshParams::parse(&params)?;
     let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
@@ -174,15 +180,48 @@ pub fn map_protocol_changes(
             .add_entity_change(&change);
     }
 
+    // A balance kept in shares leaves the store in shares and is emitted at the token's ratio.
+    let ratio = |token: &[u8]| {
+        share_ratios
+            .get_last(share_ratio_key(token))
+            .and_then(|value| ShareRatio::decode(&value))
+    };
+    let mut valued_in_shares: HashSet<(Vec<u8>, Vec<u8>)> = HashSet::new();
     for (_, (tx, balances)) in aggregate_balances_changes(balance_store, deltas) {
         let builder = transaction_changes
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(&tx));
         for token_balances in balances.values() {
             for balance_change in token_balances.values() {
-                builder.add_balance_change(balance_change);
+                let component_id = String::from_utf8(balance_change.component_id.clone())
+                    .expect("component id is not utf-8");
+                if !is_share_holder(&share_holders_store, &component_id, &balance_change.token) {
+                    builder.add_balance_change(balance_change);
+                    continue;
+                }
+                let ratio = ratio(&balance_change.token)
+                    .expect("an SY holds a token in shares only once it has a ratio");
+                let shares = BigInt::from_unsigned_bytes_be(&balance_change.balance);
+                builder.add_balance_change(&BalanceChange {
+                    balance: ratio.to_amount(&shares).to_bytes_be().1,
+                    ..balance_change.clone()
+                });
+                valued_in_shares
+                    .insert((balance_change.component_id.clone(), balance_change.token.clone()));
             }
         }
+    }
+    for (tx, change) in revalued_share_balances(
+        &block,
+        &share_ratios,
+        &share_holders_store,
+        &share_balances,
+        &valued_in_shares,
+    ) {
+        transaction_changes
+            .entry(tx.index)
+            .or_insert_with(|| TransactionChangesBuilder::new(&tx))
+            .add_balance_change(&change);
     }
 
     Ok(BlockChanges {
@@ -605,6 +644,68 @@ fn market_sy_pt(store: &StoreGetRaw, component_id: &str) -> Option<(Vec<u8>, Vec
         panic!("market {component_id} stored {} roles, expected 3", roles.len())
     };
     Some((sy.clone(), pt.clone()))
+}
+
+/// The balances kept in shares whose token's ratio moved this block, revalued at the new ratio.
+///
+/// Nothing moved those holdings, so no balance delta reports them: the ratio did, through a rebase
+/// report, a fee or a multiplier update that the next transfer of the token reveals. Holdings
+/// already emitted this block in `valued` are at the new ratio and left out. The changes are
+/// anchored to the block's last transaction, as the rate refresh's are.
+fn revalued_share_balances(
+    block: &eth::Block,
+    ratios: &StoreGetString,
+    holders: &StoreGetString,
+    share_balances: &StoreGetBigInt,
+    valued: &HashSet<(Vec<u8>, Vec<u8>)>,
+) -> Vec<(Transaction, BalanceChange)> {
+    let Some(anchor) = block.transactions().last() else { return vec![] };
+    let anchor: Transaction = anchor.into();
+    let mut tokens: Vec<Vec<u8>> = Vec::new();
+    for tx in block.transactions() {
+        let logs: Vec<&eth::Log> = tx
+            .logs_with_calls()
+            .map(|(log, _)| log)
+            .collect();
+        for (token, _, _) in ratio_pairs(&logs) {
+            if !tokens.iter().any(|seen| seen == token) {
+                tokens.push(token.to_vec());
+            }
+        }
+    }
+    let mut changes = Vec::new();
+    for token in tokens {
+        let key = share_ratio_key(&token);
+        let decode = |value: Option<String>| value.and_then(|value| ShareRatio::decode(&value));
+        let (Some(before), Some(now)) =
+            (decode(ratios.get_first(&key)), decode(ratios.get_last(&key)))
+        else {
+            continue;
+        };
+        if !now.moved_from(&before) {
+            continue;
+        }
+        for holder in share_holders(holders, &token) {
+            if valued.contains(&(holder.clone().into_bytes(), token.clone())) {
+                continue;
+            }
+            let shares = share_balances
+                .get_last(share_balance_key(&holder, &token))
+                .unwrap_or_else(BigInt::zero);
+            if shares <= BigInt::zero() {
+                continue;
+            }
+            changes.push((
+                anchor.clone(),
+                BalanceChange {
+                    token: token.clone(),
+                    balance: now.to_amount(&shares).to_bytes_be().1,
+                    component_id: holder.into_bytes(),
+                },
+            ));
+        }
+    }
+    changes
 }
 
 /// The component as it is emitted: without the creation seeds, which only seed the stores, and

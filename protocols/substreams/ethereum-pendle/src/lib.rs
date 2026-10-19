@@ -11,6 +11,7 @@ mod keys;
 mod market_state;
 mod modules;
 mod registry;
+mod shares;
 mod sy;
 mod sy_rates;
 mod transfers;

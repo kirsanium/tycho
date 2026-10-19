@@ -77,6 +77,26 @@ modules:
     inputs:
       - map: map_protocol_components
 
+  # Per token that keeps balances in shares (stETH and its forks, xStocks), its latest amount per
+  # share, from the Transfer / TransferShares pairs it emits.
+  - name: store_share_ratios
+    kind: store
+    initialBlock: 16032059
+    updatePolicy: set
+    valueType: string
+    inputs:
+      - source: sf.ethereum.type.v2.Block
+
+  # Per such token, the SYs that keep their balance of it in shares, decided at their creation.
+  - name: store_share_holders
+    kind: store
+    initialBlock: 16032059
+    updatePolicy: append
+    valueType: string
+    inputs:
+      - map: map_protocol_components
+      - store: store_share_ratios
+
   - name: map_relative_component_balance
     kind: map
     initialBlock: 16032059
@@ -84,6 +104,8 @@ modules:
       - source: sf.ethereum.type.v2.Block
       - map: map_protocol_components
       - store: store_protocol_components
+      - store: store_share_ratios
+      - store: store_share_holders
     output:
       type: proto:tycho.evm.v1.BlockBalanceDeltas
 
@@ -130,6 +152,17 @@ modules:
     inputs:
       - map: map_relative_component_balance
 
+  # The shares behind each balance kept in shares, so a holding can be revalued when its token's
+  # ratio moves without the holding changing.
+  - name: store_share_balances
+    kind: store
+    initialBlock: 16032059
+    updatePolicy: add
+    valueType: bigint
+    inputs:
+      - map: map_relative_component_balance
+      - store: store_share_holders
+
   # Separate from store_balances: reserves are not the market's ERC-20 balances, since totalSy
   # excludes donated excess that skim() later sweeps.
   - name: store_market_reserves
@@ -168,6 +201,9 @@ modules:
       - map: map_sy_state
       - store: store_sy_rate_needed
       - store: store_markets_by_yt
+      - store: store_share_ratios
+      - store: store_share_holders
+      - store: store_share_balances
     output:
       type: proto:tycho.evm.v1.BlockChanges
 

@@ -69,7 +69,7 @@ paused SY reverts every transfer, so none of those markets can trade either.
 | SY supply | `totalSupply()` once, at creation | The SY's own mints and burns |
 | SY supply cap | `getAbsoluteSupplyCap()` (or `supplyCap()`) once, at creation, kept only when it caps the SY's own supply | `SupplyCapUpdated`, which re-reads and re-judges it at the end of that block |
 | Yield token | `yieldToken()` once, at creation | — |
-| SY balances | `balanceOf` once per token, at creation | `Transfer`s, and WETH9's `Deposit` / `Withdrawal` |
+| SY balances | `balanceOf` once per token, at creation | `Transfer`s, WETH9's `Deposit` / `Withdrawal`, and vault mints and burns no `Transfer` reports; for tokens kept in shares, `TransferShares` |
 | Market `pyIndexStored` | `pyIndexStored()` on the YT, once, at market creation | `NewInterestIndex` |
 | Market fees | `getMarketConfig` once, at market creation | The factories' fee events |
 | Exchange rate | Every refresh block | — |
@@ -80,12 +80,24 @@ tokens have only ever been `one_to_one` and whose markets have expired is never 
 flag is never cleared, because a re-classification cannot see the class of a token whose probe did
 not answer.
 
-Balances are never re-read. A rebasing token (stETH, aTokens) moves an SY's balance without a
-`Transfer`, so the reported holding of one misses every rebase since creation, and one whose
-withdrawals outrun the accounted total is reported as zero. The simulation reads one balance:
-an SY's holding of its own yield token, which bounds a redemption to that token. Every other
-redemption is bounded by supply. So a missed rebase affects that bound, the reported balances
-and anything derived from them, such as TVL.
+Balances are never re-read. Three kinds of token move a balance without a plain `Transfer`, and
+two of them are followed from other events:
+
+- **Tokens kept in shares** (stETH and its forks such as eUSD, xStocks such as STRCx) store each
+  holder's shares and derive the balance from a ratio that moves on its own. They emit
+  `TransferShares` next to every `Transfer`, so an SY listing one at creation is followed in shares
+  from then on: its seed is converted at the token's ratio then, and its `TransferShares` replace
+  its `Transfer`s. The ratio comes from each block's largest `Transfer` / `TransferShares` pair of
+  that token, anyone's, and every holding is revalued when it moves.
+- **Vaults that mint and burn without a `Transfer`** (Maker's sDAI): an ERC-4626 `Deposit` or
+  `Withdraw` naming an SY counts when no mint or burn `Transfer` of the same shares reports it.
+- **Other rebasing tokens** (aTokens) are not followed: the reported holding misses every rebase
+  since the SY's last transfer of it. Aave's mint and burn `Transfer`s include the interest
+  accrued so far, which keeps the miss small.
+
+The simulation reads one balance: an SY's holding of its own yield token, which bounds a
+redemption to that token. Every other redemption is bounded by supply. So a missed rebase affects
+that bound, the reported balances and anything derived from them, such as TVL.
 
 ## The refresh, and its one parameter
 

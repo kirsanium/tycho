@@ -13,6 +13,7 @@ use tycho_substreams::{
 use crate::{
     consts::{PENDLE_SY, WETH},
     keys::{contract_id, market_tokens_key},
+    shares::decode_transfer_shares,
 };
 
 /// One component's side of a `Transfer` of a token it declares.
@@ -24,21 +25,49 @@ pub struct ComponentTransfer<'a> {
     pub amount: BigInt,
 }
 
-/// Every side of every `Transfer` in `block` that moves a token a component declares, markets and
-/// SYs alike.
+/// Every side of every movement in `block` of a token a component declares, markets and SYs
+/// alike, in the unit the component's balance of it is kept in.
+///
+/// A balance `is_share_holder` names is kept in shares and follows `TransferShares`; every other
+/// balance follows `Transfer` amounts, WETH9's wraps and unwraps, and vault mints and burns that
+/// emit no `Transfer`.
 pub fn component_transfers<'a>(
     block: &'a eth::Block,
     components_store: &StoreGetRaw,
+    is_share_holder: impl Fn(&str, &[u8]) -> bool,
 ) -> Vec<ComponentTransfer<'a>> {
     let mut transfers = Vec::new();
     for tx in block.transactions() {
-        for log in tx.logs_with_calls().map(|(log, _)| log) {
-            for (holder, amount) in log_holder_deltas(log) {
+        let logs: Vec<&eth::Log> = tx
+            .logs_with_calls()
+            .map(|(log, _)| log)
+            .collect();
+        let mut vault_moves = vault_deltas(&logs);
+        for log in &logs {
+            let mut deltas: Vec<(Vec<u8>, BigInt, bool)> = log_holder_deltas(log)
+                .into_iter()
+                .map(|(holder, amount)| (holder, amount, false))
+                .collect();
+            deltas.extend(
+                share_holder_deltas(log)
+                    .into_iter()
+                    .map(|(holder, shares)| (holder, shares, true)),
+            );
+            if let Some(position) = vault_moves
+                .iter()
+                .position(|(vault_log, _, _)| std::ptr::eq(*vault_log, *log))
+            {
+                let (_, holder, amount) = vault_moves.remove(position);
+                deltas.push((holder, amount, false));
+            }
+            for (holder, amount, in_shares) in deltas {
                 let component_id = contract_id(&holder);
                 let Some(tokens) = components_store.get_last(&component_id) else { continue };
                 let tokens: Vec<Vec<u8>> = serde_sibor::from_bytes(&tokens)
                     .expect("deserializing component tokens from the component store");
-                if !tokens.contains(&log.address) {
+                if !tokens.contains(&log.address) ||
+                    in_shares != is_share_holder(&component_id, &log.address)
+                {
                     continue;
                 }
                 transfers.push(ComponentTransfer { tx, log, component_id, amount });
@@ -46,6 +75,79 @@ pub fn component_transfers<'a>(
         }
     }
     transfers
+}
+
+/// The signed change in shares a `TransferShares` makes to each side. Mints and burns name the
+/// zero address, which is never a component; a self-transfer and a zero transfer move nothing.
+fn share_holder_deltas(log: &eth::Log) -> Vec<(Vec<u8>, BigInt)> {
+    let Some(moved) = decode_transfer_shares(log) else { return vec![] };
+    if moved.shares == BigInt::zero() || moved.from == moved.to {
+        return vec![];
+    }
+    let mut deltas = Vec::new();
+    if !is_zero_address(&moved.to) {
+        deltas.push((moved.to.clone(), moved.shares.clone()));
+    }
+    if !is_zero_address(&moved.from) {
+        deltas.push((moved.from.clone(), moved.shares.neg()));
+    }
+    deltas
+}
+
+/// ERC-4626 `Deposit(address indexed sender, address indexed owner, uint256 assets, uint256
+/// shares)`.
+const VAULT_DEPOSIT: [u8; 32] =
+    substreams::hex!("dcbc1c05240f31ff3ad067ef1ee35ce4997762752e3a095284754544f4c709d7");
+/// ERC-4626 `Withdraw(address indexed sender, address indexed receiver, address indexed owner,
+/// uint256 assets, uint256 shares)`.
+const VAULT_WITHDRAW: [u8; 32] =
+    substreams::hex!("fbde797d201c681b91056529119e0b02407c7bb96a4a2c75c01fc9667232c8db");
+
+/// The vault share mints and burns in a transaction's `logs` that no `Transfer` reports: each
+/// ERC-4626 `Deposit` and `Withdraw` paired with its log, the owner, and the signed shares.
+///
+/// Most vaults emit a mint or burn `Transfer` alongside, which the balance already follows, so a
+/// `Deposit` or `Withdraw` counts only when the same transaction has no such `Transfer` of the
+/// same vault, owner and shares left to match it. Maker's sDAI is one that emits none: without
+/// this, an SY holding it misses every share it mints, and its balance goes negative as it pays
+/// them out.
+fn vault_deltas<'a>(logs: &[&'a eth::Log]) -> Vec<(&'a eth::Log, Vec<u8>, BigInt)> {
+    let mut reported: Vec<(Vec<u8>, Vec<u8>, BigInt)> = Vec::new();
+    for log in logs {
+        let Some(transfer) = erc20::events::Transfer::match_and_decode(*log) else { continue };
+        if is_zero_address(&transfer.from) {
+            reported.push((log.address.clone(), transfer.to, transfer.value));
+        } else if is_zero_address(&transfer.to) {
+            reported.push((log.address.clone(), transfer.from, transfer.value.neg()));
+        }
+    }
+    let mut unreported = Vec::new();
+    for log in logs {
+        let (owner, shares) = match (log.topics.first(), log.topics.len(), log.data.len()) {
+            (Some(topic), 3, 64) if topic.as_slice() == VAULT_DEPOSIT => {
+                (log.topics[2][12..].to_vec(), BigInt::from_unsigned_bytes_be(&log.data[32..]))
+            }
+            (Some(topic), 4, 64) if topic.as_slice() == VAULT_WITHDRAW => (
+                log.topics[3][12..].to_vec(),
+                BigInt::from_unsigned_bytes_be(&log.data[32..]).neg(),
+            ),
+            _ => continue,
+        };
+        if shares == BigInt::zero() || is_zero_address(&owner) {
+            continue;
+        }
+        if let Some(position) = reported
+            .iter()
+            .position(|(vault, holder, amount)| {
+                *vault == log.address && *holder == owner && *amount == shares
+            })
+        {
+            reported.remove(position);
+            continue;
+        }
+        unreported.push((*log, owner, shares));
+    }
+    unreported
 }
 
 /// Whether `component_id` is a market rather than an SY. Only markets have their token roles
@@ -181,6 +283,7 @@ mod tests {
     const MARKET: [u8; 20] = [0x34; 20];
     const SY: [u8; 20] = [0xcb; 20];
     const ZERO: [u8; 20] = [0x00; 20];
+    const BOB: [u8; 20] = [0xb0; 20];
 
     fn transfer(from: [u8; 20], to: [u8; 20], value: i64) -> erc20::events::Transfer {
         erc20::events::Transfer { from: from.to_vec(), to: to.to_vec(), value: BigInt::from(value) }
@@ -283,6 +386,102 @@ mod tests {
     fn deposit_and_withdrawal_count_only_from_weth() {
         assert!(log_holder_deltas(&weth_event(MARKET, WETH_WITHDRAWAL, SY, 100)).is_empty());
         assert!(log_holder_deltas(&weth_event(MARKET, WETH_DEPOSIT, SY, 100)).is_empty());
+    }
+
+    fn topic(address: [u8; 20]) -> Vec<u8> {
+        let mut topic = vec![0u8; 12];
+        topic.extend_from_slice(&address);
+        topic
+    }
+
+    fn word(value: u64) -> Vec<u8> {
+        let mut word = vec![0u8; 24];
+        word.extend_from_slice(&value.to_be_bytes());
+        word
+    }
+
+    /// Maker's sDAI and the SY holding it, as at block 17,967,580.
+    const SDAI: [u8; 20] = substreams::hex!("83f20f44975d03b1b09e64809b757c47f942beea");
+    const SY_SDAI: [u8; 20] = substreams::hex!("90f1935f733dd8826dca2bd01ccfc600f20e978e");
+
+    fn vault_log(topic0: [u8; 32], holders: &[[u8; 20]], assets: u64, shares: u64) -> eth::Log {
+        let mut topics = vec![topic0.to_vec()];
+        topics.extend(
+            holders
+                .iter()
+                .map(|holder| topic(*holder)),
+        );
+        eth::Log {
+            address: SDAI.to_vec(),
+            topics,
+            data: [word(assets), word(shares)].concat(),
+            ..Default::default()
+        }
+    }
+
+    fn erc20_transfer(token: [u8; 20], from: [u8; 20], to: [u8; 20], value: u64) -> eth::Log {
+        eth::Log {
+            address: token.to_vec(),
+            topics: vec![
+                substreams::hex!(
+                    "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                )
+                .to_vec(),
+                topic(from),
+                topic(to),
+            ],
+            data: word(value),
+            ..Default::default()
+        }
+    }
+
+    /// sDAI mints and burns its shares with no `Transfer`, so its `Deposit` and `Withdraw` are the
+    /// only record of the SY's shares moving: the SY deposited with no mint `Transfer` at block
+    /// 17,967,580. Without them the SY's balance misses every share it minted.
+    #[test]
+    fn a_vault_mint_or_burn_without_a_transfer_moves_the_owner() {
+        let deposit = vault_log(VAULT_DEPOSIT, &[SY_SDAI, SY_SDAI], 1_000, 950);
+        let withdraw = vault_log(VAULT_WITHDRAW, &[SY_SDAI, BOB, SY_SDAI], 400, 380);
+        let moved = vault_deltas(&[&deposit, &withdraw]);
+        assert_eq!(
+            moved
+                .into_iter()
+                .map(|(_, holder, shares)| (holder, shares))
+                .collect::<Vec<_>>(),
+            vec![(SY_SDAI.to_vec(), BigInt::from(950)), (SY_SDAI.to_vec(), BigInt::from(-380))]
+        );
+    }
+
+    /// A vault that also emits its mint and burn `Transfer`s is already followed through them, so
+    /// its `Deposit` and `Withdraw` must not count again.
+    #[test]
+    fn a_vault_mint_or_burn_with_its_transfer_is_not_counted_twice() {
+        let mint = erc20_transfer(SDAI, ZERO, SY_SDAI, 950);
+        let deposit = vault_log(VAULT_DEPOSIT, &[SY_SDAI, SY_SDAI], 1_000, 950);
+        let burn = erc20_transfer(SDAI, SY_SDAI, ZERO, 380);
+        let withdraw = vault_log(VAULT_WITHDRAW, &[SY_SDAI, BOB, SY_SDAI], 400, 380);
+        assert!(vault_deltas(&[&mint, &deposit, &burn, &withdraw]).is_empty());
+    }
+
+    /// Each `TransferShares` moves both sides by its shares; a mint or burn moves one side.
+    #[test]
+    fn transfer_shares_move_both_sides_in_shares() {
+        let shares = |from: [u8; 20], to: [u8; 20], value: u64| eth::Log {
+            address: SDAI.to_vec(),
+            topics: vec![crate::shares::TRANSFER_SHARES.to_vec(), topic(from), topic(to)],
+            data: word(value),
+            ..Default::default()
+        };
+        assert_eq!(
+            share_holder_deltas(&shares(SY, MARKET, 90)),
+            vec![(MARKET.to_vec(), BigInt::from(90)), (SY.to_vec(), BigInt::from(-90))]
+        );
+        assert_eq!(
+            share_holder_deltas(&shares(ZERO, SY, 90)),
+            vec![(SY.to_vec(), BigInt::from(90))]
+        );
+        assert!(share_holder_deltas(&shares(SY, SY, 90)).is_empty());
+        assert!(share_holder_deltas(&shares(SY, MARKET, 0)).is_empty());
     }
 
     #[test]

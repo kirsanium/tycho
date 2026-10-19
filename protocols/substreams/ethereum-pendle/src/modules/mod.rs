@@ -6,6 +6,8 @@
 // Stage 1
 #[path = "1_map_market_components.rs"]
 mod map_market_components;
+#[path = "1_store_share_ratios.rs"]
+mod store_share_ratios;
 
 // Stage 2
 #[path = "2_store_sy_seen.rs"]
@@ -22,6 +24,8 @@ mod store_market_registry;
 mod store_markets_by_yt;
 #[path = "4_store_protocol_components.rs"]
 mod store_protocol_components;
+#[path = "4_store_share_holders.rs"]
+mod store_share_holders;
 
 // Stage 5
 #[path = "5_map_relative_component_balance.rs"]
@@ -38,6 +42,8 @@ mod store_py_index;
 mod store_balances;
 #[path = "6_store_market_reserves.rs"]
 mod store_market_reserves;
+#[path = "6_store_share_balances.rs"]
+mod store_share_balances;
 #[path = "6_store_sy_rate_needed.rs"]
 mod store_sy_rate_needed;
 
@@ -57,5 +63,8 @@ pub use store_market_reserves::store_market_reserves;
 pub use store_markets_by_yt::store_markets_by_yt;
 pub use store_protocol_components::store_protocol_components;
 pub use store_py_index::store_py_index;
+pub use store_share_balances::store_share_balances;
+pub use store_share_holders::store_share_holders;
+pub use store_share_ratios::store_share_ratios;
 pub use store_sy_rate_needed::store_sy_rate_needed;
 pub use store_sy_seen::store_sy_seen;

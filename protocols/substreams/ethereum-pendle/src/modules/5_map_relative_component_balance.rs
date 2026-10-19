@@ -3,13 +3,14 @@ use std::collections::HashSet;
 use anyhow::Result;
 use substreams::{
     scalar::BigInt,
-    store::{StoreGet, StoreGetRaw},
+    store::{StoreGet, StoreGetRaw, StoreGetString},
 };
 use substreams_ethereum::pb::eth::v2 as eth;
 use tycho_substreams::prelude::*;
 
 use crate::{
     deltas::in_transaction_order,
+    shares::{is_share_holder, share_ratio_key, ShareRatio},
     sy::balance_seeds,
     transfers::{component_transfers, new_sy_components, ComponentTransfer},
 };
@@ -29,27 +30,55 @@ use crate::{
 /// An SY usually held tokens long before it became a component with its first market, so its
 /// balances are seeded from the `balanceOf` reads taken at its creation and moved by transfers
 /// afterwards. The seed is read at the end of the creation block, so that block's transfers are
-/// already in it and are skipped. A rebasing token moves without a `Transfer`, so an SY's
-/// reported holding of one misses every rebase since creation. The simulation reads only an SY's
-/// holding of its own yield token, to bound a redemption to that token.
+/// already in it and are skipped. The simulation reads only an SY's holding of its own yield
+/// token, to bound a redemption to that token.
+///
+/// A token that keeps balances in shares (`crate::shares`) is followed in shares instead, for the
+/// SYs `store_share_holders` lists: its seed is converted at the token's ratio then, and its
+/// `TransferShares` replace its `Transfer`s. `map_protocol_changes` turns the shares back into a
+/// balance. Any other token that rebases still moves without a `Transfer`, and an SY's reported
+/// holding of it misses every rebase since creation.
 #[substreams::handlers::map]
 pub fn map_relative_component_balance(
     block: eth::Block,
     new_components: BlockTransactionProtocolComponents,
     store: StoreGetRaw,
+    ratios: StoreGetString,
+    holders: StoreGetString,
 ) -> Result<BlockBalanceDeltas> {
     let created = new_sy_components(&new_components);
-    Ok(in_transaction_order(balance_deltas(component_transfers(&block, &store), &created)))
+    let in_shares =
+        |component_id: &str, token: &[u8]| is_share_holder(&holders, component_id, token);
+    let ratio = |token: &[u8]| {
+        ratios
+            .get_last(share_ratio_key(token))
+            .and_then(|value| ShareRatio::decode(&value))
+    };
+    Ok(in_transaction_order(balance_deltas(
+        component_transfers(&block, &store, in_shares),
+        &created,
+        |component_id, token, balance| {
+            if !in_shares(component_id, token) {
+                return balance;
+            }
+            let ratio =
+                ratio(token).expect("an SY holds a token in shares only once it has a ratio");
+            ratio.to_shares(&balance)
+        },
+    )))
 }
 
 /// Each component transfer as a balance delta, plus the balance seeds of every SY in `created` at
 /// ordinal 0 of the transaction that created it.
 ///
 /// A created SY's own transfers are left out, whichever transaction of the block they are in: its
-/// seeds are read at the end of the block and already include them. A zero seed is left out too.
+/// seeds are read at the end of the block and already include them. Each seed goes through
+/// `seed_unit`, which turns the balance read at creation into the unit the balance is kept in. A
+/// zero seed is left out.
 fn balance_deltas(
     transfers: Vec<ComponentTransfer>,
     created: &[(&Transaction, &ProtocolComponent)],
+    seed_unit: impl Fn(&str, &[u8], BigInt) -> BigInt,
 ) -> Vec<BalanceDelta> {
     let seeded: HashSet<&str> = created
         .iter()
@@ -71,6 +100,7 @@ fn balance_deltas(
     }
     for &(tx, component) in created {
         for (token, balance) in balance_seeds(component) {
+            let balance = seed_unit(&component.id, &token, balance);
             // A zero seed adds nothing, and the aggregation pairs store deltas with these one
             // to one, so it is left out rather than written as an empty change.
             if balance == BigInt::zero() {
@@ -177,7 +207,7 @@ mod tests {
         let component = new_sy(&[(WSTETH, 1000), (EMPTY_TOKEN, 0)]);
 
         assert_eq!(
-            rows(balance_deltas(transfers, &[(&creation, &component)])),
+            rows(balance_deltas(transfers, &[(&creation, &component)], |_, _, balance| balance)),
             vec![
                 (2, 0, NEW_SY.to_string(), WSTETH.to_string(), BigInt::from(1000)),
                 (3, 30, MARKET.to_string(), NEW_SY.to_string(), BigInt::from(50)),
@@ -199,6 +229,7 @@ mod tests {
                     transfer(&tx3, &withdrawal, NEW_SY, -100)
                 ],
                 &[],
+                |_, _, balance| balance,
             )),
             vec![
                 (1, 5, NEW_SY.to_string(), WSTETH.to_string(), BigInt::from(400)),
