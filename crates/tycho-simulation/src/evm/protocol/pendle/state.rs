@@ -26,6 +26,7 @@
 use std::{any::Any, collections::HashMap, fmt, fmt::Debug, str::FromStr, sync::OnceLock};
 
 use alloy::primitives::{I256, U256};
+use hex_literal::hex;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use tycho_common::{
@@ -82,12 +83,15 @@ const EXECUTION_HAIRCUT: U256 = U256::from_limbs([10_000_000_000_000_000, 0, 0, 
 /// [`PendleMarketState::clear_of_anchor_noise`].
 const ANCHOR_NOISE: U256 = U256::from_limbs([100_000, 0, 0, 0]);
 
-/// Gas for a swap routed through Router V4.
+/// Gas for a swap routed through Router V4, on a market whose SY is not in
+/// [`MARKET_GAS_SURCHARGE`].
 ///
 /// Measured per edge on a mainnet fork at block 25 800 000 against the wstETH market, each edge in
-/// its own test on a fresh fork, then rounded up by roughly a tenth. The headroom is deliberate and
-/// asymmetric in its consequences: under-estimating makes a router pick a route that costs more
-/// than it was quoted, while over-estimating only makes Pendle look slightly worse than it is.
+/// its own test on a fresh fork, then rounded up by roughly a tenth. A sweep of all 69 live markets
+/// at block 26 228 000 put these at about the 75th percentile of markets. The headroom is
+/// deliberate and asymmetric in its consequences: under-estimating makes a router pick a route that
+/// costs more than it was quoted, while over-estimating only makes Pendle look slightly worse than
+/// it is.
 ///
 /// The two directions of a leg are **not** one number. Buying PT costs 40% more than selling it,
 /// and buying YT 27% more than selling it, because the exact-SY-in directions run the router's
@@ -100,7 +104,7 @@ const ANCHOR_NOISE: U256 = U256::from_limbs([100_000, 0, 0, 0]);
 /// | PT to SY | 215,674 | 235,000 |
 /// | SY to YT | 387,038 | 425,000 |
 /// | YT to SY | 305,972 | 335,000 |
-/// | wrap, `one_to_one` | 80,671 / 78,047 | 90,000 |
+/// | wrap, `one_to_one` | 80,671 / 78,047 | 125,000 |
 /// | wrap, `index_rate` (stETH in / out, WETH in) | 164,759 / 152,397 / 207,260 | 230,000 |
 const GAS_SY_FOR_PT: u64 = 330_000;
 const GAS_PT_FOR_SY: u64 = 235_000;
@@ -108,8 +112,9 @@ const GAS_SY_FOR_YT: u64 = 425_000;
 const GAS_YT_FOR_SY: u64 = 335_000;
 
 /// A `one_to_one` wrap is the cheapest case there is: the SY takes the token and mints, and does
-/// nothing else.
-const GAS_WRAP_ONE_TO_ONE: u64 = 90_000;
+/// nothing else. What "nothing else" costs depends on the token's own transfer: across the live
+/// SYs at block 26 228 000 the median was 93k and the 90th percentile 122k.
+const GAS_WRAP_ONE_TO_ONE: u64 = 125_000;
 
 /// An `index_rate` wrap reads through to whatever protocol the SY wraps — an ERC-4626 vault, a
 /// staking contract — and costs whatever that costs. Measured on the wstETH SY: its stETH legs,
@@ -117,6 +122,219 @@ const GAS_WRAP_ONE_TO_ONE: u64 = 90_000;
 /// the WETH and stakes it with Lido, 207k. Another wrapped protocol can cost more or less. The
 /// class is known at quote time, so the two classes are charged separately.
 const GAS_WRAP_INDEX_RATE: u64 = 230_000;
+
+/// Extra gas on every market edge of a market whose SY is listed, on top of the edge's constant.
+///
+/// Some SYs make every transfer expensive: transfer hooks, reward accounting, or the protocol
+/// they wrap. Every market edge moves SY, so the extra cost belongs to the SY, and a sweep of the
+/// 69 live markets at block 26 228 000 found it nearly the same on all four edges of a market
+/// and across trade sizes. Each value is the SY's worst sample plus a tenth, less the edge's
+/// constant, rounded up to 5,000. Without these, a route through one of these markets is
+/// quoted up to half a million gas short.
+///
+/// Hardcoded, and so only as current as that sweep: an SY that turns heavy, or a heavy one that
+/// launches after it, is charged the plain constant until it is added here. How to keep the table
+/// current is open.
+const MARKET_GAS_SURCHARGE: [([u8; 20], u64); 15] = [
+    // SY-mixWETH
+    (hex!("3870cf5e2eab623a74d2af1007295963b1c5a12f"), 535_000),
+    // SY-sUSDfr
+    (hex!("a6e23d9a6f7f4fb5ec305b50b29418dd119eb692"), 425_000),
+    // SY-sBOLD
+    (hex!("a73fb4f3a3f3889e41387973afc542fa06785981"), 280_000),
+    // SY-mixUSDC
+    (hex!("0e012d6a77a7f6c91de7cb74c2732553876d1d61"), 215_000),
+    // SY-ROY-JT-apyUSD
+    (hex!("464a2b93b6633707470bcd2c81d34519f38e1e9c"), 200_000),
+    // SY-ROY-ST-apyUSD
+    (hex!("a99a50d95003e7687d7962f29aad6cdd3655d411"), 195_000),
+    // SY-srUSDat
+    (hex!("9d0fc59f88acb85520a8cfb74c7fe141d8563185"), 165_000),
+    // SY-sUSDat
+    (hex!("8917f8c7feb840b5837edc7e128123baa2f289f9"), 90_000),
+    // SY-srnOPAL
+    (hex!("efc86eda0d06f6c608f75e4bc918d079c6779cec"), 90_000),
+    // SY-jrUSDe
+    (hex!("4f6673346ab4813f1665327ab39087008cc7d76f"), 75_000),
+    // SY-srUSDe
+    (hex!("c9bfebc79a722c05dc34bd2a227ef2db19fd1b8e"), 75_000),
+    // SY pufETH
+    (hex!("253008ba4ae2f3e6488dc998a5321d4eb1a0c905"), 65_000),
+    // SY-siUSD
+    (hex!("9f30507c264cc6eb5be35b18ff9ad7b4539aa920"), 40_000),
+    // SY-sthUSD
+    (hex!("beefe990f4099e11c6ab745555621cdfa161f18d"), 30_000),
+    // SY-mAPOLLO
+    (hex!("e1e22d55e23900f30599d8bee74a0801f09b4e58"), 30_000),
+];
+
+/// Extra gas on a deposit or redemption of a listed `(SY, token)` pair, on top of its class's
+/// constant.
+///
+/// An `index_rate` wrap costs whatever the wrapped protocol costs, which differs by token: SY-siUSD
+/// pays out USDC through a redemption queue at 2.29M gas, while its other wraps cost a fraction of
+/// that. Measured on every wrap of the live markets' SYs at block 26 228 000, and set like
+/// [`MARKET_GAS_SURCHARGE`] from the worse of the two directions. The same caveat applies: the
+/// table is only as current as that sweep.
+const WRAP_GAS_SURCHARGE: [([u8; 20], [u8; 20], u64); 23] = [
+    // SY-siUSD, USDC
+    (
+        hex!("9f30507c264cc6eb5be35b18ff9ad7b4539aa920"),
+        hex!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        2_290_000,
+    ),
+    // SY-sUSDfr, USDfr
+    (
+        hex!("a6e23d9a6f7f4fb5ec305b50b29418dd119eb692"),
+        hex!("cc07e7c4e5e35affd47b351e420a22c667d7f83d"),
+        1_535_000,
+    ),
+    // SY-mixWETH, WETH
+    (
+        hex!("3870cf5e2eab623a74d2af1007295963b1c5a12f"),
+        hex!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
+        1_380_000,
+    ),
+    // SY-siUSD, iUSD
+    (
+        hex!("9f30507c264cc6eb5be35b18ff9ad7b4539aa920"),
+        hex!("48f9e38f3070ad8945dfeae3fa70987722e3d89c"),
+        795_000,
+    ),
+    // SY-mixUSDC, USDC
+    (
+        hex!("0e012d6a77a7f6c91de7cb74c2732553876d1d61"),
+        hex!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        665_000,
+    ),
+    // SY-sBOLD, BOLD
+    (
+        hex!("a73fb4f3a3f3889e41387973afc542fa06785981"),
+        hex!("6440f144b7e50d6a8439336510312d2f54beb01d"),
+        595_000,
+    ),
+    // SY-USD3, USDC
+    (
+        hex!("ea3bc608f32847b97965c5e1648bdfcd4c2c40d0"),
+        hex!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        415_000,
+    ),
+    // SY-srUSDat, USDat
+    (
+        hex!("9d0fc59f88acb85520a8cfb74c7fe141d8563185"),
+        hex!("23238f20b894f29041f48d88ee91131c395aaa71"),
+        385_000,
+    ),
+    // SY-srUSDe, USDe
+    (
+        hex!("c9bfebc79a722c05dc34bd2a227ef2db19fd1b8e"),
+        hex!("4c9edd5852cd905f086c759e8383e09bff1e68b3"),
+        270_000,
+    ),
+    // SY-jrUSDe, USDe
+    (
+        hex!("4f6673346ab4813f1665327ab39087008cc7d76f"),
+        hex!("4c9edd5852cd905f086c759e8383e09bff1e68b3"),
+        255_000,
+    ),
+    // SY-fxSAVE, fxSP
+    (
+        hex!("13945b761b2ed3219a497a46d15a8923f418d2ab"),
+        hex!("65c9a641afceb9c0e6034e558a319488fa0fa3be"),
+        225_000,
+    ),
+    // SY-fxSAVE, fxSP
+    (
+        hex!("7ca334286e9519de99703ab49d4eff6e5559499f"),
+        hex!("65c9a641afceb9c0e6034e558a319488fa0fa3be"),
+        225_000,
+    ),
+    // SY-mAPOLLO, USDC
+    (
+        hex!("e1e22d55e23900f30599d8bee74a0801f09b4e58"),
+        hex!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        165_000,
+    ),
+    // SY-mAPOLLO, USDS
+    (
+        hex!("e1e22d55e23900f30599d8bee74a0801f09b4e58"),
+        hex!("dc035d45d973e3ec169d2276ddab16f1e407384f"),
+        150_000,
+    ),
+    // SY-sUSDfr, sUSDfr
+    (
+        hex!("a6e23d9a6f7f4fb5ec305b50b29418dd119eb692"),
+        hex!("af559d1d59b33ca4b950ab2091372af8a773e234"),
+        130_000,
+    ),
+    // SY-sUSD3, USD3
+    (
+        hex!("e78392ecb40939c1c29d9d47429913dd88b5daed"),
+        hex!("056b269eb1f75477a8666ae8c7fe01b64dd55ecc"),
+        125_000,
+    ),
+    // SY-sUSDS, DAI
+    (
+        hex!("be3d4ec488a0a042bb86f9176c24f8cd54018ba7"),
+        hex!("6b175474e89094c44da98b954eedeac495271d0f"),
+        75_000,
+    ),
+    // SY-sUSDat, USDat
+    (
+        hex!("8917f8c7feb840b5837edc7e128123baa2f289f9"),
+        hex!("23238f20b894f29041f48d88ee91131c395aaa71"),
+        65_000,
+    ),
+    // SY SIERRA, USDC
+    (
+        hex!("9845bbb51d326fe4d5e7cbd47ce157a33d7936ef"),
+        hex!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        60_000,
+    ),
+    // SY-sAID, USDC
+    (
+        hex!("39fb0bb5d696ec6da2d827649cf3a3f00299d2dd"),
+        hex!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        45_000,
+    ),
+    // SY SIERRA, SIERRA
+    (
+        hex!("9845bbb51d326fe4d5e7cbd47ce157a33d7936ef"),
+        hex!("bceb5f6877d979ec621ae694da1102cb95691ad3"),
+        35_000,
+    ),
+    // SY-ROY-JT-apyUSD, ROY-JT-apyUSD
+    (
+        hex!("464a2b93b6633707470bcd2c81d34519f38e1e9c"),
+        hex!("ab2ab53e1e2e2c5d7202918ec8c873712bcc4a2d"),
+        20_000,
+    ),
+    // SY-ROY-ST-apyUSD, ROY-ST-apyUSD
+    (
+        hex!("a99a50d95003e7687d7962f29aad6cdd3655d411"),
+        hex!("bd373c9d3d8976a4fecc504a93c768bbe8c3227c"),
+        20_000,
+    ),
+];
+
+/// The extra gas [`MARKET_GAS_SURCHARGE`] lists for a market on `sy`; zero for any other.
+fn market_gas_surcharge(sy: &Bytes) -> u64 {
+    MARKET_GAS_SURCHARGE
+        .iter()
+        .find(|(address, _)| sy.as_ref() == address)
+        .map_or(0, |(_, gas)| *gas)
+}
+
+/// The extra gas [`WRAP_GAS_SURCHARGE`] lists for wrapping `token` through `sy`; zero for any
+/// other.
+fn wrap_gas_surcharge(sy: &Bytes, token: &Bytes) -> u64 {
+    WRAP_GAS_SURCHARGE
+        .iter()
+        .find(|(listed_sy, listed_token, _)| {
+            sy.as_ref() == listed_sy && token.as_ref() == listed_token
+        })
+        .map_or(0, |(_, _, gas)| *gas)
+}
 
 /// How an SY converts a given token, as classified at component creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,7 +829,8 @@ impl ProtocolSim for PendleState {
                     return Err(unknown_pair(token_in, token_out));
                 }
                 let swap = state.amount_out(amount, from, to)?;
-                (swap.amount_out, swap.gas, PendleState::Market(state.after(swap.market)))
+                let gas = swap.gas + market_gas_surcharge(&state.sy_address);
+                (swap.amount_out, gas, PendleState::Market(state.after(swap.market)))
             }
             PendleState::Sy(state) => {
                 let (class, direction) = state
@@ -622,10 +841,14 @@ impl ProtocolSim for PendleState {
                     Direction::Deposit => token_in.decimals,
                     Direction::Redeem => token_out.decimals,
                 };
+                let token = match direction {
+                    Direction::Deposit => &token_in.address,
+                    Direction::Redeem => &token_out.address,
+                };
                 let gas = match class {
                     TokenClass::OneToOne => GAS_WRAP_ONE_TO_ONE,
                     TokenClass::IndexRate => GAS_WRAP_INDEX_RATE,
-                };
+                } + wrap_gas_surcharge(&state.sy_address, token);
                 if direction == Direction::Redeem {
                     let max_in = state.max_redeem_sy(&token_out.address, class, token_decimals)?;
                     if amount > max_in {
@@ -650,10 +873,6 @@ impl ProtocolSim for PendleState {
                         }
                     }
                 }
-                let token = match direction {
-                    Direction::Deposit => &token_in.address,
-                    Direction::Redeem => &token_out.address,
-                };
                 let after = state.after(direction, token, amount, out)?;
                 (out, gas, PendleState::Sy(after))
             }

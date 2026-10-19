@@ -2177,3 +2177,47 @@ fn kept_limits_follow_every_change_to_the_state() {
     }
     assert_eq!(limits(&state, YT, SY), no_depth());
 }
+
+/// A market on an SY listed in `MARKET_GAS_SURCHARGE` is charged the SY's surcharge on top of every
+/// edge's constant, and a listed `(SY, token)` wrap its pair's surcharge on top of its class's
+/// constant. Anything unlisted is charged the constant alone.
+#[test]
+fn a_listed_sy_is_charged_its_gas_surcharge() {
+    const MIX_WETH_SY: &str = "0x3870cf5e2eab623a74d2af1007295963b1c5a12f";
+    const WETH: &str = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+    let one = BigUint::from(10u64.pow(18));
+    let gas = |state: &PendleState, from: &str, to: &str| {
+        state
+            .get_amount_out(one.clone(), &token(from, 18), &token(to, 18))
+            .unwrap()
+            .gas
+    };
+
+    let PendleState::Market(plain) = wsteth_market(1_787_273_051) else { unreachable!() };
+    let listed = PendleState::Market(PendleMarketState {
+        sy_address: Bytes::from_str(MIX_WETH_SY).unwrap(),
+        ..plain.clone()
+    });
+    let plain = PendleState::Market(plain);
+    for (from, to, constant) in [
+        (SY, PT, GAS_SY_FOR_PT),
+        (PT, SY, GAS_PT_FOR_SY),
+        (SY, YT, GAS_SY_FOR_YT),
+        (YT, SY, GAS_YT_FOR_SY),
+    ] {
+        assert_eq!(gas(&plain, from, to), BigUint::from(constant), "{from}->{to}");
+        let (from, to) = (from.replace(SY, MIX_WETH_SY), to.replace(SY, MIX_WETH_SY));
+        assert_eq!(gas(&listed, &from, &to), BigUint::from(constant + 535_000), "{from}->{to}");
+    }
+
+    let PendleState::Sy(mut sy) = wsteth_sy() else { unreachable!() };
+    sy.sy_address = Bytes::from_str(MIX_WETH_SY).unwrap();
+    let weth = Bytes::from_str(WETH).unwrap();
+    sy.tokens_out
+        .insert(weth.clone(), TokenClass::IndexRate);
+    sy.token_decimals.insert(weth, 18);
+    let sy = PendleState::Sy(sy);
+    assert_eq!(gas(&sy, MIX_WETH_SY, WETH), BigUint::from(GAS_WRAP_INDEX_RATE + 1_380_000));
+    assert_eq!(gas(&sy, MIX_WETH_SY, STETH), BigUint::from(GAS_WRAP_INDEX_RATE));
+    assert_eq!(gas(&sy, WSTETH, MIX_WETH_SY), BigUint::from(GAS_WRAP_ONE_TO_ONE));
+}
