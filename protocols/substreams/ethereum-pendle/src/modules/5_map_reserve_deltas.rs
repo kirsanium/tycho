@@ -1,14 +1,17 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use substreams::store::{StoreGet, StoreGetRaw};
+use substreams::{
+    scalar::BigInt,
+    store::{StoreGet, StoreGetRaw},
+};
 use substreams_ethereum::pb::eth::v2 as eth;
 use tycho_substreams::prelude::*;
 
 use crate::{
     deltas::in_transaction_order,
     keys::{contract_id, market_tokens_key},
-    market_state::reserve_delta,
+    market_state::{reserve_delta, ReserveDelta},
     sy::supply_seed,
     transfers::{new_sy_components, supply_changes, SupplyChange},
 };
@@ -43,7 +46,7 @@ pub fn map_reserve_deltas(
             let [sy, pt, _yt] = roles.as_slice() else {
                 panic!("market {component_id} stored {} roles, expected 3", roles.len())
             };
-            for (token, amount) in [(pt, delta.pt), (sy, delta.sy)] {
+            for (token, amount) in nonzero_sides(pt, sy, delta) {
                 balance_deltas.push(BalanceDelta {
                     ord: log.ordinal,
                     tx: Some(tx.into()),
@@ -58,6 +61,21 @@ pub fn map_reserve_deltas(
     let created = new_sy_components(&new_components);
     balance_deltas.extend(sy_supply_deltas(supply_changes(&block, &store), &created));
     Ok(in_transaction_order(balance_deltas))
+}
+
+/// A market reserve change as a delta per token, leaving out a side that did not move.
+///
+/// A one-sided `Burn` leaves one side at zero. `aggregate_balances_changes` pairs store deltas with
+/// these one to one, so a delta that may write no store delta is never emitted.
+fn nonzero_sides<'a>(
+    pt: &'a Vec<u8>,
+    sy: &'a Vec<u8>,
+    delta: ReserveDelta,
+) -> Vec<(&'a Vec<u8>, BigInt)> {
+    [(pt, delta.pt), (sy, delta.sy)]
+        .into_iter()
+        .filter(|(_, amount)| *amount != BigInt::zero())
+        .collect()
 }
 
 /// Each SY supply change as a delta to the SY's holding of its own shares, plus the supply seed of
@@ -92,6 +110,10 @@ fn sy_supply_deltas(
         let Some(supply) = supply_seed(component) else {
             panic!("SY {} was created without its supply seed", component.id)
         };
+        // An SY created empty adds nothing; `map_protocol_changes` emits its zero supply directly.
+        if supply == BigInt::zero() {
+            continue;
+        }
         balance_deltas.push(BalanceDelta {
             ord: 0,
             tx: Some(tx.clone()),
@@ -195,15 +217,22 @@ mod tests {
         );
     }
 
-    /// A zero supply is still written: it is the SY's supply, and the bound on its redemptions.
+    /// A zero supply seed is no delta: whether adding zero writes a store delta is up to the
+    /// engine, and the aggregation pairs the two one to one. `map_protocol_changes` emits the SY's
+    /// zero supply directly instead.
     #[test]
-    fn a_zero_supply_seed_is_written() {
+    fn a_zero_supply_seed_is_not_a_delta() {
         let creation: Transaction = (&trace(2)).into();
         let component = sy(NEW_SY, Some(0));
-        assert_eq!(
-            rows(sy_supply_deltas(vec![], &[(&creation, &component)])),
-            vec![(2, 0, NEW_SY.to_string(), NEW_SY.to_string(), BigInt::zero())]
-        );
+        assert!(rows(sy_supply_deltas(vec![], &[(&creation, &component)])).is_empty());
+    }
+
+    /// A `Burn` that returns only SY moves the SY reserve alone; the zero PT side is no delta.
+    #[test]
+    fn a_one_sided_burn_moves_one_reserve() {
+        let (pt, sy) = (vec![0x0b; 20], vec![0xcb; 20]);
+        let burn = ReserveDelta { pt: BigInt::zero(), sy: BigInt::from(-500) };
+        assert_eq!(nonzero_sides(&pt, &sy, burn), vec![(&sy, BigInt::from(-500))]);
     }
 
     #[test]

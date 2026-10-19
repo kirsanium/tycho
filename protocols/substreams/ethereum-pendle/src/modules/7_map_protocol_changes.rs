@@ -27,7 +27,7 @@ use crate::{
     shares::{
         is_share_holder, ratio_pairs, share_balance_key, share_holders, share_ratio_key, ShareRatio,
     },
-    sy::{is_class_attribute, is_creation_seed, SY_TOTAL_SUPPLY},
+    sy::{is_class_attribute, is_creation_seed, supply_seed, SY_TOTAL_SUPPLY},
     sy_rates::{
         encode_timestamp, py_index_current, RefreshParams, BLOCK_TIMESTAMP, PY_INDEX_CURRENT,
         RATE_SAMPLED_AT, SY_EXCHANGE_RATE,
@@ -67,6 +67,9 @@ pub fn map_protocol_changes(
             .or_insert_with(|| TransactionChangesBuilder::new(tx));
         for component in &tx_components.components {
             builder.add_protocol_component(&as_emitted(component));
+            if let Some(change) = creation_supply(component) {
+                builder.add_entity_change(&change);
+            }
             // The creation-time `pyIndexStored()` read lands here rather than in the component's
             // static attributes: it is state, and it changes on the yield token's next interest
             // event.
@@ -600,7 +603,8 @@ fn clock_only(component_id: &str, timestamp: &[u8]) -> EntityChanges {
 
 /// Reads `exchangeRate()` for each SY in one batch.
 ///
-/// Every SY in the input appears in the result; the value is `None` where the call failed.
+/// Every SY in the input appears in the result; the value is `None` where the call failed or
+/// answered zero (see [`usable_rate`]).
 fn read_exchange_rates(sy_ids: &[String]) -> BTreeMap<String, Option<BigInt>> {
     let mut batch = RpcBatch::new();
     for sy in sy_ids {
@@ -615,15 +619,39 @@ fn read_exchange_rates(sy_ids: &[String]) -> BTreeMap<String, Option<BigInt>> {
 
     let mut rates = BTreeMap::new();
     for (index, sy) in sy_ids.iter().enumerate() {
-        let rate = responses
-            .get(index)
-            .and_then(RpcBatch::decode::<_, pendle_sy::functions::ExchangeRate>);
+        let rate = usable_rate(
+            responses
+                .get(index)
+                .and_then(RpcBatch::decode::<_, pendle_sy::functions::ExchangeRate>),
+        );
         if rate.is_none() {
-            log::info!("SY {} did not answer exchangeRate(), leaving its rate undated", sy);
+            log::info!("SY {} gave no usable exchangeRate(), leaving its rate undated", sy);
         }
         rates.insert(sy.clone(), rate);
     }
     rates
+}
+
+/// An SY's supply at creation, absolute.
+///
+/// The supply store only reports a supply that a delta moved, and an SY created empty has none,
+/// yet consumers need the attribute: it bounds every redemption.
+fn creation_supply(component: &ProtocolComponent) -> Option<EntityChanges> {
+    let supply = supply_seed(component)?;
+    Some(EntityChanges {
+        component_id: component.id.clone(),
+        attributes: vec![state_attribute(SY_TOTAL_SUPPLY, supply.to_signed_bytes_be())],
+    })
+}
+
+/// A rate the refresh can emit: `None` for a failed read and for zero.
+///
+/// An SY that is drained or deprecated can answer `exchangeRate()` with zero; one did at block
+/// 25,835,592 and still does. No SY can be priced at zero, since every conversion divides by the
+/// rate, so it is treated as a read that did not resolve: the rate stays undated and the clock
+/// stops, and the consumer refuses to quote rather than receiving a value it must reject.
+fn usable_rate(rate: Option<BigInt>) -> Option<BigInt> {
+    rate.filter(|rate| *rate > BigInt::zero())
 }
 
 /// Every market the yield token at `yt` backs, or none when it backs no market.
@@ -734,6 +762,27 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+
+    /// An SY created empty still carries its supply, zero, from creation; a market carries none.
+    #[test]
+    fn an_sy_created_empty_carries_a_zero_supply() {
+        let sy =
+            ProtocolComponent::new("0xcbc72d92b2dc8187414f6734718563898740c0bc").with_attributes(
+                &[(crate::sy::CREATION_TOTAL_SUPPLY, BigInt::zero().to_signed_bytes_be())],
+            );
+        let change = creation_supply(&sy).expect("an SY carries its supply");
+        assert_eq!(change.attributes[0].name, SY_TOTAL_SUPPLY);
+        assert_eq!(BigInt::from_signed_bytes_be(&change.attributes[0].value), BigInt::zero());
+        assert!(creation_supply(&ProtocolComponent::new("0x34")).is_none());
+    }
+
+    /// A zero rate is as unusable as a failed read; any positive rate passes unchanged.
+    #[test]
+    fn a_zero_rate_is_left_undated() {
+        assert_eq!(usable_rate(Some(BigInt::zero())), None);
+        assert_eq!(usable_rate(None), None);
+        assert_eq!(usable_rate(Some(BigInt::from(1))), Some(BigInt::from(1)));
+    }
 
     /// The seeds feed the stores and the classes are state; everything else is emitted unchanged.
     /// 10e18 as the aggregation hands it back has its top bit set; it must reach the consumer as a
