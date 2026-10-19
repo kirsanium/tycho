@@ -7,7 +7,10 @@
 //! `SY.exchangeRate()` is what limits it. It moves with whatever protocol the SY wraps, an
 //! external accrual this package holds no model for, so it is valid for the block it was read at
 //! and for no other. A quote is therefore only reproducible at [`PendleState`]'s own
-//! `rate_sampled_at`, where the rate and the curve describe the same moment.
+//! `rate_sampled_at`, where the rate and the curve describe the same moment. When `apply_block`
+//! names a later execution block, a market evaluates the curve's time terms there and keeps the
+//! sampled rate: the time terms are exact at any moment, and the rate is the part no one can know
+//! in advance.
 //!
 //! Once the chain moves past that block the state still answers *a* question exactly — just not
 //! the current one. Since only exact quotes are wanted, that is refused rather than served with

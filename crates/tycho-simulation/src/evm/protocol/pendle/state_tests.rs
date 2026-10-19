@@ -708,10 +708,12 @@ fn a_market_refuses_quotes_that_would_execute_at_expiry() {
     let before = sy_for_pt(&state, &one).expect("live at the sampled block");
 
     assert!(
-        !state.apply_block(&BlockContext::new(1, expiry - 1)),
-        "still live: nothing to re-emit"
+        state.apply_block(&BlockContext::new(1, expiry - 1)),
+        "still live, but the quote moves to the execution block"
     );
-    assert_eq!(sy_for_pt(&state, &one).unwrap(), before, "the quote stays at the sampled block");
+    let at_execution = sy_for_pt(&state, &one).unwrap();
+    assert_ne!(at_execution, before);
+    assert_eq!(at_execution, sy_for_pt(&wsteth_market(expiry - 1), &one).unwrap());
 
     assert!(state.apply_block(&BlockContext::new(2, expiry)), "turning expired must re-emit");
     assert!(!state.apply_block(&BlockContext::new(2, expiry)), "a repeated block changes nothing");
@@ -726,6 +728,40 @@ fn a_market_refuses_quotes_that_would_execute_at_expiry() {
             .get_limits(Bytes::from_str(from).unwrap(), Bytes::from_str(to).unwrap())
             .unwrap();
         assert_eq!((max_in, max_out), (BigUint::ZERO, BigUint::ZERO), "{from}->{to}");
+    }
+}
+
+/// With an execution block recorded, a market quotes every edge at that block's time with the index
+/// as sampled: the same answer as the market sampled at that moment. An execution block at or
+/// before the sample leaves the quotes, and the stream, alone.
+#[test]
+fn a_market_quotes_at_the_execution_block() {
+    let sampled = 1_787_273_051;
+    let one = BigUint::from(10u64.pow(18));
+    let quotes = |state: &PendleState| {
+        [(SY, PT), (PT, SY), (SY, YT), (YT, SY)].map(|(from, to)| {
+            state
+                .get_amount_out(one.clone(), &token(from, 18), &token(to, 18))
+                .unwrap()
+                .amount
+        })
+    };
+    let mut state = wsteth_market(sampled);
+    let at_sample = quotes(&state);
+
+    assert!(!state.apply_block(&BlockContext::new(1, sampled - 12)));
+    assert!(!state.apply_block(&BlockContext::new(1, sampled)));
+    assert_eq!(quotes(&state), at_sample);
+
+    assert!(state.apply_block(&BlockContext::new(2, sampled + 12)));
+    let at_execution = quotes(&state);
+    assert_eq!(at_execution, quotes(&wsteth_market(sampled + 12)));
+    for (edge, (later, earlier)) in at_execution
+        .iter()
+        .zip(&at_sample)
+        .enumerate()
+    {
+        assert_ne!(later, earlier, "edge {edge} did not move with the clock");
     }
 }
 

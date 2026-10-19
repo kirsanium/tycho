@@ -143,8 +143,9 @@ pub struct PendleMarketState {
     pub market: MarketState,
     /// `max(pyIndexStored, SY.exchangeRate())` as of [`Self::rate_sampled_at`].
     pub py_index: U256,
-    /// The block timestamp at which `py_index` was read. Also the clock a quote runs on: it is
-    /// the one moment for which the rate and the curve describe the same state.
+    /// The block timestamp at which `py_index` was read: the one moment for which the rate and the
+    /// curve describe the same state. Quotes run on this clock until [`Self::execution_timestamp`]
+    /// moves them later; see [`Self::quote_time`].
     pub rate_sampled_at: u64,
     /// The chain head as the stream last reported it, injected by the decoder rather than emitted
     /// by the Substreams package. Only ever compared against `rate_sampled_at`, to tell whether
@@ -157,9 +158,9 @@ pub struct PendleMarketState {
     /// edge moves SY, so this refuses every quote against the market.
     pub sy_paused: bool,
     /// Timestamp of the block a quote is expected to execute in, from
-    /// [`ProtocolSim::apply_block`]; zero until one is given. Only ever used to judge expiry: a
-    /// quote is still computed at [`Self::rate_sampled_at`], but one that would execute at or
-    /// after expiry reverts on chain, so it is refused.
+    /// [`ProtocolSim::apply_block`]; zero until one is given. Once later than
+    /// [`Self::rate_sampled_at`], quotes evaluate the curve's time terms here, with the index as
+    /// sampled, and a quote that would execute at or after expiry is refused.
     #[serde(default)]
     pub execution_timestamp: u64,
     /// Whether the stream has not yet carried the market's fees, which the indexer reads at
@@ -774,18 +775,19 @@ impl ProtocolSim for PendleState {
         }
     }
 
-    /// Records the execution block's timestamp on a market, so a quote that would execute at or
-    /// after expiry is refused. Re-emits only when that flips the market to expired; an SY has no
-    /// expiry and never changes.
+    /// Records the execution block's timestamp on a market, so its quotes are evaluated at the
+    /// moment the swap runs, and one that would execute at or after expiry is refused. Re-emits
+    /// when that moves the quote time or flips the market to expired; an SY's quotes do not
+    /// depend on time, so it never changes.
     fn apply_block(&mut self, block: &BlockContext) -> bool {
         let PendleState::Market(state) = self else { return false };
         if state.execution_timestamp == block.timestamp() {
             return false;
         }
-        let expired_before = state.expired();
+        let before = (state.quote_time(), state.expired());
         state.execution_timestamp = block.timestamp();
         state.memo = MarketMemo::default();
-        expired_before != state.expired()
+        before != (state.quote_time(), state.expired())
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolSim> {
@@ -842,12 +844,19 @@ impl PendleState {
 }
 
 impl PendleMarketState {
-    /// The timestamp this market's quotes are evaluated at: the block its rate was read at.
+    /// The timestamp this market's quotes are evaluated at: the execution block's, once
+    /// [`ProtocolSim::apply_block`] has recorded one later than the sample, and the block the rate
+    /// was read at otherwise.
     ///
-    /// Not the chain head. Evaluating the curve at the head while holding a rate from an earlier
-    /// block would pair two different moments — see the `clock` module.
+    /// The curve's time terms are closed forms, so they can be evaluated at the moment the swap
+    /// runs; the index stays the sampled one, which nothing here projects. A quote at the
+    /// execution block is therefore what the router pays there if the index has not moved and no
+    /// earlier transaction in that block trades the market. Never the chain head alone: whether
+    /// the rate still holds for the head is [`Self::is_current`]'s question — see the `clock`
+    /// module.
     pub fn quote_time(&self) -> u64 {
         self.rate_sampled_at
+            .max(self.execution_timestamp)
     }
 
     /// Whether this state still answers for the current block.
@@ -895,30 +904,29 @@ impl PendleMarketState {
         approx::calc_max_pt_out(&comp, self.market.total_pt)
     }
 
-    /// The market as it may stand at the execution block, when `apply_block` has recorded one later
-    /// than the sampled block; empty otherwise.
+    /// The market at the execution block with a risen index, when `apply_block` has recorded one
+    /// later than the sampled block; empty otherwise.
     ///
-    /// The clock moves to that block, and the PY index may have risen: it accrues with the yield
-    /// token, and nothing here projects it. It can also fall: the indexed index is
-    /// `max(SY.exchangeRate(), pyIndexStored)` with the stored value followed from events, and the
-    /// YT stores a new one only when someone interacts with it, so an exchange rate that dips
-    /// between the two blocks lowers the index the execution block uses. That case is not covered
-    /// here. The market is taken at the execution block's time with the index as sampled and
-    /// [`INDEX_DRIFT`] above it. Whether a trade fills is not monotone in the index near a bound,
-    /// so these two states alone do not cover the indices between them; [`EXECUTION_HAIRCUT`]
-    /// keeps the limits clear of the bound.
+    /// This state already quotes at that block's time, with the index as sampled. The index may
+    /// have risen by then: it accrues with the yield token, and nothing here projects it. It can
+    /// also fall: the indexed index is `max(SY.exchangeRate(), pyIndexStored)` with the stored
+    /// value followed from events, and the YT stores a new one only when someone interacts with
+    /// it, so an exchange rate that dips between the two blocks lowers the index the execution
+    /// block uses. That case is not covered here. The returned market carries the index
+    /// [`INDEX_DRIFT`] above the sampled one. Whether a trade fills is not monotone in the index
+    /// near a bound, so this and the sampled index alone do not cover the indices between them;
+    /// [`EXECUTION_HAIRCUT`] keeps the limits clear of the bound.
     fn at_execution(&self) -> Vec<Self> {
         if self.execution_timestamp <= self.rate_sampled_at {
             return Vec::new();
         }
-        let later = Self { rate_sampled_at: self.execution_timestamp, ..self.clone() };
         // Rounded up, so it is never zero: an index below 1e12 wei would otherwise get no drift at
         // all, though it moves in whole wei.
         let drift = self
             .py_index
             .saturating_mul(INDEX_DRIFT)
             .div_ceil(ONE_E18);
-        vec![Self { py_index: later.py_index.saturating_add(drift), ..later.clone() }, later]
+        vec![Self { py_index: self.py_index.saturating_add(drift), ..self.clone() }]
     }
 
     /// The most PT the market itself will send out before its exchange rate falls below par.
@@ -1330,12 +1338,11 @@ fn market_limits(
 
     // Each limit starts from a closed form for the edge's boundary, checked against
     // the quote, which replicates the router to the wei. Without an execution block
-    // the limit is that boundary, exact. With one (`apply_block`), the swap executes
-    // later than the quote, where the bounds have moved: the SY-in bounds shrink by
-    // about 1.5e-9 a block, and the index may have risen. Each closed form then starts
-    // from the smallest of its values at the sampled block and at the execution block
-    // with the index as sampled and `INDEX_DRIFT` above it, gives up
-    // `EXECUTION_HAIRCUT`, and must still fill at all three.
+    // the limit is that boundary, exact. With one (`apply_block`), the state quotes at
+    // that block's time, but the index may have risen by then. Each closed form then
+    // starts from the smaller of its values with the index as sampled and
+    // `INDEX_DRIFT` above it, gives up `EXECUTION_HAIRCUT`, and must still fill at
+    // both.
     let at_execution = state.at_execution();
     let states: Vec<&PendleMarketState> = std::iter::once(state)
         .chain(&at_execution)
@@ -1347,11 +1354,10 @@ fn market_limits(
                 .is_ok()
         })
     };
-    // A bound a checked state cannot evaluate counts as zero: no depth. At the
-    // execution block that is a rate floor the clock has carried the market past. At
-    // the sampled block it is a market whose closed form leaves the math's domain, such
-    // as an exponent past -41 on a steep curve or a PT reserve of dust; the router's
-    // search, which evaluates the same form, reverts there too.
+    // A bound a checked state cannot evaluate counts as zero: no depth. That is a rate
+    // floor the clock has carried the market past, or a market whose closed form leaves
+    // the math's domain, such as an exponent past -41 on a steep curve or a PT reserve
+    // of dust; the router's search, which evaluates the same form, reverts there too.
     let smallest = |bound: &dyn Fn(&PendleMarketState) -> Result<U256, PendleError>| {
         states
             .iter()
@@ -1461,11 +1467,12 @@ fn market_limits(
     // An input that fills but yields nothing is no depth, not a trade. A YT sale that
     // must hold at the execution block also needs to pay more than the repayment's
     // rounding there, which comes in whole wei of SY: below that, a sale that fills at
-    // the checked states can fail at an index between them. What it pays at the
-    // sampled block says nothing about this: a sale paying a thousand wei an hour
-    // before expiry pays none a second before it.
+    // the checked states can fail at an index between them. Only the execution block
+    // matters, so without one there is no such check: a sale paying a thousand wei an
+    // hour before expiry pays none a second before it.
     let dust = (from, to) == (MarketToken::Yt, MarketToken::Sy) &&
-        at_execution.iter().any(|state| {
+        for_execution &&
+        states.iter().any(|state| {
             state
                 .amount_out(max_in, from, to)
                 .map_or(true, |swap| swap.amount_out < YT_SALE_DUST)
