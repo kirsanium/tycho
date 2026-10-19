@@ -313,8 +313,19 @@ pub fn max_sy_in_for_pt(
     block_time: u64,
 ) -> PendleResult<(U256, U256)> {
     let comp = market::get_market_pre_compute(market, index, block_time)?;
-    let max_pt_out = calc_max_pt_out(&comp, market.total_pt)?;
-    let (sy_in, _) = calc_sy_in(market, &comp, index, max_pt_out)?;
+    max_sy_in_for_pt_with(market, &comp, index)
+}
+
+/// [`max_sy_in_for_pt`] from `comp`, the [`market::get_market_pre_compute`] of `market` and
+/// `index` at the block time meant, which therefore needs no time of its own. Returns what
+/// [`max_sy_in_for_pt`] returns at that time.
+pub fn max_sy_in_for_pt_with(
+    market: &MarketState,
+    comp: &MarketPreCompute,
+    index: U256,
+) -> PendleResult<(U256, U256)> {
+    let max_pt_out = calc_max_pt_out(comp, market.total_pt)?;
+    let (sy_in, _) = calc_sy_in(market, comp, index, max_pt_out)?;
     Ok((sy_in, max_pt_out))
 }
 
@@ -328,8 +339,19 @@ pub fn max_sy_in_for_yt(
     block_time: u64,
 ) -> PendleResult<(U256, U256)> {
     let comp = market::get_market_pre_compute(market, index, block_time)?;
-    let max_yt_out = calc_soft_max_pt_in(market, &comp)?;
-    let (sy_out, _) = calc_sy_out(market, &comp, index, max_yt_out)?;
+    max_sy_in_for_yt_with(market, &comp, index)
+}
+
+/// [`max_sy_in_for_yt`] from `comp`, the [`market::get_market_pre_compute`] of `market` and
+/// `index` at the block time meant, which therefore needs no time of its own. Returns what
+/// [`max_sy_in_for_yt`] returns at that time.
+pub fn max_sy_in_for_yt_with(
+    market: &MarketState,
+    comp: &MarketPreCompute,
+    index: U256,
+) -> PendleResult<(U256, U256)> {
+    let max_yt_out = calc_soft_max_pt_in(market, comp)?;
+    let (sy_out, _) = calc_sy_out(market, comp, index, max_yt_out)?;
     let to_tokenize = sy_utils::asset_to_sy_up(index, max_yt_out)?;
     if to_tokenize < sy_out {
         return Err(PendleError::NegativeResult {
@@ -348,20 +370,32 @@ pub fn approx_swap_exact_sy_for_pt(
     block_time: u64,
 ) -> PendleResult<ApproxResult> {
     let comp = market::get_market_pre_compute(market, index, block_time)?;
+    approx_swap_exact_sy_for_pt_with(market, &comp, index, exact_sy_in, block_time)
+}
+
+/// [`approx_swap_exact_sy_for_pt`] from `comp`, the [`market::get_market_pre_compute`] of `market`
+/// and `index` at `block_time`. Returns what [`approx_swap_exact_sy_for_pt`] returns.
+pub fn approx_swap_exact_sy_for_pt_with(
+    market: &MarketState,
+    comp: &MarketPreCompute,
+    index: U256,
+    exact_sy_in: U256,
+    block_time: u64,
+) -> PendleResult<ApproxResult> {
     let estimate = estimate_swap_exact_sy_for_pt(market, index, block_time, exact_sy_in)?;
-    let hard_bounds = [U256::ZERO, calc_max_pt_out(&comp, market.total_pt)?];
+    let hard_bounds = [U256::ZERO, calc_max_pt_out(comp, market.total_pt)?];
     let mut state = ApproxState::init_no_offchain(estimate, hard_bounds)?;
 
     for iteration in 0..state.max_iteration {
         let guess = state.cur_guess;
-        let (net_sy_in, trade) = calc_sy_in(market, &comp, index, guess)?;
+        let (net_sy_in, trade) = calc_sy_in(market, comp, index, guess)?;
 
         if net_sy_in <= exact_sy_in {
             if pmath::is_a_smaller_approx_b(net_sy_in, exact_sy_in, state.eps)? {
                 let net_pt_to_account = pmath::to_i256(guess)?;
                 let market_after = market::apply_trade(
                     market,
-                    &comp,
+                    comp,
                     index,
                     net_pt_to_account,
                     &trade,
@@ -395,9 +429,21 @@ pub fn approx_swap_exact_sy_for_yt(
     block_time: u64,
 ) -> PendleResult<ApproxResult> {
     let comp = market::get_market_pre_compute(market, index, block_time)?;
+    approx_swap_exact_sy_for_yt_with(market, &comp, index, exact_sy_in, block_time)
+}
+
+/// [`approx_swap_exact_sy_for_yt`] from `comp`, the [`market::get_market_pre_compute`] of `market`
+/// and `index` at `block_time`. Returns what [`approx_swap_exact_sy_for_yt`] returns.
+pub fn approx_swap_exact_sy_for_yt_with(
+    market: &MarketState,
+    comp: &MarketPreCompute,
+    index: U256,
+    exact_sy_in: U256,
+    block_time: u64,
+) -> PendleResult<ApproxResult> {
     let estimate = estimate_swap_exact_sy_for_yt(market, index, block_time, exact_sy_in)?;
     let hard_bounds =
-        [sy_utils::sy_to_asset(index, exact_sy_in)?, calc_soft_max_pt_in(market, &comp)?];
+        [sy_utils::sy_to_asset(index, exact_sy_in)?, calc_soft_max_pt_in(market, comp)?];
     // Tokenizing the input alone already needs more PT sold back than the market absorbs. The
     // router reverts here too (`ApproxParamsInvalid`), but the cause is the input's size, not a
     // malformed search, so it is reported as the trade being too big.
@@ -408,7 +454,7 @@ pub fn approx_swap_exact_sy_for_yt(
 
     for iteration in 0..state.max_iteration {
         let guess = state.cur_guess;
-        let (net_sy_out, trade) = calc_sy_out(market, &comp, index, guess)?;
+        let (net_sy_out, trade) = calc_sy_out(market, comp, index, guess)?;
         let net_sy_to_tokenize_pt = sy_utils::asset_to_sy_up(index, guess)?;
         if net_sy_to_tokenize_pt < net_sy_out {
             return Err(PendleError::NegativeResult {
@@ -425,7 +471,7 @@ pub fn approx_swap_exact_sy_for_yt(
                 let net_pt_to_account = -pmath::to_i256(guess)?;
                 let market_after = market::apply_trade(
                     market,
-                    &comp,
+                    comp,
                     index,
                     net_pt_to_account,
                     &trade,

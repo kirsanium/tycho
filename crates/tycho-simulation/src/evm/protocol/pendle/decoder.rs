@@ -168,6 +168,7 @@ fn decode_market(
         sy_paused,
         execution_timestamp: 0,
         fee_unread,
+        memo: Default::default(),
     })
 }
 

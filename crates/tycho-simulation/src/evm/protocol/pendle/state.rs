@@ -23,7 +23,7 @@
 //! the implied rate the next trade is anchored on — so a caller sizing or splitting a trade prices
 //! each leg against the depth the one before it left.
 
-use std::{any::Any, collections::HashMap, fmt, fmt::Debug, str::FromStr};
+use std::{any::Any, collections::HashMap, fmt, fmt::Debug, str::FromStr, sync::OnceLock};
 
 use alloy::primitives::{I256, U256};
 use num_bigint::BigUint;
@@ -43,7 +43,7 @@ use super::{
     math::{
         approx,
         errors::PendleError,
-        market::{self, MarketState},
+        market::{self, MarketPreCompute, MarketState},
         pmath, sy_utils,
     },
 };
@@ -166,7 +166,50 @@ pub struct PendleMarketState {
     /// creation and can fail to. The market then refuses every quote until a fee update arrives.
     #[serde(default)]
     pub fee_unread: bool,
+    /// What this state derives from itself, kept after first use. See [`MarketMemo`].
+    #[serde(skip)]
+    pub memo: MarketMemo,
 }
+
+/// Values a market state derives from itself, kept after their first use: the curve's pre-compute,
+/// which every quote and bound starts from, and the limits of each edge, which `spot_price` and
+/// `query_pool_swap` ask for again on every call.
+///
+/// Each value is stored with the state it was computed from and used only while that still
+/// matches, so a state whose public fields are changed in place recomputes rather than answering
+/// stale. A clone starts empty, and `delta_transition` and `apply_block` empty it, so the state a
+/// change leaves behind can fill it again. Equality and serialization ignore it.
+#[derive(Default)]
+pub struct MarketMemo {
+    pre_compute: OnceLock<Box<KeptPreCompute>>,
+    limits: [OnceLock<Box<KeptLimits>>; 4],
+}
+
+/// A pre-compute, with the market, index and time it was computed at.
+type KeptPreCompute = (MarketState, U256, u64, MarketPreCompute);
+
+/// An edge's limits, with the state they were computed from.
+type KeptLimits = (PendleMarketState, (BigUint, BigUint));
+
+impl Clone for MarketMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl fmt::Debug for MarketMemo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MarketMemo")
+    }
+}
+
+impl PartialEq for MarketMemo {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for MarketMemo {}
 
 /// The ERC-5115 wrapper, and the conversions it supports per token.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +263,29 @@ pub enum PendleState {
 }
 
 impl PendleMarketState {
+    /// The contract's `getMarketPreCompute` at [`Self::quote_time`], kept in [`MarketMemo`].
+    fn pre_compute(&self) -> Result<MarketPreCompute, PendleError> {
+        let at = self.quote_time();
+        if let Some((market, index, time, comp)) = self
+            .memo
+            .pre_compute
+            .get()
+            .map(|kept| &**kept)
+        {
+            if *market == self.market && *index == self.py_index && *time == at {
+                return Ok(comp.clone());
+            }
+        }
+        let comp = market::get_market_pre_compute(&self.market, self.py_index, at)?;
+        let _ = self.memo.pre_compute.set(Box::new((
+            self.market.clone(),
+            self.py_index,
+            at,
+            comp.clone(),
+        )));
+        Ok(comp)
+    }
+
     /// Which of the market's three tokens an address names.
     fn role(&self, token: &Bytes) -> Option<MarketToken> {
         if *token == self.sy_address {
@@ -274,8 +340,9 @@ impl PendleMarketState {
 
     /// PT in → SY out. Exact: the market has this primitive.
     fn pt_for_sy(&self, pt_in: U256) -> Result<(U256, MarketState), PendleError> {
-        let executed = market::execute_trade(
+        let executed = market::execute_trade_with(
             &self.market,
+            &self.pre_compute()?,
             self.py_index,
             -pmath::to_i256(pt_in)?,
             self.quote_time(),
@@ -290,8 +357,9 @@ impl PendleMarketState {
     fn yt_for_sy(&self, yt_in: U256) -> Result<(U256, MarketState), PendleError> {
         // The borrowed PT leg is a real market trade, so it goes through the same checks the
         // market runs: above all, it cannot lend out more PT than it holds.
-        let executed = market::execute_trade(
+        let executed = market::execute_trade_with(
             &self.market,
+            &self.pre_compute()?,
             self.py_index,
             pmath::to_i256(yt_in)?,
             self.quote_time(),
@@ -332,8 +400,9 @@ impl PendleMarketState {
                 (out, GAS_YT_FOR_SY, market)
             }
             (MarketToken::Sy, MarketToken::Pt) => {
-                let filled = approx::approx_swap_exact_sy_for_pt(
+                let filled = approx::approx_swap_exact_sy_for_pt_with(
                     &self.market,
+                    &self.pre_compute()?,
                     self.py_index,
                     amount_in,
                     self.quote_time(),
@@ -341,8 +410,9 @@ impl PendleMarketState {
                 (filled.amount_out, GAS_SY_FOR_PT, filled.market_after)
             }
             (MarketToken::Sy, MarketToken::Yt) => {
-                let filled = approx::approx_swap_exact_sy_for_yt(
+                let filled = approx::approx_swap_exact_sy_for_yt_with(
                     &self.market,
+                    &self.pre_compute()?,
                     self.py_index,
                     amount_in,
                     self.quote_time(),
@@ -472,11 +542,7 @@ impl ProtocolSim for PendleState {
     fn fee(&self) -> f64 {
         match self {
             PendleState::Market(state) => {
-                let Ok(comp) = market::get_market_pre_compute(
-                    &state.market,
-                    state.py_index,
-                    state.quote_time(),
-                ) else {
+                let Ok(comp) = state.pre_compute() else {
                     return 0.0;
                 };
                 let excess = comp.fee_rate - pmath::i_one();
@@ -624,181 +690,24 @@ impl ProtocolSim for PendleState {
     ) -> Result<(BigUint, BigUint), SimulationError> {
         match self {
             PendleState::Market(state) => {
-                if state.expired() {
-                    // Dead, not merely empty. Zero depth in both directions.
-                    return Ok(no_depth());
-                }
-                // Every edge moves SY, which a paused SY refuses to transfer, and no edge can be
-                // priced without the fee.
-                if state.sy_paused || state.fee_unread {
-                    return Ok(no_depth());
-                }
-                // A bound this state cannot quote against is not a bound. Reported as no depth
-                // rather than an error, so a router skips the market the way it skips an expired
-                // one instead of treating a routine gap as a failure.
-                if !state.is_current() {
-                    return Ok(no_depth());
-                }
-                // No liquidity yet. Every bound below divides by the reserves.
-                if state.market.total_pt <= I256::ZERO || state.market.total_sy <= I256::ZERO {
-                    return Ok(no_depth());
-                }
-                let (Some(from), Some(to)) = (state.role(&sell_token), state.role(&buy_token))
-                else {
-                    return Ok(no_depth());
+                let slot = match (state.role(&sell_token), state.role(&buy_token)) {
+                    (Some(MarketToken::Sy), Some(MarketToken::Pt)) => Some(0),
+                    (Some(MarketToken::Pt), Some(MarketToken::Sy)) => Some(1),
+                    (Some(MarketToken::Sy), Some(MarketToken::Yt)) => Some(2),
+                    (Some(MarketToken::Yt), Some(MarketToken::Sy)) => Some(3),
+                    _ => None,
                 };
-
-                // Each limit starts from a closed form for the edge's boundary, checked against
-                // the quote, which replicates the router to the wei. Without an execution block
-                // the limit is that boundary, exact. With one (`apply_block`), the swap executes
-                // later than the quote, where the bounds have moved: the SY-in bounds shrink by
-                // about 1.5e-9 a block, and the index may have risen. Each closed form then starts
-                // from the smallest of its values at the sampled block and at the execution block
-                // with the index as sampled and `INDEX_DRIFT` above it, gives up
-                // `EXECUTION_HAIRCUT`, and must still fill at all three.
-                let at_execution = state.at_execution();
-                let states: Vec<&PendleMarketState> = std::iter::once(state)
-                    .chain(&at_execution)
-                    .collect();
-                let fills = |amount: U256| {
-                    states.iter().all(|state| {
-                        state
-                            .amount_out(amount, from, to)
-                            .is_ok()
-                    })
-                };
-                // A bound a checked state cannot evaluate counts as zero: no depth. At the
-                // execution block that is a rate floor the clock has carried the market past. At
-                // the sampled block it is a market whose closed form leaves the math's domain, such
-                // as an exponent past -41 on a steep curve or a PT reserve of dust; the router's
-                // search, which evaluates the same form, reverts there too.
-                let smallest = |bound: &dyn Fn(&PendleMarketState) -> Result<U256, PendleError>| {
-                    states
-                        .iter()
-                        .map(|state| bound(state).unwrap_or(U256::ZERO))
-                        .min()
-                        .unwrap_or(U256::ZERO)
-                };
-                let for_execution = !at_execution.is_empty();
-                let max_in = match (from, to) {
-                    // The router's search stops at the haircut rate floor, and without an execution
-                    // block accepts a request up to `eps` above what that bound costs.
-                    (MarketToken::Sy, MarketToken::Pt) => {
-                        let exact = smallest(&|state| {
-                            let (sy_in, pt_out) = approx::max_sy_in_for_pt(
-                                &state.market,
-                                state.py_index,
-                                state.quote_time(),
-                            )?;
-                            if for_execution {
-                                state.clear_of_anchor_noise(sy_in, pt_out)
-                            } else {
-                                Ok(sy_in)
-                            }
-                        });
-                        sy_in_limit(exact, for_execution, fills)?
-                    }
-                    // The same search, bounded by the proportion cap the minted PT is sold into.
-                    (MarketToken::Sy, MarketToken::Yt) => {
-                        let exact = smallest(&|state| {
-                            approx::max_sy_in_for_yt(
-                                &state.market,
-                                state.py_index,
-                                state.quote_time(),
-                            )
-                            .map(|(sy_in, _)| sy_in)
-                        });
-                        sy_in_limit(exact, for_execution, fills)?
-                    }
-                    // Selling PT hands PT *to* the market, so the 96% proportion cap binds, and the
-                    // market checks it directly: the closed form is the boundary.
-                    (MarketToken::Pt, MarketToken::Sy) => {
-                        let bound = smallest(&|state| state.max_pt_in());
-                        let bound = if for_execution { haircut(bound) } else { bound };
-                        if fills(bound) {
-                            bound
-                        } else {
-                            U256::ZERO
-                        }
-                    }
-                    // Selling YT flash-*borrows* PT from the market and buys it back, fee included,
-                    // so each extra YT pays less, and past some size it pays nothing or costs SY:
-                    // the trader's output peaks well before the market's rate floor stops the
-                    // trade. The limit is that peak, searched for within what fills; a larger
-                    // sale executes but returns less.
-                    (MarketToken::Yt, MarketToken::Sy) => {
-                        let candidate = smallest(&|state| {
-                            let bound = state.max_pt_out_unhaircut()?;
-                            if for_execution {
-                                state.clear_of_anchor_noise(bound, bound)
-                            } else {
-                                Ok(bound)
-                            }
-                        });
-                        // The sale itself never evaluates that closed form, so where it cannot be
-                        // evaluated the sale may still fill: the boundary is searched for instead.
-                        let candidate = if candidate.is_zero() {
-                            largest_filling_input(pmath::to_u256(state.market.total_pt)?, fills)
-                        } else {
-                            candidate
-                        };
-                        let fillable =
-                            largest_fill(candidate, smallest(&|state| state.max_pt_out()), fills);
-                        // Where the output still rises at the bound, the peak lands on it, so the
-                        // search keeps to the haircut bound.
-                        let fillable = if for_execution { haircut(fillable) } else { fillable };
-                        let output = |amount: U256| {
-                            state
-                                .amount_out(amount, from, to)
-                                .ok()
-                                .map(|swap| swap.amount_out)
-                        };
-                        // Within `fillable` the sale fills at every checked state, so the search
-                        // follows the sampled state's output alone and checks only its answer.
-                        let peak = most_output_within(fillable, output);
-                        if fills(peak) {
-                            peak
-                        } else {
-                            U256::ZERO
-                        }
-                    }
-                    // PT against YT, or either against itself: not an edge of this market.
-                    _ => return Ok(no_depth()),
-                };
-                // `get_amount_out` refuses any amount above `u128::MAX`, so a limit past it would
-                // not be quotable; it is clamped there, where it must still fill.
-                let max_in = if max_in > unbounded_soft_limit() {
-                    let clamped = unbounded_soft_limit();
-                    if fills(clamped) {
-                        clamped
-                    } else {
-                        U256::ZERO
-                    }
-                } else {
-                    max_in
-                };
-                if max_in.is_zero() {
-                    return Ok(no_depth());
+                let cached = slot
+                    .and_then(|slot| state.memo.limits[slot].get())
+                    .filter(|cached| cached.0 == *state);
+                if let Some(cached) = cached {
+                    return Ok(cached.1.clone());
                 }
-                let max_out = state
-                    .amount_out(max_in, from, to)?
-                    .amount_out;
-                // An input that fills but yields nothing is no depth, not a trade. A YT sale that
-                // must hold at the execution block also needs to pay more than the repayment's
-                // rounding there, which comes in whole wei of SY: below that, a sale that fills at
-                // the checked states can fail at an index between them. What it pays at the
-                // sampled block says nothing about this: a sale paying a thousand wei an hour
-                // before expiry pays none a second before it.
-                let dust = (from, to) == (MarketToken::Yt, MarketToken::Sy) &&
-                    at_execution.iter().any(|state| {
-                        state
-                            .amount_out(max_in, from, to)
-                            .map_or(true, |swap| swap.amount_out < YT_SALE_DUST)
-                    });
-                if max_out.is_zero() || dust {
-                    return Ok(no_depth());
+                let limits = market_limits(state, sell_token, buy_token)?;
+                if let Some(slot) = slot {
+                    let _ = state.memo.limits[slot].set(Box::new((state.clone(), limits.clone())));
                 }
-                Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
+                Ok(limits)
             }
             PendleState::Sy(state) => {
                 let Some((class, direction)) = state.class(&sell_token, &buy_token) else {
@@ -850,7 +759,10 @@ impl ProtocolSim for PendleState {
         balances: &Balances,
     ) -> Result<(), TransitionError> {
         match self {
-            PendleState::Market(state) => state.apply(&delta),
+            PendleState::Market(state) => {
+                state.memo = MarketMemo::default();
+                state.apply(&delta)
+            }
             // An SY's redemption to its yield token is bounded by what it holds of it, which
             // arrives as a component balance.
             PendleState::Sy(state) => {
@@ -872,6 +784,7 @@ impl ProtocolSim for PendleState {
         }
         let expired_before = state.expired();
         state.execution_timestamp = block.timestamp();
+        state.memo = MarketMemo::default();
         expired_before != state.expired()
     }
 
@@ -971,14 +884,14 @@ impl PendleMarketState {
 
     /// The most PT the market will absorb, from the 96% proportion cap.
     fn max_pt_in(&self) -> Result<U256, PendleError> {
-        let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
+        let comp = self.pre_compute()?;
         approx::calc_soft_max_pt_in(&self.market, &comp)
     }
 
     /// The most PT the router's search will take out, from the exchange-rate floor less its
     /// 999/1000 haircut.
     fn max_pt_out(&self) -> Result<U256, PendleError> {
-        let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
+        let comp = self.pre_compute()?;
         approx::calc_max_pt_out(&comp, self.market.total_pt)
     }
 
@@ -1010,14 +923,14 @@ impl PendleMarketState {
 
     /// The most PT the market itself will send out before its exchange rate falls below par.
     fn max_pt_out_unhaircut(&self) -> Result<U256, PendleError> {
-        let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
+        let comp = self.pre_compute()?;
         approx::calc_max_pt_out_unhaircut(&comp, self.market.total_pt)
     }
 
     /// `amount`, a bound whose trade takes `pt` PT to the exchange-rate floor, less the share of
     /// it that [`ANCHOR_NOISE`] can move: zero when the noise is all of `pt`.
     fn clear_of_anchor_noise(&self, amount: U256, pt: U256) -> Result<U256, PendleError> {
-        let comp = market::get_market_pre_compute(&self.market, self.py_index, self.quote_time())?;
+        let comp = self.pre_compute()?;
         let total_pt = pmath::to_u256(self.market.total_pt)?;
         let total_asset = pmath::to_u256(comp.total_asset)?;
         let reserves = total_pt.saturating_add(total_asset);
@@ -1384,6 +1297,183 @@ fn most_output_within(upper: U256, output: impl Fn(U256) -> Option<U256>) -> U25
         }
     }
     best.0
+}
+
+/// A market edge's limits, as [`ProtocolSim::get_limits`] documents them, computed afresh.
+fn market_limits(
+    state: &PendleMarketState,
+    sell_token: Bytes,
+    buy_token: Bytes,
+) -> Result<(BigUint, BigUint), SimulationError> {
+    if state.expired() {
+        // Dead, not merely empty. Zero depth in both directions.
+        return Ok(no_depth());
+    }
+    // Every edge moves SY, which a paused SY refuses to transfer, and no edge can be
+    // priced without the fee.
+    if state.sy_paused || state.fee_unread {
+        return Ok(no_depth());
+    }
+    // A bound this state cannot quote against is not a bound. Reported as no depth
+    // rather than an error, so a router skips the market the way it skips an expired
+    // one instead of treating a routine gap as a failure.
+    if !state.is_current() {
+        return Ok(no_depth());
+    }
+    // No liquidity yet. Every bound below divides by the reserves.
+    if state.market.total_pt <= I256::ZERO || state.market.total_sy <= I256::ZERO {
+        return Ok(no_depth());
+    }
+    let (Some(from), Some(to)) = (state.role(&sell_token), state.role(&buy_token)) else {
+        return Ok(no_depth());
+    };
+
+    // Each limit starts from a closed form for the edge's boundary, checked against
+    // the quote, which replicates the router to the wei. Without an execution block
+    // the limit is that boundary, exact. With one (`apply_block`), the swap executes
+    // later than the quote, where the bounds have moved: the SY-in bounds shrink by
+    // about 1.5e-9 a block, and the index may have risen. Each closed form then starts
+    // from the smallest of its values at the sampled block and at the execution block
+    // with the index as sampled and `INDEX_DRIFT` above it, gives up
+    // `EXECUTION_HAIRCUT`, and must still fill at all three.
+    let at_execution = state.at_execution();
+    let states: Vec<&PendleMarketState> = std::iter::once(state)
+        .chain(&at_execution)
+        .collect();
+    let fills = |amount: U256| {
+        states.iter().all(|state| {
+            state
+                .amount_out(amount, from, to)
+                .is_ok()
+        })
+    };
+    // A bound a checked state cannot evaluate counts as zero: no depth. At the
+    // execution block that is a rate floor the clock has carried the market past. At
+    // the sampled block it is a market whose closed form leaves the math's domain, such
+    // as an exponent past -41 on a steep curve or a PT reserve of dust; the router's
+    // search, which evaluates the same form, reverts there too.
+    let smallest = |bound: &dyn Fn(&PendleMarketState) -> Result<U256, PendleError>| {
+        states
+            .iter()
+            .map(|state| bound(state).unwrap_or(U256::ZERO))
+            .min()
+            .unwrap_or(U256::ZERO)
+    };
+    let for_execution = !at_execution.is_empty();
+    let max_in = match (from, to) {
+        // The router's search stops at the haircut rate floor, and without an execution
+        // block accepts a request up to `eps` above what that bound costs.
+        (MarketToken::Sy, MarketToken::Pt) => {
+            let exact = smallest(&|state| {
+                let (sy_in, pt_out) = approx::max_sy_in_for_pt_with(
+                    &state.market,
+                    &state.pre_compute()?,
+                    state.py_index,
+                )?;
+                if for_execution {
+                    state.clear_of_anchor_noise(sy_in, pt_out)
+                } else {
+                    Ok(sy_in)
+                }
+            });
+            sy_in_limit(exact, for_execution, fills)?
+        }
+        // The same search, bounded by the proportion cap the minted PT is sold into.
+        (MarketToken::Sy, MarketToken::Yt) => {
+            let exact = smallest(&|state| {
+                approx::max_sy_in_for_yt_with(&state.market, &state.pre_compute()?, state.py_index)
+                    .map(|(sy_in, _)| sy_in)
+            });
+            sy_in_limit(exact, for_execution, fills)?
+        }
+        // Selling PT hands PT *to* the market, so the 96% proportion cap binds, and the
+        // market checks it directly: the closed form is the boundary.
+        (MarketToken::Pt, MarketToken::Sy) => {
+            let bound = smallest(&|state| state.max_pt_in());
+            let bound = if for_execution { haircut(bound) } else { bound };
+            if fills(bound) {
+                bound
+            } else {
+                U256::ZERO
+            }
+        }
+        // Selling YT flash-*borrows* PT from the market and buys it back, fee included,
+        // so each extra YT pays less, and past some size it pays nothing or costs SY:
+        // the trader's output peaks well before the market's rate floor stops the
+        // trade. The limit is that peak, searched for within what fills; a larger
+        // sale executes but returns less.
+        (MarketToken::Yt, MarketToken::Sy) => {
+            let candidate = smallest(&|state| {
+                let bound = state.max_pt_out_unhaircut()?;
+                if for_execution {
+                    state.clear_of_anchor_noise(bound, bound)
+                } else {
+                    Ok(bound)
+                }
+            });
+            // The sale itself never evaluates that closed form, so where it cannot be
+            // evaluated the sale may still fill: the boundary is searched for instead.
+            let candidate = if candidate.is_zero() {
+                largest_filling_input(pmath::to_u256(state.market.total_pt)?, fills)
+            } else {
+                candidate
+            };
+            let fillable = largest_fill(candidate, smallest(&|state| state.max_pt_out()), fills);
+            // Where the output still rises at the bound, the peak lands on it, so the
+            // search keeps to the haircut bound.
+            let fillable = if for_execution { haircut(fillable) } else { fillable };
+            let output = |amount: U256| {
+                state
+                    .amount_out(amount, from, to)
+                    .ok()
+                    .map(|swap| swap.amount_out)
+            };
+            // Within `fillable` the sale fills at every checked state, so the search
+            // follows the sampled state's output alone and checks only its answer.
+            let peak = most_output_within(fillable, output);
+            if fills(peak) {
+                peak
+            } else {
+                U256::ZERO
+            }
+        }
+        // PT against YT, or either against itself: not an edge of this market.
+        _ => return Ok(no_depth()),
+    };
+    // `get_amount_out` refuses any amount above `u128::MAX`, so a limit past it would
+    // not be quotable; it is clamped there, where it must still fill.
+    let max_in = if max_in > unbounded_soft_limit() {
+        let clamped = unbounded_soft_limit();
+        if fills(clamped) {
+            clamped
+        } else {
+            U256::ZERO
+        }
+    } else {
+        max_in
+    };
+    if max_in.is_zero() {
+        return Ok(no_depth());
+    }
+    let max_out = state
+        .amount_out(max_in, from, to)?
+        .amount_out;
+    // An input that fills but yields nothing is no depth, not a trade. A YT sale that
+    // must hold at the execution block also needs to pay more than the repayment's
+    // rounding there, which comes in whole wei of SY: below that, a sale that fills at
+    // the checked states can fail at an index between them. What it pays at the
+    // sampled block says nothing about this: a sale paying a thousand wei an hour
+    // before expiry pays none a second before it.
+    let dust = (from, to) == (MarketToken::Yt, MarketToken::Sy) &&
+        at_execution.iter().any(|state| {
+            state
+                .amount_out(max_in, from, to)
+                .map_or(true, |swap| swap.amount_out < YT_SALE_DUST)
+        });
+    if max_out.is_zero() || dust {
+        return Ok(no_depth());
+    }
+    Ok((u256_to_biguint(max_in), u256_to_biguint(max_out)))
 }
 
 /// What `get_limits` reports for a pair this component cannot trade.
