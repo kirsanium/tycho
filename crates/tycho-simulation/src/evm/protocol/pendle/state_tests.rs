@@ -62,6 +62,7 @@ fn wsteth_market(rate_sampled_at: u64) -> PendleState {
         sy_paused: false,
         execution_timestamp: 0,
         fee_unread: false,
+        memo: Default::default(),
     })
 }
 
@@ -1924,6 +1925,7 @@ fn wsteth_market_at_block_25_800_000() -> PendleState {
         sy_paused: false,
         execution_timestamp: 0,
         fee_unread: false,
+        memo: Default::default(),
     })
 }
 
@@ -2087,4 +2089,55 @@ fn a_deposit_only_token_prices_in_the_direction_it_trades() {
     let price = state.spot_price(&weth, &sy).unwrap();
     // One WETH wraps into 1 / exchange_rate SY.
     assert!((price - 1.0 / 1.241884).abs() < 1e-6, "{price}");
+}
+
+/// A repeated `get_limits` call answers what the first did, and after a delta, an execution block
+/// or a field changed in place the state answers what a fresh copy of it would.
+#[test]
+fn kept_limits_follow_every_change_to_the_state() {
+    let fresh = |state: &PendleState, sell: &str, buy: &str| {
+        state
+            .clone()
+            .get_limits(Bytes::from_str(sell).unwrap(), Bytes::from_str(buy).unwrap())
+            .unwrap()
+    };
+    let limits = |state: &PendleState, sell: &str, buy: &str| {
+        state
+            .get_limits(Bytes::from_str(sell).unwrap(), Bytes::from_str(buy).unwrap())
+            .unwrap()
+    };
+    let mut state = wsteth_market(1_700_000_000);
+    for (sell, buy) in [(SY, PT), (PT, SY), (SY, YT), (YT, SY)] {
+        assert_eq!(limits(&state, sell, buy), limits(&state, sell, buy));
+    }
+    let before = limits(&state, YT, SY);
+
+    let delta = ProtocolStateDelta {
+        component_id: "market".to_string(),
+        updated_attributes: HashMap::from([(
+            "total_pt".to_string(),
+            Bytes::from(
+                u("60000000000000000000")
+                    .to_be_bytes::<32>()
+                    .to_vec(),
+            ),
+        )]),
+        deleted_attributes: Default::default(),
+    };
+    state
+        .delta_transition(delta, &HashMap::new(), &Balances::default())
+        .unwrap();
+    let after_delta = limits(&state, YT, SY);
+    assert_ne!(after_delta, before);
+    assert_eq!(after_delta, fresh(&state, YT, SY));
+
+    state.apply_block(&BlockContext::new(1, 1_700_000_012));
+    let after_block = limits(&state, YT, SY);
+    assert_ne!(after_block, after_delta);
+    assert_eq!(after_block, fresh(&state, YT, SY));
+
+    if let PendleState::Market(market) = &mut state {
+        market.head_timestamp = market.rate_sampled_at + 12;
+    }
+    assert_eq!(limits(&state, YT, SY), no_depth());
 }

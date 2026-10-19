@@ -210,8 +210,29 @@ pub fn execute_trade(
         });
     }
     let comp = get_market_pre_compute(market, index, block_time)?;
-    let trade = calc_trade(market, &comp, index, net_pt_to_account)?;
-    let market = apply_trade(market, &comp, index, net_pt_to_account, &trade, block_time)?;
+    execute_trade_with(market, &comp, index, net_pt_to_account, block_time)
+}
+
+/// [`execute_trade`] from `comp`, the [`get_market_pre_compute`] of `market` and `index` at
+/// `block_time`. Returns what [`execute_trade`] returns, its checks included.
+pub fn execute_trade_with(
+    market: &MarketState,
+    comp: &MarketPreCompute,
+    index: U256,
+    net_pt_to_account: I256,
+    block_time: u64,
+) -> PendleResult<TradeExecution> {
+    if is_expired(market.expiry, block_time) {
+        return Err(PendleError::MarketExpired { expiry: market.expiry, block_time });
+    }
+    if market.total_pt <= net_pt_to_account {
+        return Err(PendleError::MarketInsufficientPtForTrade {
+            total_pt: market.total_pt.to_string(),
+            required: net_pt_to_account.to_string(),
+        });
+    }
+    let trade = calc_trade(market, comp, index, net_pt_to_account)?;
+    let market = apply_trade(market, comp, index, net_pt_to_account, &trade, block_time)?;
     Ok(TradeExecution { trade, market })
 }
 
