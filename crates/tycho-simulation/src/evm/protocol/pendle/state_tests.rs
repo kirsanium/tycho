@@ -2019,6 +2019,144 @@ fn every_market_edge_quotes_what_the_chain_executed() {
     }
 }
 
+/// Swaps executed on two V6-factory markets at block 26 228 000, with the state each market had
+/// there.
+#[derive(serde::Deserialize)]
+struct ExecutedSwapsV6 {
+    markets: Vec<ExecutedMarket>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExecutedMarket {
+    name: String,
+    sy: String,
+    pt: String,
+    yt: String,
+    decimals: u32,
+    state: ExecutedMarketState,
+    executed: Vec<ExecutedSwap>,
+    rejected: Vec<RejectedV6Swap>,
+}
+
+/// The market's `readState(router)` and its YT's `pyIndexCurrent()`, as decimal strings.
+#[derive(serde::Deserialize)]
+struct ExecutedMarketState {
+    total_pt: String,
+    total_sy: String,
+    scalar_root: String,
+    expiry: String,
+    ln_fee_rate_root: String,
+    reserve_fee_percent: String,
+    last_ln_implied_rate: String,
+    py_index: String,
+    timestamp: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RejectedV6Swap {
+    edge: String,
+    amount_in: String,
+    /// The revert's selector; `0x880ccd2c` is `MarketZeroNetLPFee`.
+    revert: String,
+}
+
+impl ExecutedMarket {
+    fn state(&self) -> PendleState {
+        let signed = |value: &str| I256::from_dec_str(value).unwrap();
+        let unsigned = |value: &str| U256::from_str(value).unwrap();
+        let timestamp: u64 = self.state.timestamp.parse().unwrap();
+        PendleState::Market(PendleMarketState {
+            market: MarketState {
+                total_pt: signed(&self.state.total_pt),
+                total_sy: signed(&self.state.total_sy),
+                scalar_root: signed(&self.state.scalar_root),
+                expiry: self.state.expiry.parse().unwrap(),
+                ln_fee_rate_root: unsigned(&self.state.ln_fee_rate_root),
+                reserve_fee_percent: unsigned(&self.state.reserve_fee_percent),
+                last_ln_implied_rate: unsigned(&self.state.last_ln_implied_rate),
+            },
+            py_index: unsigned(&self.state.py_index),
+            rate_sampled_at: timestamp,
+            head_timestamp: timestamp,
+            sy_address: Bytes::from_str(&self.sy).unwrap(),
+            pt_address: Bytes::from_str(&self.pt).unwrap(),
+            yt_address: Bytes::from_str(&self.yt).unwrap(),
+            sy_paused: false,
+            execution_timestamp: 0,
+            fee_unread: false,
+            from_original_factory: false,
+            memo: Default::default(),
+        })
+    }
+
+    /// The tokens an edge name such as `sy_for_pt` trades on this market, in and out.
+    fn edge_tokens(&self, edge: &str) -> (Token, Token) {
+        let address = |name: &str| match name {
+            "sy" => &self.sy,
+            "pt" => &self.pt,
+            "yt" => &self.yt,
+            other => panic!("no token {other}"),
+        };
+        let (token_in, token_out) = edge.split_once("_for_").unwrap();
+        (token(address(token_in), self.decimals), token(address(token_out), self.decimals))
+    }
+}
+
+fn executed_swaps_v6() -> ExecutedSwapsV6 {
+    serde_json::from_str(include_str!("tests/fixtures/executed_swaps_v6.json")).unwrap()
+}
+
+/// Every swap executed on the two V6-factory markets is quoted to the wei, on all four edges: an
+/// 18-decimal market and one whose SY and asset have 6 decimals. Every swap the chain reverted is
+/// refused as `InvalidInput`, and those that reverted with `MarketZeroNetLPFee` are refused for
+/// that reason.
+#[test]
+fn every_v6_market_edge_quotes_what_the_chain_executed() {
+    let markets = executed_swaps_v6().markets;
+    assert_eq!(markets.len(), 2);
+    for market in markets {
+        let state = market.state();
+        assert!(market.executed.len() >= 20, "{}", market.name);
+        for swap in &market.executed {
+            let (token_in, token_out) = market.edge_tokens(&swap.edge);
+            let quote = state
+                .get_amount_out(BigUint::from_str(&swap.amount_in).unwrap(), &token_in, &token_out)
+                .unwrap_or_else(|e| {
+                    panic!("{} {} {}: {e}", market.name, swap.edge, swap.amount_in)
+                });
+            assert_eq!(
+                quote.amount.to_string(),
+                swap.amount_out,
+                "{} {} {}",
+                market.name,
+                swap.edge,
+                swap.amount_in
+            );
+        }
+        for swap in &market.rejected {
+            let (token_in, token_out) = market.edge_tokens(&swap.edge);
+            let error = state
+                .get_amount_out(BigUint::from_str(&swap.amount_in).unwrap(), &token_in, &token_out)
+                .expect_err(&format!(
+                    "{} {} {} must be refused",
+                    market.name, swap.edge, swap.amount_in
+                ));
+            let SimulationError::InvalidInput(message, None) = &error else {
+                panic!("{} {} {}: {error:?}", market.name, swap.edge, swap.amount_in);
+            };
+            if swap.revert == "0x880ccd2c" {
+                assert!(
+                    message.contains("MarketZeroNetLPFee"),
+                    "{} {} {}: {message}",
+                    market.name,
+                    swap.edge,
+                    swap.amount_in
+                );
+            }
+        }
+    }
+}
+
 /// The router's search runs out of range on these inputs at that block, so the swap reverts.
 #[test]
 fn a_trade_the_chain_rejects_is_rejected() {
