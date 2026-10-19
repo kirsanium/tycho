@@ -14,8 +14,8 @@ probing `previewDeposit` and `previewRedeem`, and re-classified on the SY's `Upg
 carries its SY's pause as `sy_paused`. An SY that caps its own supply carries the cap as
 `sy_supply_cap`, and every SY whose `yieldToken()` answers its `yield_token`. An SY's supply and
 balances are read once at creation and followed from events afterwards: balances of tokens kept in
-shares (stETH, eUSD, STRCx) in shares, from `TransferShares`, and valued at the ratio their
-transfers reveal; vault mints and burns that emit no `Transfer` (sDAI) from ERC-4626 `Deposit` and
+shares (stETH, eUSD, STRCx, Aave aTokens) in shares, from `TransferShares` or the aToken's `Mint`,
+`Burn` and `BalanceTransfer`, and valued at the ratio those events reveal; vault mints and burns that emit no `Transfer` (sDAI) from ERC-4626 `Deposit` and
 `Withdraw`. `SY.exchangeRate()` is read
 every `sy_rate_refresh_blocks` blocks (default 1), for the SYs of live markets and for SYs that have
 ever had an `index_rate` token, and each market's PY index is derived from it and the stored index

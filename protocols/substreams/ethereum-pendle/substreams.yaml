@@ -77,8 +77,8 @@ modules:
     inputs:
       - map: map_protocol_components
 
-  # Per token that keeps balances in shares (stETH and its forks, xStocks), its latest amount per
-  # share, from the Transfer / TransferShares pairs it emits.
+  # Per token that keeps balances in shares (stETH and its forks, xStocks, Aave aTokens), its latest
+  # amount per share, from its Transfer / TransferShares pairs or its aToken events' index.
   - name: store_share_ratios
     kind: store
     initialBlock: 16032059

@@ -13,7 +13,7 @@ use tycho_substreams::{
 use crate::{
     consts::{PENDLE_SY, WETH},
     keys::{contract_id, market_tokens_key},
-    shares::decode_transfer_shares,
+    shares::unit_deltas,
 };
 
 /// One component's side of a `Transfer` of a token it declares.
@@ -49,7 +49,7 @@ pub fn component_transfers<'a>(
                 .map(|(holder, amount)| (holder, amount, false))
                 .collect();
             deltas.extend(
-                share_holder_deltas(log)
+                unit_deltas(log)
                     .into_iter()
                     .map(|(holder, shares)| (holder, shares, true)),
             );
@@ -75,23 +75,6 @@ pub fn component_transfers<'a>(
         }
     }
     transfers
-}
-
-/// The signed change in shares a `TransferShares` makes to each side. Mints and burns name the
-/// zero address, which is never a component; a self-transfer and a zero transfer move nothing.
-fn share_holder_deltas(log: &eth::Log) -> Vec<(Vec<u8>, BigInt)> {
-    let Some(moved) = decode_transfer_shares(log) else { return vec![] };
-    if moved.shares == BigInt::zero() || moved.from == moved.to {
-        return vec![];
-    }
-    let mut deltas = Vec::new();
-    if !is_zero_address(&moved.to) {
-        deltas.push((moved.to.clone(), moved.shares.clone()));
-    }
-    if !is_zero_address(&moved.from) {
-        deltas.push((moved.from.clone(), moved.shares.neg()));
-    }
-    deltas
 }
 
 /// ERC-4626 `Deposit(address indexed sender, address indexed owner, uint256 assets, uint256
@@ -473,15 +456,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            share_holder_deltas(&shares(SY, MARKET, 90)),
+            unit_deltas(&shares(SY, MARKET, 90)),
             vec![(MARKET.to_vec(), BigInt::from(90)), (SY.to_vec(), BigInt::from(-90))]
         );
-        assert_eq!(
-            share_holder_deltas(&shares(ZERO, SY, 90)),
-            vec![(SY.to_vec(), BigInt::from(90))]
-        );
-        assert!(share_holder_deltas(&shares(SY, SY, 90)).is_empty());
-        assert!(share_holder_deltas(&shares(SY, MARKET, 0)).is_empty());
+        assert_eq!(unit_deltas(&shares(ZERO, SY, 90)), vec![(SY.to_vec(), BigInt::from(90))]);
+        assert!(unit_deltas(&shares(SY, SY, 90)).is_empty());
+        assert!(unit_deltas(&shares(SY, MARKET, 0)).is_empty());
     }
 
     #[test]

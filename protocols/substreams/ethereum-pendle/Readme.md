@@ -83,17 +83,19 @@ not answer.
 Balances are never re-read. Three kinds of token move a balance without a plain `Transfer`, and
 two of them are followed from other events:
 
-- **Tokens kept in shares** (stETH and its forks such as eUSD, xStocks such as STRCx) store each
-  holder's shares and derive the balance from a ratio that moves on its own. They emit
-  `TransferShares` next to every `Transfer`, so an SY listing one at creation is followed in shares
-  from then on: its seed is converted at the token's ratio then, and its `TransferShares` replace
-  its `Transfer`s. The ratio comes from each block's largest `Transfer` / `TransferShares` pair of
-  that token, anyone's, and every holding is revalued when it moves.
+- **Tokens kept in shares** (stETH and its forks such as eUSD, xStocks such as STRCx, and Aave
+  aTokens) store each holder's shares and derive the balance from a ratio that moves on its own.
+  stETH-style and xStocks tokens emit `TransferShares` next to every `Transfer`; aTokens report the
+  scaled amount and the liquidity index in every `Mint`, `Burn` and `BalanceTransfer`. So an SY
+  listing one at creation is followed in shares from then on: its seed is converted at the token's
+  ratio then, and those events replace its `Transfer`s. The ratio comes from each block's largest
+  `Transfer` / `TransferShares` pair of that token, or an aToken event's index, anyone's, and every
+  holding is revalued when it moves by more than a millionth. An aToken's interest accrues between
+  its events, so its balance is as of the token's last event.
 - **Vaults that mint and burn without a `Transfer`** (Maker's sDAI): an ERC-4626 `Deposit` or
   `Withdraw` naming an SY counts when no mint or burn `Transfer` of the same shares reports it.
-- **Other rebasing tokens** (aTokens) are not followed: the reported holding misses every rebase
-  since the SY's last transfer of it. Aave's mint and burn `Transfer`s include the interest
-  accrued so far, which keeps the miss small.
+- **Other rebasing tokens** are not followed: the reported holding misses every rebase since the
+  SY's creation. None appears among the SYs swept.
 
 The simulation reads one balance: an SY's holding of its own yield token, which bounds a
 redemption to that token. Every other redemption is bounded by supply. So a missed rebase affects
