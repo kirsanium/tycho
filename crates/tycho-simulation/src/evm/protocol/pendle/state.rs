@@ -385,6 +385,11 @@ pub struct PendleMarketState {
     /// creation and can fail to. The market then refuses every quote until a fee update arrives.
     #[serde(default)]
     pub fee_unread: bool,
+    /// Whether the original market factory (`0x27b1…0784`) created this market. Its markets lack
+    /// the `MarketZeroNetLPFee` check every later factory's carry, so a trade whose fee to the LPs
+    /// rounds to zero fills there and reverts everywhere else.
+    #[serde(default)]
+    pub from_original_factory: bool,
     /// What this state derives from itself, kept after first use. See [`MarketMemo`].
     #[serde(skip)]
     pub memo: MarketMemo,
@@ -557,8 +562,9 @@ impl PendleMarketState {
         Ok(())
     }
 
-    /// PT in → SY out. Exact: the market has this primitive.
-    fn pt_for_sy(&self, pt_in: U256) -> Result<(U256, MarketState), PendleError> {
+    /// PT in → SY out. Exact: the market has this primitive. Also returns the LPs' share of the
+    /// fee, in SY.
+    fn pt_for_sy(&self, pt_in: U256) -> Result<(U256, MarketState, U256), PendleError> {
         let executed = market::execute_trade_with(
             &self.market,
             &self.pre_compute()?,
@@ -566,14 +572,19 @@ impl PendleMarketState {
             -pmath::to_i256(pt_in)?,
             self.quote_time(),
         )?;
-        Ok((pmath::to_u256(executed.trade.net_sy_to_account)?, executed.market))
+        Ok((
+            pmath::to_u256(executed.trade.net_sy_to_account)?,
+            executed.market,
+            lp_fee(&executed.trade)?,
+        ))
     }
 
     /// YT in → SY out. A flash-swap: borrow PT, redeem PT+YT to SY, repay the market.
     ///
     /// Redeeming `n` YT needs `n` PT, so the borrowed leg is exactly the YT amount. What the
-    /// trader keeps is the redemption proceeds less what repaying the borrow costs.
-    fn yt_for_sy(&self, yt_in: U256) -> Result<(U256, MarketState), PendleError> {
+    /// trader keeps is the redemption proceeds less what repaying the borrow costs. Also returns
+    /// the LPs' share of the borrowed leg's fee, in SY.
+    fn yt_for_sy(&self, yt_in: U256) -> Result<(U256, MarketState, U256), PendleError> {
         // The borrowed PT leg is a real market trade, so it goes through the same checks the
         // market runs: above all, it cannot lend out more PT than it holds.
         let executed = market::execute_trade_with(
@@ -599,24 +610,25 @@ impl PendleMarketState {
         let sy_out = sy_utils::asset_to_sy(self.py_index, yt_in - py_to_repay)?;
         // Only the borrowed PT leg touches the market. Tokenizing and redeeming PY happens on the
         // YT contract, against reserves this component does not hold.
-        Ok((sy_out, executed.market))
+        Ok((sy_out, executed.market, lp_fee(&executed.trade)?))
     }
 
-    /// One market edge, quoted: the output, its gas, and the reserves the trade leaves behind.
+    /// One market edge, quoted: the output, its gas, the reserves the trade leaves behind, and the
+    /// LPs' share of its fee in asset units.
     fn amount_out(
         &self,
         amount_in: U256,
         from: MarketToken,
         to: MarketToken,
     ) -> Result<MarketSwap, PendleError> {
-        let (amount_out, gas, market) = match (from, to) {
+        let (amount_out, gas, market, lp_fee_sy) = match (from, to) {
             (MarketToken::Pt, MarketToken::Sy) => {
-                let (out, market) = self.pt_for_sy(amount_in)?;
-                (out, GAS_PT_FOR_SY, market)
+                let (out, market, lp_fee) = self.pt_for_sy(amount_in)?;
+                (out, GAS_PT_FOR_SY, market, lp_fee)
             }
             (MarketToken::Yt, MarketToken::Sy) => {
-                let (out, market) = self.yt_for_sy(amount_in)?;
-                (out, GAS_YT_FOR_SY, market)
+                let (out, market, lp_fee) = self.yt_for_sy(amount_in)?;
+                (out, GAS_YT_FOR_SY, market, lp_fee)
             }
             (MarketToken::Sy, MarketToken::Pt) => {
                 let filled = approx::approx_swap_exact_sy_for_pt_with(
@@ -626,7 +638,10 @@ impl PendleMarketState {
                     amount_in,
                     self.quote_time(),
                 )?;
-                (filled.amount_out, GAS_SY_FOR_PT, filled.market_after)
+                let lp_fee = filled
+                    .net_sy_fee
+                    .saturating_sub(filled.net_sy_to_reserve);
+                (filled.amount_out, GAS_SY_FOR_PT, filled.market_after, lp_fee)
             }
             (MarketToken::Sy, MarketToken::Yt) => {
                 let filled = approx::approx_swap_exact_sy_for_yt_with(
@@ -644,11 +659,26 @@ impl PendleMarketState {
                     .checked_add(net_sy_out)
                     .ok_or(PendleError::Overflow { operation: "SY to tokenize" })?;
                 let yt_out = sy_utils::sy_to_asset(self.py_index, sy_to_tokenize)?;
-                (yt_out, GAS_SY_FOR_YT, filled.market_after)
+                let lp_fee = filled
+                    .net_sy_fee
+                    .saturating_sub(filled.net_sy_to_reserve);
+                (yt_out, GAS_SY_FOR_YT, filled.market_after, lp_fee)
             }
             _ => unreachable!("unsupported pair is rejected before reaching here"),
         };
-        Ok(MarketSwap { amount_out, gas, market })
+        let lp_fee = sy_utils::sy_to_asset(self.py_index, lp_fee_sy)?;
+        Ok(MarketSwap { amount_out, gas, market, lp_fee })
+    }
+
+    /// Refuses a quoted trade the market would revert after computing it: on every market but the
+    /// original factory's, `PendleMarketV7` reverts with `MarketZeroNetLPFee` when the LPs' share
+    /// of the fee converts to zero asset units. Dust trades hit it, and near expiry, where the
+    /// fee rate falls toward zero, so do trades of a few units of a 6-decimal token.
+    fn guard_lp_fee(&self, swap: &MarketSwap) -> Result<(), PendleError> {
+        if !self.from_original_factory && swap.lp_fee.is_zero() {
+            return Err(PendleError::MarketZeroNetLpFee);
+        }
+        Ok(())
     }
 
     /// The same state carrying the market a trade left behind.
@@ -668,6 +698,17 @@ struct MarketSwap {
     /// The reserves and implied rate after the trade. A second quote against this prices at the
     /// depth the first one left, which is what makes splitting a trade across sizes meaningful.
     market: MarketState,
+    /// The LPs' share of the trade's fee, in asset units, rounded down as the market rounds it.
+    lp_fee: U256,
+}
+
+/// The LPs' share of a trade's fee, in SY: the whole fee less the treasury's cut.
+fn lp_fee(trade: &market::TradeResult) -> Result<U256, PendleError> {
+    let lp_share = trade
+        .net_sy_fee
+        .checked_sub(trade.net_sy_to_reserve)
+        .ok_or(PendleError::Overflow { operation: "LP fee" })?;
+    pmath::to_u256(lp_share)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -798,91 +839,7 @@ impl ProtocolSim for PendleState {
         token_in: &Token,
         token_out: &Token,
     ) -> Result<GetAmountOutResult, SimulationError> {
-        if amount_in == BigUint::from(0u32) {
-            return Err(SimulationError::InvalidInput("amount_in is zero".to_string(), None));
-        }
-        // More than any token's supply. The math is checked, but an amount this size overflows
-        // inside it, and an overflow there reads as a broken state rather than a request too large.
-        if amount_in > BigUint::from(u128::MAX) {
-            return Err(SimulationError::InvalidInput(
-                format!("amount_in {amount_in} exceeds any token supply"),
-                None,
-            ));
-        }
-        let amount = biguint_to_u256(&amount_in);
-
-        let (out, gas, new_state) = match self {
-            PendleState::Market(state) => {
-                state.guard_live()?;
-                state.guard_sy_unpaused()?;
-                state.guard_fee_read()?;
-                state.guard_current()?;
-                let from = state
-                    .role(&token_in.address)
-                    .ok_or_else(|| unknown_pair(token_in, token_out))?;
-                let to = state
-                    .role(&token_out.address)
-                    .ok_or_else(|| unknown_pair(token_in, token_out))?;
-                // PT↔YT never touches the market: minting and redeeming PY is the YT's business,
-                // and SY is one side of every market edge.
-                if from == to || (from != MarketToken::Sy && to != MarketToken::Sy) {
-                    return Err(unknown_pair(token_in, token_out));
-                }
-                let swap = state.amount_out(amount, from, to)?;
-                let gas = swap.gas + market_gas_surcharge(&state.sy_address);
-                (swap.amount_out, gas, PendleState::Market(state.after(swap.market)))
-            }
-            PendleState::Sy(state) => {
-                let (class, direction) = state
-                    .class(&token_in.address, &token_out.address)
-                    .ok_or_else(|| unquotable_pair(token_in, token_out))?;
-                state.guard_quotable(class)?;
-                let token_decimals = match direction {
-                    Direction::Deposit => token_in.decimals,
-                    Direction::Redeem => token_out.decimals,
-                };
-                let token = match direction {
-                    Direction::Deposit => &token_in.address,
-                    Direction::Redeem => &token_out.address,
-                };
-                let gas = match class {
-                    TokenClass::OneToOne => GAS_WRAP_ONE_TO_ONE,
-                    TokenClass::IndexRate => GAS_WRAP_INDEX_RATE,
-                } + wrap_gas_surcharge(&state.sy_address, token);
-                if direction == Direction::Redeem {
-                    let max_in = state.max_redeem_sy(&token_out.address, class, token_decimals)?;
-                    if amount > max_in {
-                        return Err(SimulationError::InvalidInput(
-                            format!(
-                                "redeeming {amount} SY exceeds the {max_in} the SY can pay out"
-                            ),
-                            None,
-                        ));
-                    }
-                }
-                let out = state.convert(amount, class, direction, token_decimals)?;
-                if direction == Direction::Deposit {
-                    if let Some(room) = state.deposit_headroom() {
-                        if out > room {
-                            return Err(SimulationError::InvalidInput(
-                                format!(
-                                    "minting {out} SY passes the supply cap, which leaves {room}"
-                                ),
-                                None,
-                            ));
-                        }
-                    }
-                }
-                let after = state.after(direction, token, amount, out)?;
-                (out, gas, PendleState::Sy(after))
-            }
-        };
-
-        Ok(GetAmountOutResult {
-            amount: u256_to_biguint(out),
-            gas: BigUint::from(gas),
-            new_state: Box::new(new_state),
-        })
+        self.quote(amount_in, token_in, token_out, true)
     }
 
     /// The largest trade that will not revert, per direction.
@@ -1037,6 +994,108 @@ impl ProtocolSim for PendleState {
 }
 
 impl PendleState {
+    /// [`ProtocolSim::get_amount_out`], with the market's zero-LP-fee refusal optional.
+    ///
+    /// A quote for a router enforces it, since the market reverts there. A probe for the marginal
+    /// rate does not: it prices a small trade to read the curve's slope, and near expiry on a
+    /// 6-decimal market even one unit's fee to the LPs rounds to zero.
+    fn quote(
+        &self,
+        amount_in: BigUint,
+        token_in: &Token,
+        token_out: &Token,
+        enforce_lp_fee: bool,
+    ) -> Result<GetAmountOutResult, SimulationError> {
+        if amount_in == BigUint::from(0u32) {
+            return Err(SimulationError::InvalidInput("amount_in is zero".to_string(), None));
+        }
+        // More than any token's supply. The math is checked, but an amount this size overflows
+        // inside it, and an overflow there reads as a broken state rather than a request too large.
+        if amount_in > BigUint::from(u128::MAX) {
+            return Err(SimulationError::InvalidInput(
+                format!("amount_in {amount_in} exceeds any token supply"),
+                None,
+            ));
+        }
+        let amount = biguint_to_u256(&amount_in);
+
+        let (out, gas, new_state) = match self {
+            PendleState::Market(state) => {
+                state.guard_live()?;
+                state.guard_sy_unpaused()?;
+                state.guard_fee_read()?;
+                state.guard_current()?;
+                let from = state
+                    .role(&token_in.address)
+                    .ok_or_else(|| unknown_pair(token_in, token_out))?;
+                let to = state
+                    .role(&token_out.address)
+                    .ok_or_else(|| unknown_pair(token_in, token_out))?;
+                // PT↔YT never touches the market: minting and redeeming PY is the YT's business,
+                // and SY is one side of every market edge.
+                if from == to || (from != MarketToken::Sy && to != MarketToken::Sy) {
+                    return Err(unknown_pair(token_in, token_out));
+                }
+                let swap = state.amount_out(amount, from, to)?;
+                if enforce_lp_fee {
+                    state.guard_lp_fee(&swap)?;
+                }
+                let gas = swap.gas + market_gas_surcharge(&state.sy_address);
+                (swap.amount_out, gas, PendleState::Market(state.after(swap.market)))
+            }
+            PendleState::Sy(state) => {
+                let (class, direction) = state
+                    .class(&token_in.address, &token_out.address)
+                    .ok_or_else(|| unquotable_pair(token_in, token_out))?;
+                state.guard_quotable(class)?;
+                let token_decimals = match direction {
+                    Direction::Deposit => token_in.decimals,
+                    Direction::Redeem => token_out.decimals,
+                };
+                let token = match direction {
+                    Direction::Deposit => &token_in.address,
+                    Direction::Redeem => &token_out.address,
+                };
+                let gas = match class {
+                    TokenClass::OneToOne => GAS_WRAP_ONE_TO_ONE,
+                    TokenClass::IndexRate => GAS_WRAP_INDEX_RATE,
+                } + wrap_gas_surcharge(&state.sy_address, token);
+                if direction == Direction::Redeem {
+                    let max_in = state.max_redeem_sy(&token_out.address, class, token_decimals)?;
+                    if amount > max_in {
+                        return Err(SimulationError::InvalidInput(
+                            format!(
+                                "redeeming {amount} SY exceeds the {max_in} the SY can pay out"
+                            ),
+                            None,
+                        ));
+                    }
+                }
+                let out = state.convert(amount, class, direction, token_decimals)?;
+                if direction == Direction::Deposit {
+                    if let Some(room) = state.deposit_headroom() {
+                        if out > room {
+                            return Err(SimulationError::InvalidInput(
+                                format!(
+                                    "minting {out} SY passes the supply cap, which leaves {room}"
+                                ),
+                                None,
+                            ));
+                        }
+                    }
+                }
+                let after = state.after(direction, token, amount, out)?;
+                (out, gas, PendleState::Sy(after))
+            }
+        };
+
+        Ok(GetAmountOutResult {
+            amount: u256_to_biguint(out),
+            gas: BigUint::from(gas),
+            new_state: Box::new(new_state),
+        })
+    }
+
     /// Units of `token_out` a small trade returns per unit of `token_in`.
     ///
     /// Probes with a thousandth of the depth, capped at one unit: small enough to stay inside the
@@ -1049,7 +1108,7 @@ impl PendleState {
         let within_depth = max_in / 1000u32;
         let probe =
             if within_depth == BigUint::from(0u32) { one_unit } else { one_unit.min(within_depth) };
-        let quoted = self.get_amount_out(probe.clone(), token_in, token_out)?;
+        let quoted = self.quote(probe.clone(), token_in, token_out, false)?;
         let amount_in = biguint_to_f64(&probe) / 10f64.powi(token_in.decimals as i32);
         let amount_out = biguint_to_f64(&quoted.amount) / 10f64.powi(token_out.decimals as i32);
         if amount_out == 0.0 {
@@ -1814,11 +1873,20 @@ impl PendleMarketState {
         if let Some(value) = attribute_u256(attributes, "reserve_fee_percent")? {
             self.market.reserve_fee_percent = value;
         }
-        if let Some(value) = attribute_u256(attributes, "py_index_current")? {
-            self.py_index = value;
+        // A zero index cannot price anything: it reads as never sampled, as in the decoder, and
+        // the timestamp beside it is not taken.
+        let index = attribute_u256(attributes, "py_index_current")?;
+        if let Some(value) = index {
+            if value.is_zero() {
+                self.rate_sampled_at = clock::NEVER_SAMPLED;
+            } else {
+                self.py_index = value;
+            }
         }
         if let Some(value) = attribute_u256(attributes, "rate_sampled_at")? {
-            self.rate_sampled_at = value.saturating_to();
+            if !index.is_some_and(|index| index.is_zero()) {
+                self.rate_sampled_at = value.saturating_to();
+            }
         }
         if let Some(value) = attribute_u256(attributes, SY_PAUSED)? {
             self.sy_paused = !value.is_zero();
@@ -1842,18 +1910,22 @@ mod tests;
 impl PendleSyState {
     fn apply(&mut self, delta: &ProtocolStateDelta) -> Result<(), TransitionError> {
         let attributes = &delta.updated_attributes;
-        if let Some(value) = attribute_u256(attributes, "sy_exchange_rate")? {
-            // The decoder rejects a zero rate too. Every conversion divides by it.
+        // A drained or deprecated SY can report a zero rate. Every conversion divides by it, so it
+        // reads as never sampled, as in the decoder: the `index_rate` edges refuse and report no
+        // depth, the `one_to_one` edges need no rate and go on quoting, and nothing fails the
+        // stream. The timestamp beside it is not taken.
+        let rate = attribute_u256(attributes, "sy_exchange_rate")?;
+        if let Some(value) = rate {
             if value.is_zero() {
-                return Err(TransitionError::DecodeError(format!(
-                    "SY {} reported an exchange rate of zero",
-                    self.sy_address
-                )));
+                self.rate_sampled_at = clock::NEVER_SAMPLED;
+            } else {
+                self.exchange_rate = value;
             }
-            self.exchange_rate = value;
         }
         if let Some(value) = attribute_u256(attributes, "rate_sampled_at")? {
-            self.rate_sampled_at = value.saturating_to();
+            if !rate.is_some_and(|rate| rate.is_zero()) {
+                self.rate_sampled_at = value.saturating_to();
+            }
         }
         if let Some(value) = attribute_u256(attributes, "block_timestamp")? {
             self.head_timestamp = value.saturating_to();

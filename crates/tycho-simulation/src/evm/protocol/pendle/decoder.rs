@@ -45,6 +45,9 @@ const ATTR_SY_ADDRESS: &str = "sy_address";
 const ATTR_PT_ADDRESS: &str = "pt_address";
 const ATTR_YT_ADDRESS: &str = "yt_address";
 const ATTR_TOTAL_PT: &str = "total_pt";
+const ATTR_FACTORY: &str = "factory";
+/// The original market factory. Its markets lack the `MarketZeroNetLPFee` check.
+const ORIGINAL_FACTORY: [u8; 20] = hex_literal::hex!("27b1dacd74688af24a64bd3c9c1b143118740784");
 const ATTR_TOTAL_SY: &str = "total_sy";
 const ATTR_LAST_LN_IMPLIED_RATE: &str = "last_ln_implied_rate";
 const ATTR_LN_FEE_RATE_ROOT: &str = "ln_fee_rate_root";
@@ -168,6 +171,9 @@ fn decode_market(
         sy_paused,
         execution_timestamp: 0,
         fee_unread,
+        from_original_factory: statics
+            .get(ATTR_FACTORY)
+            .is_some_and(|factory| factory.as_ref() == ORIGINAL_FACTORY),
         memo: Default::default(),
     })
 }
@@ -192,11 +198,6 @@ fn decode_sy(
         .saturating_to::<u32>();
 
     let (exchange_rate, rate_sampled_at) = rate_reading(state, ATTR_SY_EXCHANGE_RATE)?;
-    if rate_sampled_at != NEVER_SAMPLED && exchange_rate.is_zero() {
-        return Err(InvalidSnapshotError::ValueError(format!(
-            "{ATTR_SY_EXCHANGE_RATE} is zero, which no live SY reports"
-        )));
-    }
 
     // One state attribute per quotable token, named for the direction and the token. A token the
     // indexer could not classify has no attribute here, or `NO_CLASS` once an upgrade took its
@@ -269,9 +270,9 @@ fn decode_sy(
 /// Reads a rate and the block timestamp it was read at, which the refresh emits together.
 ///
 /// A rate that was never read decodes as zero at [`NEVER_SAMPLED`], a state that refuses to quote
-/// until a delta brings the rate in. A rate without its timestamp is an error: dating it by the
-/// header instead would claim it was read at a block it was not, which is exactly what the
-/// exactness guard checks.
+/// until a delta brings the rate in. So does a rate of zero. A rate without its timestamp is an
+/// error: dating it by the header instead would claim it was read at a block it was not, which is
+/// exactly what the exactness guard checks.
 fn rate_reading(
     state: &HashMap<String, Bytes>,
     rate_name: &str,
@@ -282,6 +283,12 @@ fn rate_reading(
     let rate_sampled_at = attribute_u256(state, ATTR_RATE_SAMPLED_AT)?
         .ok_or_else(|| missing(ATTR_RATE_SAMPLED_AT))?
         .saturating_to::<u64>();
+    // A drained or deprecated SY can report a zero rate; one has since block 25,835,592. Nothing
+    // can be priced at zero, so it reads as never sampled: the state decodes and refuses to quote
+    // rather than failing, which would stop every protocol in the consumer's stream.
+    if rate.is_zero() {
+        return Ok((rate, NEVER_SAMPLED));
+    }
     Ok((rate, rate_sampled_at))
 }
 
@@ -894,8 +901,11 @@ mod tests {
         assert!(matches!(error, TransitionError::DecodeError(_)), "{error:?}");
     }
 
+    /// A drained SY can report a zero rate; one has since block 25,835,592. It decodes as never
+    /// sampled, so it refuses to quote, rather than failing the decode, which by default stops
+    /// every protocol in the consumer's stream.
     #[tokio::test]
-    async fn a_read_exchange_rate_of_zero_is_rejected() {
+    async fn a_read_exchange_rate_of_zero_decodes_as_never_sampled() {
         let mut sy = created_sy();
         sy.state
             .attributes
@@ -904,6 +914,13 @@ mod tests {
             .attributes
             .insert(ATTR_RATE_SAMPLED_AT.to_string(), word(HEAD.into()));
 
-        assert!(matches!(decode(sy).await, Err(InvalidSnapshotError::ValueError(_))));
+        let PendleState::Sy(state) = decode(sy)
+            .await
+            .expect("a zero rate decodes")
+        else {
+            panic!("an SY decodes as an SY");
+        };
+        assert_eq!(state.rate_sampled_at, NEVER_SAMPLED);
+        assert!(!state.is_current());
     }
 }

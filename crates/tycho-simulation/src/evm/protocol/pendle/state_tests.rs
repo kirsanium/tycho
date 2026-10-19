@@ -62,6 +62,8 @@ fn wsteth_market(rate_sampled_at: u64) -> PendleState {
         sy_paused: false,
         execution_timestamp: 0,
         fee_unread: false,
+        // The reference wstETH market comes from the original factory.
+        from_original_factory: true,
         memo: Default::default(),
     })
 }
@@ -1961,6 +1963,8 @@ fn wsteth_market_at_block_25_800_000() -> PendleState {
         sy_paused: false,
         execution_timestamp: 0,
         fee_unread: false,
+        // The reference wstETH market comes from the original factory.
+        from_original_factory: true,
         memo: Default::default(),
     })
 }
@@ -2050,18 +2054,50 @@ fn an_amount_wider_than_256_bits_is_invalid_input() {
     assert!(matches!(error, SimulationError::InvalidInput(_, None)), "{error:?}");
 }
 
+/// A delta carrying a zero rate leaves the SY never sampled, whatever timestamp rides with it: its
+/// `index_rate` edges refuse and report no depth, its `one_to_one` edges go on quoting, and the
+/// delta itself does not fail. A later non-zero rate brings it back.
 #[test]
-fn a_delta_with_a_zero_exchange_rate_is_rejected() {
+fn a_delta_with_a_zero_exchange_rate_stops_the_rate() {
     let mut state = wsteth_sy();
-    let delta = ProtocolStateDelta {
+    let rate_update = |rate: Vec<u8>| ProtocolStateDelta {
         component_id: SY.to_string(),
-        updated_attributes: HashMap::from([("sy_exchange_rate".to_string(), Bytes::from(vec![0]))]),
+        updated_attributes: HashMap::from([
+            ("sy_exchange_rate".to_string(), Bytes::from(rate)),
+            ("rate_sampled_at".to_string(), Bytes::from(1_700_000_012u64.to_be_bytes().to_vec())),
+            ("block_timestamp".to_string(), Bytes::from(1_700_000_012u64.to_be_bytes().to_vec())),
+        ]),
         ..Default::default()
     };
-    let error = state
-        .delta_transition(delta, &HashMap::new(), &Balances::default())
-        .unwrap_err();
-    assert!(matches!(error, TransitionError::DecodeError(_)), "{error:?}");
+    state
+        .delta_transition(rate_update(vec![0]), &HashMap::new(), &Balances::default())
+        .unwrap();
+    let one = BigUint::from(10u64.pow(18));
+    assert!(state
+        .get_amount_out(one.clone(), &token(SY, 18), &token(STETH, 18))
+        .is_err());
+    let (max_in, _) = state
+        .get_limits(Bytes::from_str(SY).unwrap(), Bytes::from_str(STETH).unwrap())
+        .unwrap();
+    assert_eq!(max_in, BigUint::ZERO);
+    assert!(state
+        .get_amount_out(one.clone(), &token(SY, 18), &token(WSTETH, 18))
+        .is_ok());
+
+    state
+        .delta_transition(
+            rate_update(
+                u("1241884000000000000")
+                    .to_be_bytes::<32>()
+                    .to_vec(),
+            ),
+            &HashMap::new(),
+            &Balances::default(),
+        )
+        .unwrap();
+    assert!(state
+        .get_amount_out(one, &token(SY, 18), &token(STETH, 18))
+        .is_ok());
 }
 
 /// On a market too shallow to fill a whole unit, the price is still answered, from a probe inside
@@ -2220,4 +2256,51 @@ fn a_listed_sy_is_charged_its_gas_surcharge() {
     assert_eq!(gas(&sy, MIX_WETH_SY, WETH), BigUint::from(GAS_WRAP_INDEX_RATE + 1_380_000));
     assert_eq!(gas(&sy, MIX_WETH_SY, STETH), BigUint::from(GAS_WRAP_INDEX_RATE));
     assert_eq!(gas(&sy, WSTETH, MIX_WETH_SY), BigUint::from(GAS_WRAP_ONE_TO_ONE));
+}
+
+/// Every market factory but the original deploys `PendleMarketV7`, which reverts with
+/// `MarketZeroNetLPFee` when the LPs' share of the fee converts to zero asset units. A dust trade
+/// is refused there as `InvalidInput`, on all four edges, and quoted on an original-factory market;
+/// a trade of size quotes on both.
+#[test]
+fn a_trade_paying_the_lps_nothing_is_refused_on_later_factory_markets() {
+    let PendleState::Market(original) = wsteth_market(1_787_273_051) else { unreachable!() };
+    let later =
+        PendleState::Market(PendleMarketState { from_original_factory: false, ..original.clone() });
+    let original = PendleState::Market(original);
+    let quote = |state: &PendleState, amount: u64, from: &str, to: &str| {
+        state.get_amount_out(BigUint::from(amount), &token(from, 18), &token(to, 18))
+    };
+    for (from, to) in [(PT, SY), (YT, SY), (SY, PT), (SY, YT)] {
+        // Ten wei pays the LPs nothing; a tenth of a token pays them something.
+        match quote(&later, 10, from, to) {
+            Err(SimulationError::InvalidInput(message, None)) => {
+                assert!(message.contains("MarketZeroNetLPFee"), "{from}->{to}: {message}")
+            }
+            other => panic!("{from}->{to}: a dust trade must be refused, got {other:?}"),
+        }
+        assert!(quote(&later, 100_000_000_000_000_000, from, to).is_ok(), "{from}->{to}");
+        // Dust trades can fail on the original factory's market for their own reasons (a YT sale
+        // too small to repay its loan); none of them is this one.
+        if let Err(SimulationError::InvalidInput(message, _)) = quote(&original, 10, from, to) {
+            assert!(!message.contains("MarketZeroNetLPFee"), "{from}->{to}: {message}");
+        }
+    }
+}
+
+/// The spot price prices a small probe to read the curve's slope, and is answered even where every
+/// such probe's fee to the LPs rounds to zero, as on a market charging almost no fee.
+#[test]
+fn the_spot_price_ignores_the_lp_fee_refusal() {
+    let PendleState::Market(mut market) = wsteth_market(1_787_273_051) else { unreachable!() };
+    market.from_original_factory = false;
+    market.market.ln_fee_rate_root = U256::from(1u8);
+    let state = PendleState::Market(market);
+    assert!(state
+        .get_amount_out(BigUint::from(10u64.pow(18)), &token(PT, 18), &token(SY, 18))
+        .is_err());
+    let price = state
+        .spot_price(&token(PT, 18), &token(SY, 18))
+        .expect("the spot price is answered");
+    assert!(price > 0.0);
 }

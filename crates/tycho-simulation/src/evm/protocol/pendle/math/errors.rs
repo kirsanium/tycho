@@ -61,6 +61,9 @@ pub enum PendleError {
     /// edge's depth, buying that PT back costs more PY than the sale has, and the router's
     /// callback reverts on the subtraction.
     YtSaleCannotRepay { yt_in: String, py_to_repay: String },
+    /// `PendleMarketV7`'s `MarketZeroNetLPFee`: the LPs' share of the trade's fee converts to zero
+    /// asset units, so the market refuses the trade after computing it.
+    MarketZeroNetLpFee,
 }
 
 impl fmt::Display for PendleError {
@@ -74,6 +77,10 @@ impl fmt::Display for PendleError {
             PendleError::LogarithmOutOfBounds { a } => {
                 write!(f, "ln({a}) is undefined; the argument must be strictly positive")
             }
+            PendleError::MarketZeroNetLpFee => write!(
+                f,
+                "MarketZeroNetLPFee: the trade's fee to the LPs rounds to zero asset units"
+            ),
             PendleError::YtSaleCannotRepay { yt_in, py_to_repay } => write!(
                 f,
                 "selling {yt_in} YT cannot repay the {py_to_repay} PY its borrowed PT costs; the \

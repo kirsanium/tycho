@@ -36,7 +36,9 @@ impl From<PendleError> for SimulationError {
             PendleError::YtSaleCannotRepay { .. } => SimulationError::InvalidInput(message, None),
 
             // Too small to price, which is also the caller's input.
-            PendleError::ApproxRangeUnderflow => SimulationError::InvalidInput(message, None),
+            PendleError::ApproxRangeUnderflow | PendleError::MarketZeroNetLpFee => {
+                SimulationError::InvalidInput(message, None)
+            }
 
             // An empty market has nothing to quote against, but it may be seeded later.
             PendleError::MarketZeroTotalPtOrTotalAsset { .. } => {
