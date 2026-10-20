@@ -55,6 +55,16 @@ pub fn initialize_metrics() {
         "Price level stream updates dropped because the RPC did not serve the quoted target \
          block within the poll window"
     );
+    describe_counter!(
+        "tycho_integration_price_level_oracle_override_misses_total",
+        "Price level stream swaps simulated without their venue's overrides, because Titan \
+         published none for the venue at the quoted block"
+    );
+    describe_counter!(
+        "tycho_integration_price_level_oracle_override_unserved_total",
+        "Price level stream swaps simulated without overrides, because Titan's state override \
+         stream carries no channel for the venue at all"
+    );
     describe_histogram!(
         "tycho_integration_simulation_execution_slippage_ratio",
         "Slippage ratio between simulated and actual execution amounts"
@@ -166,8 +176,7 @@ pub fn record_simulation_execution_revert(protocol: &str, error_category: &str) 
     .increment(1);
 }
 
-/// Record a price level stream execution that was skipped because the pAMM's oracle lane was not
-/// stamped for the quoted block (the designed outcome when Titan did not build that block).
+/// Record a price level stream execution that reverted `StaleUpdate()`.
 pub fn record_execution_stale_quote(protocol: &str) {
     counter!(
         "tycho_integration_execution_stale_quotes_total",
@@ -221,10 +230,11 @@ pub fn record_protocol_pool_count(protocol: &str, count: usize) {
     .set(count as f64);
 }
 
-/// Record that an update was skipped because the RPC block was ahead of the update block.
+/// Record that an update was skipped because the RPC did not serve its block: the RPC was
+/// already ahead of the update block, or never reached it within the poll attempts.
 ///
 /// The protocol's `SynchronizerState` may report Ready in this case — the lag is only
-/// observable by comparing the update block against the RPC's latest block.
+/// observable by comparing the update block against the RPC's block.
 pub fn record_protocol_sync_state_skipped(protocol: &str) {
     gauge!(
         "tycho_integration_protocol_sync_state",
@@ -233,10 +243,7 @@ pub fn record_protocol_sync_state_skipped(protocol: &str) {
     .set(7.0);
 }
 
-/// Explicitly mark a protocol as Ready.
-///
-/// Used for streams that carry no `SynchronizerState` (the price level stream), whose liveness
-/// is derived from update receipt instead; the counterpart of [`mark_protocol_stale`].
+/// Mark a protocol as Ready, for streams that carry no `SynchronizerState`.
 pub fn mark_protocol_ready(protocol: &str) {
     gauge!(
         "tycho_integration_protocol_sync_state",
@@ -248,6 +255,25 @@ pub fn mark_protocol_ready(protocol: &str) {
 /// Record a price level stream update dropped because the RPC never served its target block.
 pub fn record_price_level_target_block_miss() {
     counter!("tycho_integration_price_level_target_block_misses_total").increment(1);
+}
+
+/// Record a swap of `protocol` simulated without the overrides Titan publishes for its venue.
+pub fn record_price_level_oracle_override_miss(protocol: &str) {
+    counter!(
+        "tycho_integration_price_level_oracle_override_misses_total",
+        "protocol" => protocol.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a swap of `protocol` simulated without overrides because Titan's state override stream
+/// serves no channel for its venue.
+pub fn record_price_level_oracle_override_unserved(protocol: &str) {
+    counter!(
+        "tycho_integration_price_level_oracle_override_unserved_total",
+        "protocol" => protocol.to_string()
+    )
+    .increment(1);
 }
 
 /// Explicitly mark a protocol as stale when no update has been received within the expected window.
@@ -265,6 +291,14 @@ pub fn mark_protocol_stale(protocol: &str) {
 /// Record when a protocol update is skipped because it's behind the current block
 pub fn record_protocol_update_skipped() {
     counter!("tycho_integration_protocol_updates_skipped_total").increment(1);
+}
+
+/// Record a protocol update not selected by `--test-every-n-updates` sampling.
+///
+/// Deliberately separate from `tycho_integration_protocol_updates_skipped_total`: skipped means
+/// the harness wanted to test the block but could not; sampled-out is a configured decision.
+pub fn record_protocol_update_sampled_out() {
+    counter!("tycho_integration_protocol_updates_sampled_out_total").increment(1);
 }
 
 /// Record the block delay of protocol updates

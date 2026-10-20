@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: LicenseRef-Fynd-License-1.1
 pragma solidity ^0.8.26;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
@@ -44,6 +44,10 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
     // Positive slippage configuration
     bool private _positiveSlippageEnabled;
 
+    // Clients whose swaps keep the surplus above expectedAmountOut even
+    // while positive slippage capture is enabled
+    mapping(address => bool) private _positiveSlippageExempt;
+
     //keccak256("ROUTER_FEE_SETTER_ROLE")
     bytes32 public constant ROUTER_FEE_SETTER_ROLE =
         0x9939157be7760e9462f1d5a0dcad88b616ddc64138e317108b40b1cf55601348;
@@ -62,12 +66,28 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
         address indexed oldReceiver, address indexed newReceiver
     );
     event PositiveSlippageToggled(bool enabled);
+    event PositiveSlippageExemptionSet(address indexed client, bool exempt);
 
-    constructor(address routerFeeSetter) {
-        _routerFeeReceiver = msg.sender;
+    /**
+     * @param routerFeeSetter Address granted ROUTER_FEE_SETTER_ROLE
+     * @param routerFeeReceiver Address whose vault balance receives router fees
+     * @dev The receiver is explicit rather than defaulted to `msg.sender`: when
+     *      the calculator is deployed through a CREATE2 factory, the factory is
+     *      the sender, and fees credited to it can never be withdrawn.
+     *      Positive slippage capture starts enabled, since that is how every
+     *      deployment is operated; `setPositiveSlippageEnabled` turns it off.
+     */
+    constructor(address routerFeeSetter, address routerFeeReceiver) {
+        if (routerFeeReceiver == address(0)) {
+            revert FeeCalculator__AddressZero();
+        }
+        _routerFeeReceiver = routerFeeReceiver;
+        _positiveSlippageEnabled = true;
         // Make the role its own admin so role holders can manage their own role
         _setRoleAdmin(ROUTER_FEE_SETTER_ROLE, ROUTER_FEE_SETTER_ROLE);
         _grantRole(ROUTER_FEE_SETTER_ROLE, routerFeeSetter);
+        emit RouterFeeReceiverUpdated(address(0), routerFeeReceiver);
+        emit PositiveSlippageToggled(true);
     }
 
     /**
@@ -75,8 +95,9 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
      * @dev Called from TychoRouterV3. Does not perform any accounting.
      *
      *      Deduction order:
-     *      1. When positive slippage capture is enabled, the surplus
-     *         (actualAmountOut - expectedAmountOut) is taken by the router first.
+     *      1. When positive slippage capture is enabled and the client is not
+     *         exempt, the surplus (actualAmountOut - expectedAmountOut) is
+     *         taken by the router first.
      *      2. Fees (client fee + router fees) are then calculated on
      *         the amount *after* surplus extraction (expectedAmountOut when
      *         surplus was taken, actualAmountOut otherwise).
@@ -94,7 +115,7 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
         address resolvedClient = _resolveClient(feeInput.client);
 
         uint256 positiveSlippage = _calculatePositiveSlippage(
-            feeInput.actualAmountOut, feeInput.expectedAmountOut
+            feeInput.actualAmountOut, feeInput.expectedAmountOut, resolvedClient
         );
 
         // Fee base = actual output minus any extracted surplus.
@@ -126,11 +147,17 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
         view
         returns (bool)
     {
-        // Slippage direction is unknown before the swap, so we always
-        // route funds through the router when positive slippage is enabled.
-        if (_positiveSlippageEnabled) return true;
-
         address resolvedClient = _resolveClient(client);
+
+        // Slippage direction is unknown before the swap, so we always
+        // route funds through the router when positive slippage is enabled —
+        // unless this client's surplus is never captured anyway.
+        if (
+            _positiveSlippageEnabled && !_positiveSlippageExempt[resolvedClient]
+        ) {
+            return true;
+        }
+
         (uint32 routerFeeOnOutputBps, uint32 routerFeeOnClientFeeBps) =
             _getFeeInfo(resolvedClient);
 
@@ -202,13 +229,18 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
 
     /**
      * @dev Calculates the positive slippage surplus, all of which goes to the router
-     * @return positiveSlippage The surplus (zero if disabled or no surplus)
+     * @return positiveSlippage The surplus (zero if disabled, the client is
+     *         exempt, or there is no surplus)
      */
     function _calculatePositiveSlippage(
         uint256 actualAmountOut,
-        uint256 expectedAmountOut
+        uint256 expectedAmountOut,
+        address client
     ) internal view returns (uint256 positiveSlippage) {
-        if (!_positiveSlippageEnabled || actualAmountOut <= expectedAmountOut) {
+        if (
+            !_positiveSlippageEnabled || _positiveSlippageExempt[client]
+                || actualAmountOut <= expectedAmountOut
+        ) {
             return 0;
         }
 
@@ -436,5 +468,31 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
      */
     function getPositiveSlippageEnabled() external view returns (bool) {
         return _positiveSlippageEnabled;
+    }
+
+    /**
+     * @dev Exempts a client from positive slippage capture, or removes the
+     *      exemption. An exempt client's swaps keep the surplus above
+     *      expectedAmountOut even while capture is enabled globally.
+     * @param client The client address to update
+     * @param exempt True to exempt, false to capture again
+     */
+    function setPositiveSlippageExempt(address client, bool exempt)
+        external
+        onlyRole(ROUTER_FEE_SETTER_ROLE)
+    {
+        _positiveSlippageExempt[client] = exempt;
+        emit PositiveSlippageExemptionSet(client, exempt);
+    }
+
+    /**
+     * @dev Returns whether a client is exempt from positive slippage capture
+     */
+    function isPositiveSlippageExempt(address client)
+        external
+        view
+        returns (bool)
+    {
+        return _positiveSlippageExempt[client];
     }
 }

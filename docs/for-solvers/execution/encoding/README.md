@@ -44,9 +44,9 @@ The router takes two output guardrails, and the solution supplies both:
 </table>
 
 Both are absolute amounts, so refreshing a quote means updating both — apply your slippage
-tolerance to the new quote and set `min_amount_out` to the result. The router bounds
-`minAmountOut` against `expectedAmountOut` on both sides (see [Slippage bounds](#slippage-bounds)),
-so it rejects a floor that no longer matches the quote.
+tolerance to the new quote and set `min_amount_out` to the result. The router caps `minAmountOut`
+at `expectedAmountOut` (see [Slippage bounds](#slippage-bounds)), so it rejects a floor above the
+quote.
 {% endtab %}
 
 {% tab title="UserTransferType" %}
@@ -222,7 +222,7 @@ creation and signing yourself using the public `Permit2` utility (see [Token tra
 The full method call includes the following parameters, which act as **execution guardrails:**
 
 * `amountIn` and `tokenIn` — the amount and token you transfer into the TychoRouterV3. For native ETH, use `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`. The router reverts if the token is `address(0)` or the amount is zero.
-* `expectedAmountOut` — your quoted output amount, taken from `solution.expected_amount_out()`. This is the baseline the router measures slippage against, and the value it bounds `minAmountOut` against (see [Slippage bounds](#slippage-bounds)). It must be greater than zero.
+* `expectedAmountOut` — your quoted output amount, taken from `solution.expected_amount_out()`. The router measures positive slippage against it and caps `minAmountOut` at it (see [Slippage bounds](#slippage-bounds)). It must be greater than zero.
 * `minAmountOut` and `tokenOut` — the smallest output you are willing to accept once fees are deducted, taken from `solution.min_amount_out()`. The same native ETH address rule applies. For maximum security, derive the underlying quote from a **third-party source**.
 * `receiver` — who receives the final output. Set this to the TychoRouterV3 address to credit output tokens to the vault.
 * `nTokens` — _(split swaps only)_ the number of distinct tokens in the split routing graph.
@@ -234,7 +234,7 @@ The `ClientFeeParams` struct is defined as:
 <thead><tr><th width="210">Field</th><th width="490">Description</th></tr></thead>
 <tbody>
 <tr><td><code>clientFeeBps</code></td><td>Client fee as a <code>uint32</code> in fee units, where <code>100_000_000</code> = 100% (see <a href="#fee-units">Fee units</a>). Set to <code>0</code> to take no fee</td></tr>
-<tr><td><code>clientFeeReceiver</code></td><td>Address that receives the client fee (credited to their vault balance)</td></tr>
+<tr><td><code>clientFeeReceiver</code></td><td>Address that identifies the client and receives the client fee (credited to their vault balance). The router resolves negotiated fee rates and positive-slippage exemptions against it, so a signed receiver is worth passing even with <code>clientFeeBps</code> set to <code>0</code></td></tr>
 <tr><td><code>maxClientContribution</code></td><td>Maximum amount the client is willing to pay out of pocket if slippage causes the output to fall below <code>minAmountOut</code>. If the shortfall exceeds this value, the transaction reverts. Set to <code>0</code> if the client should not subsidize</td></tr>
 <tr><td><code>deadline</code></td><td>Unix timestamp after which the signature is no longer valid</td></tr>
 <tr><td><code>clientSignature</code></td><td>EIP-712 signature over the fee fields <strong>and</strong> the full swap intent, signed by <code>clientFeeReceiver</code>: a 65-byte ECDSA signature when that address is an EOA, or an ERC-1271 signature of any length when it is a contract</td></tr>
@@ -261,8 +261,12 @@ constructing and signing it — the encoder does not use it internally. Call `.i
 ABI-encodable tuple for calldata construction.
 
 ```rust
-// No fee
+// No fee, no client identity
 let params = ClientFeeParams::default().into_abi_params();
+
+// No fee, but identify the client — the router applies any rate negotiated for
+// `client_fee_receiver` instead of looking one up by `tx.origin`
+let params = ClientFeeParams::new_without_fee(receiver, signature, deadline).into_abi_params();
 
 // With a 1 BPS fee (10_000 fee units)
 let params = ClientFeeParams::new(receiver, signature, deadline, 10_000u32)
@@ -278,18 +282,16 @@ example to your use case. See the `TychoRouterV3` contract functions for referen
 
 #### Slippage bounds <a href="#slippage-bounds" id="slippage-bounds"></a>
 
-`minAmountOut` must sit inside a window anchored on `expectedAmountOut`:
+`minAmountOut` must be non-zero and no greater than `expectedAmountOut`:
 
 ```
-expectedAmountOut * (10_000 - MAX_SLIPPAGE_TOLERANCE_BPS) / 10_000  <=  minAmountOut  <=  expectedAmountOut
+0  <  minAmountOut  <=  expectedAmountOut
 ```
 
-`MAX_SLIPPAGE_TOLERANCE_BPS` is `2_000`, which puts the floor 20% below your quote. A quote of 1000 USDC
-therefore accepts any `minAmountOut` between `800 * 10**6` and `1000 * 10**6`. The router reverts with
-`TychoRouter__InvalidMinAmountOut` for anything outside that window, zero included.
-
-`expectedAmountOut` sets both ends of the window, so raising it also raises the floor. Pass the amount
-your simulation returned.
+The router reverts with `TychoRouter__InvalidMinAmountOut` for a zero `minAmountOut` or one above
+`expectedAmountOut`. There is no lower cap on how far below the quote you may set it, so compute a
+real floor from your slippage tolerance — a `minAmountOut` set too low exposes the swap to MEV
+attacks. Pass the amount your simulation returned as `expectedAmountOut`.
 
 {% hint style="info" %}
 The router may capture output above `expectedAmountOut` as positive slippage, so it does not guarantee
@@ -301,8 +303,13 @@ that surplus beyond your quote reaches the receiver. Amounts between `minAmountO
 
 ETH and WETH are separate tokens in a solution, and the encoder does not convert between them for you.
 Wherever your route goes from one to the other, add a swap on the `native_wrapper` protocol. The Tycho
-stream injects a `native_wrapper` component on every chain, so you route through it like through any
-other pool, and a dedicated WETH executor runs the swap.
+stream injects a `native_wrapper` component only when the chain has a wrapper contract, so you route
+through it like through any other pool and a dedicated WETH executor runs the swap.
+
+Arc has native USDC and a routable ERC-20 USDC interface at
+<code>0x3600000000000000000000000000000000000000</code>. They share one balance, Arc has no wrapper,
+and routes must use the ERC-20 address directly rather than a <code>native_wrapper</code> component.
+See <a href="https://docs.arc.network/arc/concepts/stablecoin-native-model" target="_blank" rel="noopener noreferrer">Arc's stablecoin-native model</a>.
 
 Your swaps must connect `token_in` to `token_out`, so a missing wrap swap is rejected at validation.
 

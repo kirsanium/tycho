@@ -50,6 +50,8 @@ If you don't have an RPC URL, here are some public ones for <a href="https://eth
 
 The `PRIVATE_KEY` environment variable is unnecessary if you want to run the quickstart without simulation or execution.
 
+On Arc, pass `--sell-token` explicitly. No default sell token is configured for Arc.
+
 ### What it does
 
 The quickstart fetches all protocol states. Then it returns the best amount out (best price) for a given token pair (by default, 10 USDC to WETH).
@@ -173,7 +175,7 @@ Now you know the best protocol component (i.e., pool), you can put the swap into
 The `Solution` carries two values that set your slippage protection. `expected_amount_out` is the output your simulation quoted, and `min_amount_out` is the smallest output you will accept. The router receives them as `expectedAmountOut` and `minAmountOut`, the two guardrails that protect your funds from MEV during execution. This quickstart sets `min_amount_out` 0.25% below the quote.
 
 {% hint style="warning" %}
-For maximum security, you should determine the quoted amount from a **third-party source.** Note that inflating `expected_amount_out` does not buy you more room: the router bounds `minAmountOut` against the quote from both sides, so a higher quote raises your slippage floor with it.
+For maximum security, determine the quoted amount from a **third-party source.** The router only requires `minAmountOut` to be non-zero and no greater than `expectedAmountOut`; it sets no lower bound, so your slippage protection is only as good as the `min_amount_out` you compute. A `min_amount_out` derived from a bad quote can sit far below the fair output and leave you exposed.
 {% endhint %}
 
 You can now create the Swap and Solution objects. For more info about the `Swap` and `Solution` models, see [here](for-solvers/execution/encoding/#models).
@@ -253,10 +255,10 @@ This gives you full control over execution. And it protects you from MEV and sli
 
 ### 6. Simulate or execute the best swap
 
-This step allows you to test or perform real transactions based on the best available swap options. For this step, you need to pass your wallet's private key in the run command. Handle it securely and never expose it publicly.
+This step allows you to test or perform real transactions based on the best available swap options. It needs the `PRIVATE_KEY` environment variable from [Run the Quickstart](./#run-the-quickstart) — the quickstart skips simulation and execution without it. Handle that key securely and never expose it publicly.
 
 ```bash
-cargo run --release --example quickstart -- --swapper-pk $PK
+cargo run --release --example quickstart
 ```
 
 When you provide your private key, the quickstart will check your token balances and display them before showing you options:
