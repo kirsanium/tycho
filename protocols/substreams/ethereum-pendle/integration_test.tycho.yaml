@@ -1,11 +1,8 @@
 substreams_yaml_path: ./substreams.yaml
 # No adapter contract: Pendle is a native (Rust) integration, so there is no VM SwapAdapter to
 # build.
-# Balances are not checked. An SY's balances follow its creation read and `Transfer`s only, so a
-# rebasing holding drifts by its rebases: SY-wstETH holds a few wei of stETH that the chain reports
-# and the index does not. The harness can only skip the check for the whole file, so it is skipped
-# here for every component.
-skip_balance_check: true
+# Balances are checked, including SY-wstETH's few wei of stETH, which is followed in shares.
+skip_balance_check: false
 protocol_type_names:
   - "pendle_market"
   - "pendle_sy"
