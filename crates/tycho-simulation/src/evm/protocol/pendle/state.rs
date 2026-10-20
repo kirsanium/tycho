@@ -478,6 +478,22 @@ pub struct PendleSyState {
     /// the stream's state (see `PendleSyState::judge_holding`) and kept across quotes.
     #[serde(default)]
     pub holding_backs_supply: bool,
+    /// The step a deposit of each entry token mints in, where the SY rounds its mint: USDC into
+    /// SY-PPLUS mints a multiple of 10^12 SY wei. Absent where the mint is not rounded.
+    #[serde(default)]
+    pub deposit_steps: HashMap<Bytes, U256>,
+    /// The entry fee, in basis points, the vault behind this SY charges on `index_rate` deposits
+    /// from [`Self::entry_fee_from`]; zero for an SY that pays none.
+    #[serde(default)]
+    pub entry_fee_bps: u32,
+    /// The timestamp from which [`Self::entry_fee_bps`] applies, until the vault moves it.
+    #[serde(default)]
+    pub entry_fee_from: u64,
+    /// Timestamp of the block a quote is expected to execute in, from
+    /// [`ProtocolSim::apply_block`]; zero until one is given. Only an SY with an entry fee needs
+    /// it, to judge whether the fee applies there.
+    #[serde(default)]
+    pub execution_timestamp: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -740,33 +756,69 @@ impl PendleSyState {
     /// `OneToOne` still rescales for decimals: one wstETH is one SY-wstETH, but only because both
     /// carry 18. A 6-decimal token against an 18-decimal SY is one-to-one in *units*, not in wei.
     ///
-    /// A deposit is quoted at the closed form, which some SYs do not quite pay: seven of the 46
-    /// live SYs swept took a 1e-7 to 1e-6 haircut on entry, so their deposits quote up to 1e-6
-    /// high, and the error compounds across hops. The indexer's classifier accepts no wider a
-    /// haircut, so 1e-6 bounds it. Redemptions matched their closed form to the unit.
+    /// An `index_rate` deposit divides by `exchangeRate() + 1`, not the rate itself. The rate is
+    /// the SY's price rounded down, while its `previewDeposit` uses the wrapped vault's exact
+    /// price, which lies between the two; an SY whose rate carries few digits, such as mixUSDC's
+    /// seven, mints up to 1e-6 less than the rate alone predicts. The quote so never promises more
+    /// than the SY mints, and is at most one part in the rate low. Redemptions multiply by the
+    /// rounded-down rate, which already errs that way.
+    ///
+    /// A deposit pays the vault's entry fee where one applies (see [`Self::entry_fee_applies`]),
+    /// taken from the input rounded up, as the vault takes it, and its output is rounded down to
+    /// the token's deposit step.
     fn convert(
         &self,
         amount: U256,
         class: TokenClass,
         direction: Direction,
+        token: &Bytes,
         token_decimals: u32,
     ) -> Result<U256, PendleError> {
-        match (class, direction) {
+        let out = match (class, direction) {
             (TokenClass::OneToOne, Direction::Deposit) => {
-                rescale(amount, token_decimals, self.sy_decimals)
+                rescale(amount, token_decimals, self.sy_decimals)?
             }
             (TokenClass::OneToOne, Direction::Redeem) => {
-                rescale(amount, self.sy_decimals, token_decimals)
+                return rescale(amount, self.sy_decimals, token_decimals);
             }
             (TokenClass::IndexRate, Direction::Deposit) => {
+                let amount = self.net_of_entry_fee(amount);
                 let as_asset = rescale(amount, token_decimals, self.asset_decimals)?;
-                sy_utils::asset_to_sy(self.exchange_rate, as_asset)
+                sy_utils::asset_to_sy(
+                    self.exchange_rate
+                        .saturating_add(U256::from(1u8)),
+                    as_asset,
+                )?
             }
             (TokenClass::IndexRate, Direction::Redeem) => {
                 let as_asset = sy_utils::sy_to_asset(self.exchange_rate, amount)?;
-                rescale(as_asset, self.asset_decimals, token_decimals)
+                return rescale(as_asset, self.asset_decimals, token_decimals);
             }
+        };
+        Ok(match self.deposit_steps.get(token) {
+            Some(step) if *step > U256::from(1u8) => out - out % *step,
+            _ => out,
+        })
+    }
+
+    /// Whether the vault's entry fee applies at the moment a quote is for: the later of the block
+    /// the state was read at and the execution block, when one is recorded.
+    fn entry_fee_applies(&self) -> bool {
+        let at = self
+            .head_timestamp
+            .max(self.rate_sampled_at)
+            .max(self.execution_timestamp);
+        self.entry_fee_bps > 0 && at >= self.entry_fee_from
+    }
+
+    /// `amount` less the vault's entry fee where it applies, the fee rounded up.
+    fn net_of_entry_fee(&self, amount: U256) -> U256 {
+        if !self.entry_fee_applies() {
+            return amount;
         }
+        let fee = (amount.saturating_mul(U256::from(self.entry_fee_bps)) + U256::from(9_999u32)) /
+            U256::from(10_000u32);
+        amount.saturating_sub(fee)
     }
 }
 
@@ -906,7 +958,7 @@ impl ProtocolSim for PendleState {
                     return Ok(no_depth());
                 };
                 let convert =
-                    |amount: U256| state.convert(amount, class, direction, token_decimals);
+                    |amount: U256| state.convert(amount, class, direction, token, token_decimals);
                 let max_in = match direction {
                     // A capped SY mints only up to its cap. An uncapped one has no limit of its
                     // own; what the protocol it wraps accepts is not visible here.
@@ -953,10 +1005,20 @@ impl ProtocolSim for PendleState {
 
     /// Records the execution block's timestamp on a market, so its quotes are evaluated at the
     /// moment the swap runs, and one that would execute at or after expiry is refused. Re-emits
-    /// when that moves the quote time or flips the market to expired; an SY's quotes do not
-    /// depend on time, so it never changes.
+    /// when that moves the quote time or flips the market to expired. An SY's quotes depend on
+    /// time only through an entry fee, so it re-emits only when the fee starts or stops applying.
     fn apply_block(&mut self, block: &BlockContext) -> bool {
-        let PendleState::Market(state) = self else { return false };
+        let state = match self {
+            PendleState::Market(state) => state,
+            PendleState::Sy(sy) => {
+                if sy.entry_fee_bps == 0 {
+                    return false;
+                }
+                let before = sy.entry_fee_applies();
+                sy.execution_timestamp = block.timestamp();
+                return before != sy.entry_fee_applies();
+            }
+        };
         if state.execution_timestamp == block.timestamp() {
             return false;
         }
@@ -1071,7 +1133,7 @@ impl PendleState {
                         ));
                     }
                 }
-                let out = state.convert(amount, class, direction, token_decimals)?;
+                let out = state.convert(amount, class, direction, token, token_decimals)?;
                 if direction == Direction::Deposit {
                     if let Some(room) = state.deposit_headroom() {
                         if out > room {
@@ -1287,7 +1349,8 @@ impl PendleSyState {
         if token != yield_token || !self.holding_backs_supply {
             return Ok(supply);
         }
-        let convert = |amount: U256| self.convert(amount, class, Direction::Redeem, token_decimals);
+        let convert =
+            |amount: U256| self.convert(amount, class, Direction::Redeem, token, token_decimals);
         largest_input_within(held, supply, convert)
     }
 
@@ -1306,7 +1369,7 @@ impl PendleSyState {
             let class = *self.tokens_out.get(yield_token)?;
             let token_decimals = *self.token_decimals.get(yield_token)?;
             let payout = self
-                .convert(self.total_supply, class, Direction::Redeem, token_decimals)
+                .convert(self.total_supply, class, Direction::Redeem, yield_token, token_decimals)
                 .ok()?;
             Some(held >= payout - payout / U256::from(1000))
         })()
@@ -1343,7 +1406,7 @@ impl PendleSyState {
         let yield_token = self.yield_token.as_ref()?;
         let class = *self.tokens_out.get(yield_token)?;
         let decimals = *self.token_decimals.get(yield_token)?;
-        self.convert(sy, class, Direction::Redeem, decimals)
+        self.convert(sy, class, Direction::Redeem, yield_token, decimals)
             .ok()
     }
 
@@ -1939,6 +2002,20 @@ impl PendleSyState {
         if let Some(value) = attribute_u256(attributes, SY_SUPPLY_CAP)? {
             self.supply_cap = lifted_cap_as_none(value);
         }
+        if let Some(value) = attribute_u256(attributes, ENTRY_FEE_BPS)? {
+            self.entry_fee_bps = value.saturating_to();
+        }
+        if let Some(value) = attribute_u256(attributes, ENTRY_FEE_FROM)? {
+            self.entry_fee_from = value.saturating_to();
+        }
+        for (name, value) in attributes {
+            let Some(token) = step_attribute_token(name).map_err(TransitionError::DecodeError)?
+            else {
+                continue;
+            };
+            let step = u256_from_be(value, name)?;
+            self.deposit_steps.insert(token, step);
+        }
         if delta
             .deleted_attributes
             .contains(SY_SUPPLY_CAP)
@@ -2010,6 +2087,22 @@ pub(super) const YIELD_TOKEN: &str = "yield_token";
 /// Prefixes of the per-token class attributes, followed by the token's hex address.
 pub(super) const TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
 pub(super) const TOKEN_OUT_CLASS_PREFIX: &str = "token_out_class_0x";
+/// Prefix of the per-token deposit step, followed by the token's hex address.
+pub(super) const TOKEN_IN_STEP_PREFIX: &str = "token_in_step_0x";
+/// State attributes: the vault's entry fee in basis points, and the timestamp it applies from.
+pub(super) const ENTRY_FEE_BPS: &str = "entry_fee_bps";
+pub(super) const ENTRY_FEE_FROM: &str = "entry_fee_from";
+
+/// The token a deposit-step attribute names, or `None` for any other attribute.
+pub(super) fn step_attribute_token(name: &str) -> Result<Option<Bytes>, String> {
+    let Some(suffix) = name.strip_prefix(TOKEN_IN_STEP_PREFIX) else { return Ok(None) };
+    let token = Bytes::from_str(&format!("0x{suffix}"))
+        .map_err(|e| format!("{name} does not name an address: {e}"))?;
+    if token.len() != 20 {
+        return Err(format!("{name} names {} bytes, not a 20-byte address", token.len()));
+    }
+    Ok(Some(token))
+}
 
 /// The direction and token a class attribute names, or `None` for any other attribute.
 ///

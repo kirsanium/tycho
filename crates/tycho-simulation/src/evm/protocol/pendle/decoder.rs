@@ -26,9 +26,9 @@ use super::{
     math::market::MarketState,
     state::{
         attribute_i256, attribute_reserve, attribute_u256, class_attribute_token,
-        lifted_cap_as_none, u256_from_be, Direction, PendleMarketState, PendleState, PendleSyState,
-        TokenClass, ValueTooWide, NO_CLASS, PAUSED, SY_PAUSED, SY_SUPPLY_CAP, SY_TOTAL_SUPPLY,
-        YIELD_TOKEN,
+        lifted_cap_as_none, step_attribute_token, u256_from_be, Direction, PendleMarketState,
+        PendleState, PendleSyState, TokenClass, ValueTooWide, ENTRY_FEE_BPS, ENTRY_FEE_FROM,
+        NO_CLASS, PAUSED, SY_PAUSED, SY_SUPPLY_CAP, SY_TOTAL_SUPPLY, YIELD_TOKEN,
     },
 };
 use crate::protocol::{
@@ -262,6 +262,14 @@ fn decode_sy(
         tokens_in,
         tokens_out,
         holding_backs_supply: false,
+        deposit_steps: deposit_steps(state)?,
+        entry_fee_bps: attribute_u256(state, ENTRY_FEE_BPS)?
+            .unwrap_or_default()
+            .saturating_to(),
+        entry_fee_from: attribute_u256(state, ENTRY_FEE_FROM)?
+            .unwrap_or_default()
+            .saturating_to(),
+        execution_timestamp: 0,
     };
     sy.judge_holding();
     Ok(sy)
@@ -320,6 +328,21 @@ fn token_classes(state: &HashMap<String, Bytes>) -> Result<TokenClasses, Invalid
 }
 
 type TokenClasses = (HashMap<Bytes, TokenClass>, HashMap<Bytes, TokenClass>);
+
+/// The deposit step of each entry token the state names one for.
+fn deposit_steps(
+    state: &HashMap<String, Bytes>,
+) -> Result<HashMap<Bytes, U256>, InvalidSnapshotError> {
+    let mut steps = HashMap::new();
+    for (name, value) in state {
+        let Some(token) = step_attribute_token(name).map_err(InvalidSnapshotError::ValueError)?
+        else {
+            continue;
+        };
+        steps.insert(token, u256_from_be(value, name)?);
+    }
+    Ok(steps)
+}
 
 #[cfg(test)]
 mod tests {

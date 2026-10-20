@@ -97,6 +97,10 @@ fn wsteth_sy() -> PendleState {
         yield_token: Some(Bytes::from_str(WSTETH).unwrap()),
         yield_token_held: Some(u("3248104473502927520625")),
         holding_backs_supply: true,
+        deposit_steps: HashMap::new(),
+        entry_fee_bps: 0,
+        entry_fee_from: 0,
+        execution_timestamp: 0,
     })
 }
 
@@ -127,6 +131,10 @@ fn six_decimal_asset_sy() -> PendleState {
         yield_token: None,
         yield_token_held: None,
         holding_backs_supply: false,
+        deposit_steps: HashMap::new(),
+        entry_fee_bps: 0,
+        entry_fee_from: 0,
+        execution_timestamp: 0,
     })
 }
 
@@ -2441,4 +2449,79 @@ fn the_spot_price_ignores_the_lp_fee_refusal() {
         .spot_price(&token(PT, 18), &token(SY, 18))
         .expect("the spot price is answered");
     assert!(price > 0.0);
+}
+
+const USDC: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+const USDAT: &str = "0x23238f20b894f29041f48d88ee91131c395aaa71";
+
+/// An 18-decimal SY over a 6-decimal asset, taking a 6-decimal token as `index_rate` at `rate`, as
+/// SY-mixUSDC, SY-PPLUS and SY-sUSDat do.
+fn rate_sy(rate: u64, asset_decimals: u32, token: &str) -> PendleSyState {
+    let PendleState::Sy(mut sy) = wsteth_sy() else { unreachable!() };
+    let token = Bytes::from_str(token).unwrap();
+    sy.exchange_rate = U256::from(rate);
+    sy.asset_decimals = asset_decimals;
+    sy.tokens_in = HashMap::from([(token.clone(), TokenClass::IndexRate)]);
+    sy.token_decimals = HashMap::from([(token, 6)]);
+    sy
+}
+
+fn deposit(sy: &PendleSyState, entry: &str, amount: u64) -> BigUint {
+    PendleState::Sy(sy.clone())
+        .get_amount_out(BigUint::from(amount), &token(entry, 6), &token(SY, 18))
+        .unwrap()
+        .amount
+}
+
+/// SY-mixUSDC's rate carries seven digits (1,024,060 at block 26,228,000), and one USDC mints
+/// 976,504,993,258,965,504 SY wei where that rate alone predicts 976,505,282,893,580,454. Quoted at
+/// the rate plus one, the deposit never promises more than the SY mints, and stays within one part
+/// in the rate of it.
+#[test]
+fn an_index_rate_deposit_never_promises_more_than_the_sy_mints() {
+    let minted = BigUint::from(976_504_993_258_965_504u64);
+    let quoted = deposit(&rate_sy(1_024_060, 6, USDC), USDC, 1_000_000);
+    assert!(quoted <= minted, "{quoted} > {minted}");
+    assert!(minted.clone() - quoted <= minted / BigUint::from(1_000_000u32));
+}
+
+/// SY-PPLUS computes in USDC's six decimals and mints a multiple of 10^12 SY wei: one USDC mints
+/// 978,906 × 10^12 and ten mint 9,789,069 × 10^12. With its step, each quote is exactly that.
+#[test]
+fn a_deposit_with_a_step_mints_a_whole_multiple_of_it() {
+    let mut sy = rate_sy(1_021_547_529_624_145_398, 18, USDC);
+    sy.deposit_steps = HashMap::from([(Bytes::from_str(USDC).unwrap(), U256::from(10u64.pow(12)))]);
+    assert_eq!(deposit(&sy, USDC, 1_000_000), BigUint::from(978_906_000_000_000_000u64));
+    assert_eq!(deposit(&sy, USDC, 10_000_000), BigUint::from(9_789_069_000_000_000_000u64));
+}
+
+/// The sUSDat vault charges 25 bp on deposits from its announced close until it opens again. At
+/// block 26,100,000 (rate 1,040,756) the fee applied and one USDat minted 958,437,362,004,859,566
+/// SY wei. A quote before the close charges nothing; one from the close on, or for an execution
+/// block past it, charges the fee and stays within a part per million below what the SY minted;
+/// and recording such an execution block re-emits the state.
+#[test]
+fn a_deposit_pays_the_entry_fee_from_the_close() {
+    let mut sy = rate_sy(1_040_756, 6, USDAT);
+    sy.entry_fee_bps = 25;
+    sy.entry_fee_from = sy.head_timestamp + 600;
+    let free = deposit(&sy, USDAT, 1_000_000);
+
+    let mut closed = sy.clone();
+    closed.head_timestamp = sy.entry_fee_from;
+    closed.rate_sampled_at = sy.entry_fee_from;
+    let charged = deposit(&closed, USDAT, 1_000_000);
+    let minted = BigUint::from(958_437_362_004_859_566u64);
+    assert!(charged <= minted, "{charged} > {minted}");
+    assert!(minted.clone() - charged.clone() <= minted / BigUint::from(1_000_000u32));
+    assert!(free > charged);
+
+    let mut state = PendleState::Sy(sy.clone());
+    assert!(!state.apply_block(&BlockContext::new(1, sy.entry_fee_from - 12)));
+    assert!(state.apply_block(&BlockContext::new(2, sy.entry_fee_from)));
+    let at_execution = state
+        .get_amount_out(BigUint::from(1_000_000u32), &token(USDAT, 6), &token(SY, 18))
+        .unwrap()
+        .amount;
+    assert_eq!(at_execution, charged);
 }
