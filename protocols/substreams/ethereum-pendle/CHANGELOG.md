@@ -21,4 +21,5 @@ SYs whose deposits go through the sUSDat vault carry its entry fee and the time 
 followed from the vault's events. `SY.exchangeRate()` is read
 every `sy_rate_refresh_blocks` blocks (default 1), for the SYs of live markets and for SYs that have
 ever had an `index_rate` token, and each market's PY index is derived from it and the stored index
-its YT reports.
+its YT reports. A market reports a YT balance of zero on creation and on every reserve move, so that
+Tycho counts YT as traded although no component holds it.

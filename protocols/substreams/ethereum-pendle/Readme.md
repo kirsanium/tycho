@@ -99,6 +99,14 @@ two of them are followed from other events:
 - **Other rebasing tokens** are not followed: the reported holding misses every rebase since the
   SY's creation. None appears among the SYs swept.
 
+A market holds no YT, yet reports a YT balance of zero when it is created and whenever its
+reserves move. This works around how Tycho judges a token in use: it counts a token as traded
+when a component balance of it changes, and clients drop tokens not traded recently (on Ethereum,
+within 30 days by default). A YT trade mints or burns YT in the YT contract and moves only the
+market's SY and PT, so without the zero balance YT would never count as traded, and every client
+using the default filter would drop YT and every market with it. The zero is the market's true YT
+balance. It does not lift YT's token quality: the token analyser needs a holder to transfer from.
+
 The simulation reads one balance: an SY's holding of its own yield token, which bounds a
 redemption to that token. Every other redemption is bounded by supply. So a missed rebase affects
 that bound, the reported balances and anything derived from them, such as TVL.

@@ -73,6 +73,9 @@ pub fn map_protocol_changes(
             if let Some(change) = creation_supply(component) {
                 builder.add_entity_change(&change);
             }
+            if let Some((_, _, yt)) = market_roles(&components_store, &component.id) {
+                builder.add_balance_change(&yt_activity(&component.id, yt));
+            }
             // The creation-time `pyIndexStored()` read lands here rather than in the component's
             // static attributes: it is state, and it changes on the yield token's next interest
             // event.
@@ -106,7 +109,7 @@ pub fn map_protocol_changes(
         for (component_id, token_balances) in &balances {
             let component_id = String::from_utf8(component_id.clone())
                 .expect("reserve component id is not valid utf-8");
-            let Some((sy, pt)) = market_sy_pt(&components_store, &component_id) else {
+            let Some((sy, pt, yt)) = market_roles(&components_store, &component_id) else {
                 // Not a market, so an SY, whose one reserve is its own supply.
                 let own_address = hex::decode(component_id.trim_start_matches("0x"))
                     .expect("SY component id is not hex");
@@ -140,10 +143,11 @@ pub fn map_protocol_changes(
                 continue;
             }
 
-            transaction_changes
+            let builder = transaction_changes
                 .entry(tx.index)
-                .or_insert_with(|| TransactionChangesBuilder::new(&tx))
-                .add_entity_change(&EntityChanges { component_id, attributes });
+                .or_insert_with(|| TransactionChangesBuilder::new(&tx));
+            builder.add_balance_change(&yt_activity(&component_id, yt));
+            builder.add_entity_change(&EntityChanges { component_id, attributes });
         }
     }
 
@@ -672,16 +676,39 @@ fn markets_backed_by(markets_by_yt: &StoreGetString, yt: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Returns a market's SY and PT addresses, or `None` if the id names something that is not a
+/// Returns a market's SY, PT and YT addresses, or `None` if the id names something that is not a
 /// market.
-fn market_sy_pt(store: &StoreGetRaw, component_id: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+fn market_roles(store: &StoreGetRaw, component_id: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let roles = store.get_last(market_tokens_key(component_id))?;
     let roles: Vec<Vec<u8>> = serde_sibor::from_bytes(&roles)
         .expect("deserializing market token roles from the component store");
-    let [sy, pt, _yt] = roles.as_slice() else {
+    let [sy, pt, yt] = roles.as_slice() else {
         panic!("market {component_id} stored {} roles, expected 3", roles.len())
     };
-    Some((sy.clone(), pt.clone()))
+    Some((sy.clone(), pt.clone(), yt.clone()))
+}
+
+/// A zero balance of the market's YT, emitted when the market is created and whenever its
+/// reserves move.
+///
+/// This is a workaround for how Tycho decides a token is in use, not a balance anyone needs. Tycho
+/// counts a token as traded when a component balance of it changed, and clients drop tokens not
+/// traded recently (by default on Ethereum, within 30 days). A market holds only SY and PT: a YT
+/// trade mints or burns YT in the YT contract and moves only the market's SY and PT, so without
+/// this no component ever reports a YT balance. YT would then never count as traded, every client
+/// using the default token filter would drop it, and with it every market, since a market lists
+/// its YT. Zero is the market's true YT balance, so the reported balances stay correct.
+///
+/// Emitting it on every reserve move keeps YT counted as traded while its market is active; a
+/// market that does not move for 30 days loses its YT from those clients, as any idle pool's
+/// tokens would. It does not fix YT's token quality: the token analyser needs a holder to transfer
+/// from, and a zero balance is none.
+fn yt_activity(market_id: &str, yt: Vec<u8>) -> BalanceChange {
+    BalanceChange {
+        token: yt,
+        balance: BigInt::zero().to_bytes_be().1,
+        component_id: market_id.as_bytes().to_vec(),
+    }
 }
 
 /// The entry fee on each SY that pays it: on its creation, the fee as it stands; and on every SY
@@ -851,6 +878,16 @@ mod tests {
         assert_eq!(change.attributes[0].name, SY_TOTAL_SUPPLY);
         assert_eq!(BigInt::from_signed_bytes_be(&change.attributes[0].value), BigInt::zero());
         assert!(creation_supply(&ProtocolComponent::new("0x34")).is_none());
+    }
+
+    /// The YT's activity marker is the market's true YT balance, zero, under the market's id.
+    #[test]
+    fn a_market_reports_zero_yt() {
+        let yt = hex::decode("8e5ae33b762076244fb4ebbd15ba837a176726f4").unwrap();
+        let change = yt_activity("0xb986fe3f6ecf16c13e769b0d6d2a0bc41449d54f", yt.clone());
+        assert_eq!(change.token, yt);
+        assert_eq!(change.component_id, b"0xb986fe3f6ecf16c13e769b0d6d2a0bc41449d54f".to_vec());
+        assert_eq!(BigInt::from_unsigned_bytes_be(&change.balance), BigInt::zero());
     }
 
     /// A zero rate is as unusable as a failed read; any positive rate passes unchanged.

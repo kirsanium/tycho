@@ -22,8 +22,9 @@ use crate::{
 /// `skim()` later sweeps. The balance channel carries what the indexer can reconcile against
 /// chain state, which is the real token balance of the component's own address.
 ///
-/// The market custodies SY and PT; it holds no YT, and reports nothing for it, which the
-/// reconciliation reads as zero — the market's on-chain YT balance. The market is also its own LP
+/// The market custodies SY and PT; it holds no YT, and reports nothing for it here.
+/// `map_protocol_changes` reports the market's YT balance as zero, which it is on chain, so that
+/// Tycho counts YT as traded. The market is also its own LP
 /// token, so it emits `Transfer` from its own address: those are ignored because the LP token is
 /// not in the market's token list.
 ///
