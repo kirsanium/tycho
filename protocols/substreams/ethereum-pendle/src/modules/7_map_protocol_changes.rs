@@ -12,6 +12,7 @@ use tycho_substreams::{balances::aggregate_balances_changes, prelude::*};
 
 use crate::{
     abi::pendle_sy,
+    entry_fee::{fee_change, ENTRY_FEE_BPS, ENTRY_FEE_FROM, FEE_BPS_KEY, FEE_FROM_KEY, PAYERS_KEY},
     fees::{
         fan_out, fee_scope, read_market_fees, MarketFee, LN_FEE_RATE_ROOT, RESERVE_FEE_PERCENT,
     },
@@ -53,6 +54,8 @@ pub fn map_protocol_changes(
     share_ratios: StoreGetString,
     share_holders_store: StoreGetString,
     share_balances: StoreGetBigInt,
+    entry_fee: StoreGetBigInt,
+    entry_fee_payers: StoreGetString,
 ) -> Result<BlockChanges, substreams::errors::Error> {
     let refresh = RefreshParams::parse(&params)?;
     let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
@@ -177,6 +180,13 @@ pub fn map_protocol_changes(
 
     let registry = || registry_store.get_last(MARKET_REGISTRY);
     for (tx, change) in fee_changes(&block, &new_components, registry, read_market_fees) {
+        transaction_changes
+            .entry(tx.index)
+            .or_insert_with(|| TransactionChangesBuilder::new(&tx))
+            .add_entity_change(&change);
+    }
+
+    for (tx, change) in entry_fee_changes(&block, &new_components, &entry_fee, &entry_fee_payers) {
         transaction_changes
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(&tx))
@@ -672,6 +682,73 @@ fn market_sy_pt(store: &StoreGetRaw, component_id: &str) -> Option<(Vec<u8>, Vec
         panic!("market {component_id} stored {} roles, expected 3", roles.len())
     };
     Some((sy.clone(), pt.clone()))
+}
+
+/// The entry fee on each SY that pays it: on its creation, the fee as it stands; and on every SY
+/// that pays it, whenever the vault's events change it, anchored to the last such event's
+/// transaction.
+fn entry_fee_changes(
+    block: &eth::Block,
+    new_components: &BlockTransactionProtocolComponents,
+    entry_fee: &StoreGetBigInt,
+    payers: &StoreGetString,
+) -> Vec<(Transaction, EntityChanges)> {
+    let payers: Vec<String> = payers
+        .get_last(PAYERS_KEY)
+        .map(|listed| {
+            listed
+                .split(';')
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unique()
+                .collect()
+        })
+        .unwrap_or_default();
+    if payers.is_empty() {
+        return vec![];
+    }
+    let fee = |id: &str| {
+        let bps = entry_fee.get_last(FEE_BPS_KEY)?;
+        let from = entry_fee
+            .get_last(FEE_FROM_KEY)
+            .unwrap_or_else(BigInt::zero);
+        Some(EntityChanges {
+            component_id: id.to_string(),
+            attributes: vec![
+                state_attribute(ENTRY_FEE_BPS, bps.to_signed_bytes_be()),
+                state_attribute(ENTRY_FEE_FROM, from.to_signed_bytes_be()),
+            ],
+        })
+    };
+    let mut changes = Vec::new();
+    let last_change = block
+        .transactions()
+        .filter(|tx| {
+            tx.logs_with_calls()
+                .any(|(log, _)| fee_change(log).is_some())
+        })
+        .last();
+    if let Some(tx) = last_change {
+        let tx: Transaction = tx.into();
+        changes.extend(
+            payers
+                .iter()
+                .filter_map(|id| fee(id).map(|change| (tx.clone(), change))),
+        );
+        return changes;
+    }
+    for tx_components in &new_components.tx_components {
+        let tx = tx_components
+            .tx
+            .as_ref()
+            .expect("component batch without a transaction");
+        for component in &tx_components.components {
+            if payers.contains(&component.id) {
+                changes.extend(fee(&component.id).map(|change| (tx.clone(), change)));
+            }
+        }
+    }
+    changes
 }
 
 /// The balances kept in shares whose token's ratio moved this block, revalued at the new ratio.

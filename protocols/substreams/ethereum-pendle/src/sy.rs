@@ -14,7 +14,11 @@ use substreams::{log, scalar::BigInt};
 use substreams_ethereum::{pb::eth::rpc::RpcResponse, rpc::RpcBatch};
 use tycho_substreams::{abi::erc20, prelude::*};
 
-use crate::{abi::pendle_sy, consts::PENDLE_SY, keys::contract_id};
+use crate::{
+    abi::pendle_sy,
+    consts::{ENTRY_FEE_PAYER_YIELD_TOKENS, PENDLE_SY},
+    keys::contract_id,
+};
 
 /// Which closed-form conversion an SY applies to one specific token.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -108,6 +112,45 @@ pub fn classify_deposit(
     classify(observed, &one_to_one, &index_rate)
 }
 
+/// Classifies a `tokensIn` entry of an SY that pays an entry fee, from a probe taken while the fee
+/// may be charged: `index_rate`, when the probe sits at most [`MAX_ENTRY_FEE_BPS`] below that
+/// prediction. The fee itself is state, followed from the vault's events.
+pub fn classify_deposit_net_of_entry_fee(
+    observed: &BigInt,
+    asset_decimals: u32,
+    exchange_rate: &BigInt,
+) -> Option<TokenClass> {
+    if exchange_rate.clone() == BigInt::zero() {
+        return None;
+    }
+    let index_rate = pow10(asset_decimals) * BigInt::from(RATE_ONE) / exchange_rate.clone();
+    let floor =
+        index_rate.clone() * BigInt::from(10_000 - MAX_ENTRY_FEE_BPS) / BigInt::from(10_000);
+    (*observed <= index_rate && *observed >= floor).then_some(TokenClass::IndexRate)
+}
+
+/// The largest entry fee the classification tolerates for an SY that pays one: 1%. The one known
+/// is 25 basis points.
+const MAX_ENTRY_FEE_BPS: i64 = 100;
+
+/// The step a deposit mints in, from the probe of one whole token: `10^(sy - token decimals)` when
+/// the SY's units are finer than the token's and the probe output is a whole multiple of that,
+/// as an SY computing in the token's precision and scaling up mints. 1 otherwise.
+///
+/// An unrounded mint is a whole multiple of `10^k` by chance once in `10^k` probes, and `k` is
+/// at least 12 for a 6-decimal token into an 18-decimal SY.
+pub fn deposit_step(observed: &BigInt, sy_decimals: u32, token_decimals: u32) -> BigInt {
+    if token_decimals >= sy_decimals || *observed == BigInt::zero() {
+        return BigInt::one();
+    }
+    let step = pow10(sy_decimals - token_decimals);
+    if observed.clone() % step.clone() == BigInt::zero() {
+        step
+    } else {
+        BigInt::one()
+    }
+}
+
 /// Classifies a `tokensOut` entry from a `previewRedeem` probe of one whole SY unit.
 ///
 /// `observed` is the token output the SY predicts for `10^sy_decimals` of itself.
@@ -139,6 +182,8 @@ pub(crate) struct SyProfile {
     pub(crate) tokens_in: Vec<(Vec<u8>, TokenClass)>,
     /// Quotable exit tokens and the conversion each uses.
     pub(crate) tokens_out: Vec<(Vec<u8>, TokenClass)>,
+    /// The deposit step of each quotable entry token. See [`deposit_step`].
+    pub(crate) deposit_steps: Vec<(Vec<u8>, BigInt)>,
     /// Listed tokens whose probe did not answer. See [`Classification::unprobed`].
     pub(crate) unprobed: Vec<Vec<u8>>,
     /// `totalSupply()` at the creation block, the seed supply is accumulated from.
@@ -189,6 +234,9 @@ pub const SY_SUPPLY_CAP: &str = "sy_supply_cap";
 /// Prefixes of the per-token class attributes, followed by the token's hex address. Emitted as
 /// state, since an upgrade can change how a token converts.
 pub const TOKEN_IN_CLASS_PREFIX: &str = "token_in_class_0x";
+/// Prefix of the per-token deposit step, followed by the token's hex address: the SY mints a
+/// multiple of this many SY wei. Emitted with the classes, and 1 where the mint is not rounded.
+pub const TOKEN_IN_STEP_PREFIX: &str = "token_in_step_0x";
 pub const TOKEN_OUT_CLASS_PREFIX: &str = "token_out_class_0x";
 /// The class a re-classification gives a listed token and direction that matches neither closed
 /// form: the pair is unquotable, as if it had no class.
@@ -208,9 +256,21 @@ pub fn is_creation_seed(name: &str) -> bool {
         name.starts_with(CREATION_BALANCE_PREFIX)
 }
 
-/// Whether an attribute is a token class.
+/// Whether an attribute is a token class or a deposit step, which ride and are emitted together.
 pub fn is_class_attribute(name: &str) -> bool {
-    name.starts_with(TOKEN_IN_CLASS_PREFIX) || name.starts_with(TOKEN_OUT_CLASS_PREFIX)
+    name.starts_with(TOKEN_IN_CLASS_PREFIX) ||
+        name.starts_with(TOKEN_OUT_CLASS_PREFIX) ||
+        name.starts_with(TOKEN_IN_STEP_PREFIX)
+}
+
+/// One deposit-step attribute per quotable entry token.
+pub fn step_attributes(steps: &[(Vec<u8>, BigInt)]) -> Vec<(String, Vec<u8>)> {
+    steps
+        .iter()
+        .map(|(token, step)| {
+            (format!("{TOKEN_IN_STEP_PREFIX}{}", hex::encode(token)), step.to_signed_bytes_be())
+        })
+        .collect()
 }
 
 /// One class attribute per quotable token and direction: an entry token and an exit token can
@@ -275,6 +335,7 @@ impl SyProfile {
             ("sy_decimals".to_string(), BigInt::from(self.decimals).to_signed_bytes_be()),
         ];
         attributes.extend(class_attributes(&self.tokens_in, &self.tokens_out));
+        attributes.extend(step_attributes(&self.deposit_steps));
         attributes.push((CREATION_PAUSED.to_string(), vec![u8::from(self.paused)]));
         if let Some(yield_token) = &self.yield_token {
             attributes.push((YIELD_TOKEN.to_string(), yield_token.clone()));
@@ -299,8 +360,16 @@ impl SyProfile {
 }
 
 pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
-    let Classification { decimals, asset, asset_decimals, tokens_in, tokens_out, unprobed, .. } =
-        classify_sy(sy_address)?;
+    let Classification {
+        decimals,
+        asset,
+        asset_decimals,
+        tokens_in,
+        tokens_out,
+        deposit_steps,
+        unprobed,
+        ..
+    } = classify_sy(sy_address)?;
 
     let tokens = component_tokens(sy_address, &tokens_in, &tokens_out, &unprobed);
     let Some(Seeds { total_supply, holdings, paused, yield_token, supply_cap }) =
@@ -317,6 +386,7 @@ pub(crate) fn profile_sy(sy_address: &[u8]) -> Option<SyProfile> {
         asset_decimals,
         tokens_in,
         tokens_out,
+        deposit_steps,
         unprobed,
         total_supply,
         holdings,
@@ -335,6 +405,8 @@ pub(crate) struct Classification {
     pub(crate) tokens_in: Vec<(Vec<u8>, TokenClass)>,
     /// Quotable exit tokens and the conversion each uses.
     pub(crate) tokens_out: Vec<(Vec<u8>, TokenClass)>,
+    /// The deposit step of each quotable entry token. See [`deposit_step`].
+    pub(crate) deposit_steps: Vec<(Vec<u8>, BigInt)>,
     /// Entry tokens whose decimals or probe did not answer, so whether they still match a closed
     /// form is unknown. A pause does not land tokens here: Pendle's `SYBase` pauses transfers,
     /// not previews. A probe fails where the token or the protocol the SY wraps rejects it.
@@ -361,11 +433,22 @@ pub(crate) fn classify_sy(sy_address: &[u8]) -> Option<Classification> {
         .add(pendle_sy::functions::ExchangeRate {}, sy_address.to_vec())
         .add(pendle_sy::functions::GetTokensIn {}, sy_address.to_vec())
         .add(pendle_sy::functions::GetTokensOut {}, sy_address.to_vec())
+        .add(pendle_sy::functions::YieldToken {}, sy_address.to_vec())
         .execute()
         .map(|r| r.responses)
         .unwrap_or_default();
 
     let decimals = decode_decimals(responses.first()?)?;
+    // An SY wrapping a vault that charges an entry fee may be probed while it does, which puts
+    // its deposits below the closed form by the fee.
+    let pays_entry_fee = responses
+        .get(5)
+        .and_then(RpcBatch::decode::<_, pendle_sy::functions::YieldToken>)
+        .is_some_and(|yield_token| {
+            ENTRY_FEE_PAYER_YIELD_TOKENS
+                .iter()
+                .any(|payer| yield_token.as_slice() == payer)
+        });
     let (_asset_type, asset, asset_decimals) = responses
         .get(1)
         .and_then(RpcBatch::decode::<_, pendle_sy::functions::AssetInfo>)?;
@@ -388,15 +471,27 @@ pub(crate) fn classify_sy(sy_address: &[u8]) -> Option<Classification> {
     let token_decimals = read_token_decimals(&tokens_in, &tokens_out);
 
     let mut quotable_in = Vec::new();
+    let mut deposit_steps = Vec::new();
     let mut undetermined_in = Vec::new();
     for (token, probe) in probe_deposits(sy_address, &tokens_in, &token_decimals) {
         let Some(probe) = probe else {
             undetermined_in.push(token);
             continue;
         };
-        let Some(class) = classify_deposit(&probe, decimals, asset_decimals, &exchange_rate) else {
-            continue;
-        };
+        let class =
+            classify_deposit(&probe, decimals, asset_decimals, &exchange_rate).or_else(|| {
+                pays_entry_fee
+                    .then(|| {
+                        classify_deposit_net_of_entry_fee(&probe, asset_decimals, &exchange_rate)
+                    })
+                    .flatten()
+            });
+        let Some(class) = class else { continue };
+        let probed_decimals = token_decimals
+            .iter()
+            .find(|(listed, _)| *listed == token)
+            .map_or(decimals, |(_, decimals)| *decimals);
+        deposit_steps.push((token.clone(), deposit_step(&probe, decimals, probed_decimals)));
         quotable_in.push((token, class));
     }
 
@@ -423,6 +518,7 @@ pub(crate) fn classify_sy(sy_address: &[u8]) -> Option<Classification> {
         asset_decimals,
         tokens_in: quotable_in,
         tokens_out: quotable_out,
+        deposit_steps,
         undetermined_in,
         undetermined_out,
         entry_list_unread,
@@ -786,6 +882,40 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+
+    /// USDC into SY-PPLUS: the SY computes in USDC's six decimals and scales up, so one USDC mints
+    /// 978,906 × 10^12 SY wei and every mint is a multiple of 10^12. A mint that is not a whole
+    /// multiple, or a token no coarser than the SY, has no step.
+    #[test]
+    fn a_mint_rounded_to_the_token_precision_has_a_step() {
+        let pplus = BigInt::from(978_906u64) * pow10(12);
+        assert_eq!(deposit_step(&pplus, 18, 6), pow10(12));
+        assert_eq!(deposit_step(&(pplus + BigInt::one()), 18, 6), BigInt::one());
+        assert_eq!(deposit_step(&pow10(18), 18, 18), BigInt::one());
+    }
+
+    /// The sUSDat vault took its 25 bp entry fee at block 26,100,000: one USDat minted
+    /// 958,437,362,004,859,566 SY wei against 960,839,460,656,500,818 without it. An SY that pays
+    /// the fee still classifies as `index_rate` from that probe; anything more than 1% below the
+    /// closed form, or above it, does not.
+    #[test]
+    fn a_probe_taken_while_the_entry_fee_is_charged_still_classifies() {
+        let without_fee = BigInt::from(960_839_460_656_500_818u64);
+        let rate = pow10(6) * BigInt::from(RATE_ONE) / without_fee.clone();
+        let index_rate = pow10(6) * BigInt::from(RATE_ONE) / rate.clone();
+        let with_fee = BigInt::from(958_437_362_004_859_566u64);
+        assert_eq!(classify_deposit(&with_fee, 18, 6, &rate), None);
+        assert_eq!(
+            classify_deposit_net_of_entry_fee(&with_fee, 6, &rate),
+            Some(TokenClass::IndexRate)
+        );
+        let two_percent_below = index_rate.clone() * BigInt::from(98) / BigInt::from(100);
+        assert_eq!(classify_deposit_net_of_entry_fee(&two_percent_below, 6, &rate), None);
+        assert_eq!(
+            classify_deposit_net_of_entry_fee(&(index_rate + BigInt::one()), 6, &rate),
+            None
+        );
+    }
 
     /// Every fixture below is a value read from Ethereum mainnet, not one computed from this
     /// module's own constants. That matters: predictions derived from `RATE_ONE` would agree

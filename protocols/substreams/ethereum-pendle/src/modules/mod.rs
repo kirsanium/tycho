@@ -6,6 +6,8 @@
 // Stage 1
 #[path = "1_map_market_components.rs"]
 mod map_market_components;
+#[path = "1_store_entry_fee.rs"]
+mod store_entry_fee;
 #[path = "1_store_share_ratios.rs"]
 mod store_share_ratios;
 
@@ -18,6 +20,8 @@ mod store_sy_seen;
 mod map_protocol_components;
 
 // Stage 4
+#[path = "4_store_entry_fee_payers.rs"]
+mod store_entry_fee_payers;
 #[path = "4_store_market_registry.rs"]
 mod store_market_registry;
 #[path = "4_store_markets_by_yt.rs"]
@@ -58,6 +62,8 @@ pub use map_relative_component_balance::map_relative_component_balance;
 pub use map_reserve_deltas::map_reserve_deltas;
 pub use map_sy_state::map_sy_state;
 pub use store_balances::store_balances;
+pub use store_entry_fee::store_entry_fee;
+pub use store_entry_fee_payers::store_entry_fee_payers;
 pub use store_market_registry::store_market_registry;
 pub use store_market_reserves::store_market_reserves;
 pub use store_markets_by_yt::store_markets_by_yt;

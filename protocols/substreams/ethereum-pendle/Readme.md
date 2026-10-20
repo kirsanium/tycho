@@ -68,6 +68,8 @@ paused SY reverts every transfer, so none of those markets can trade either.
 | Market `sy_paused` | The SY's `paused()`, at market creation (from the SY profile) | The SY's `Paused`, `Unpaused` |
 | SY supply | `totalSupply()` once, at creation | The SY's own mints and burns |
 | SY supply cap | `getAbsoluteSupplyCap()` (or `supplyCap()`) once, at creation, kept only when it caps the SY's own supply | `SupplyCapUpdated`, which re-reads and re-judges it at the end of that block |
+| SY deposit steps | Per entry token, at classification: `10^(sy - token decimals)` when the probe mints a whole multiple of it | Re-classification on `Upgraded` and `Unpaused` |
+| SY entry fee (SYs on sUSDat or srUSDat) | — | The sUSDat vault's fee and next-close events |
 | Yield token | `yieldToken()` once, at creation | — |
 | SY balances | `balanceOf` once per token, at creation | `Transfer`s, WETH9's `Deposit` / `Withdrawal`, and vault mints and burns no `Transfer` reports; for tokens kept in shares, `TransferShares` |
 | Market `pyIndexStored` | `pyIndexStored()` on the YT, once, at market creation | `NewInterestIndex` |

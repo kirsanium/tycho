@@ -16,7 +16,9 @@ carries its SY's pause as `sy_paused`. An SY that caps its own supply carries th
 balances are read once at creation and followed from events afterwards: balances of tokens kept in
 shares (stETH, eUSD, STRCx, Aave aTokens) in shares, from `TransferShares` or the aToken's `Mint`,
 `Burn` and `BalanceTransfer`, and valued at the ratio those events reveal; vault mints and burns that emit no `Transfer` (sDAI) from ERC-4626 `Deposit` and
-`Withdraw`. `SY.exchangeRate()` is read
+`Withdraw`. Each entry token carries the step the SY mints in where the SY rounds its mint, and the
+SYs whose deposits go through the sUSDat vault carry its entry fee and the time it applies from,
+followed from the vault's events. `SY.exchangeRate()` is read
 every `sy_rate_refresh_blocks` blocks (default 1), for the SYs of live markets and for SYs that have
 ever had an `index_rate` token, and each market's PY index is derived from it and the stored index
 its YT reports.

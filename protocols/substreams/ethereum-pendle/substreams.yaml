@@ -97,6 +97,25 @@ modules:
       - map: map_protocol_components
       - store: store_share_ratios
 
+  # The entry fee the sUSDat vault charges outside US market hours, and the timestamp it applies
+  # from, from the vault's events.
+  - name: store_entry_fee
+    kind: store
+    initialBlock: 16032059
+    updatePolicy: set
+    valueType: bigint
+    inputs:
+      - source: sf.ethereum.type.v2.Block
+
+  # The SYs whose deposits pay that fee.
+  - name: store_entry_fee_payers
+    kind: store
+    initialBlock: 16032059
+    updatePolicy: append
+    valueType: string
+    inputs:
+      - map: map_protocol_components
+
   - name: map_relative_component_balance
     kind: map
     initialBlock: 16032059
@@ -204,6 +223,8 @@ modules:
       - store: store_share_ratios
       - store: store_share_holders
       - store: store_share_balances
+      - store: store_entry_fee
+      - store: store_entry_fee_payers
     output:
       type: proto:tycho.evm.v1.BlockChanges
 

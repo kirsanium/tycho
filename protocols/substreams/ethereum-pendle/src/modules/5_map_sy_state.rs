@@ -15,9 +15,9 @@ use crate::{
     keys::{contract_id, MARKET_REGISTRY},
     registry::markets_of_sy,
     sy::{
-        class_attributes, classify_sy, is_class_attribute, read_own_supply_cap, uncapped,
-        Classification, CREATION_PAUSED, CREATION_SUPPLY_CAP, CREATION_SY_PAUSED, NO_CLASS, PAUSED,
-        SY_PAUSED, SY_SUPPLY_CAP, TOKEN_IN_CLASS_PREFIX, TOKEN_OUT_CLASS_PREFIX,
+        class_attributes, classify_sy, is_class_attribute, read_own_supply_cap, step_attributes,
+        uncapped, Classification, CREATION_PAUSED, CREATION_SUPPLY_CAP, CREATION_SY_PAUSED,
+        NO_CLASS, PAUSED, SY_PAUSED, SY_SUPPLY_CAP, TOKEN_IN_CLASS_PREFIX, TOKEN_OUT_CLASS_PREFIX,
     },
     transfers::{is_market, new_sy_components},
 };
@@ -283,6 +283,7 @@ fn reclassified(sy: &[u8], listed: &[Vec<u8>], classification: &Classification) 
     let Classification {
         tokens_in,
         tokens_out,
+        deposit_steps,
         undetermined_in,
         undetermined_out,
         entry_list_unread,
@@ -318,6 +319,16 @@ fn reclassified(sy: &[u8], listed: &[Vec<u8>], classification: &Classification) 
             }
         }
     }
+    // A step goes with each class it applies to. A token that lost its class keeps its old step,
+    // which no quote reads.
+    let kept_steps: Vec<(Vec<u8>, BigInt)> = deposit_steps
+        .iter()
+        .filter(|(token, _)| listed.contains(token))
+        .cloned()
+        .collect();
+    for (name, value) in step_attributes(&kept_steps) {
+        attributes.push(update(&name, value));
+    }
     attributes
 }
 
@@ -345,6 +356,7 @@ mod tests {
             asset_decimals: 18,
             tokens_in: tokens_in.to_vec(),
             tokens_out: tokens_out.to_vec(),
+            deposit_steps: vec![],
             undetermined_in: undetermined.to_vec(),
             undetermined_out: undetermined.to_vec(),
             entry_list_unread: false,

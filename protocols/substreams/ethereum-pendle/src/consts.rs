@@ -25,3 +25,23 @@ pub const PENDLE_SY: &str = "pendle_sy";
 /// well-defined relative to one. Every override for any other router is irrelevant here and is
 /// ignored rather than applied to a quote that will not use it.
 pub const ROUTER_V4: [u8; 20] = hex!("888888888889758f76e7103c6cbf23abbf58f946");
+
+/// The sUSDat vault, which charges an entry fee on deposits outside US equity market hours and
+/// announces it in events: `ENTRY_FEE_SET` sets the fee in basis points, and each
+/// `ENTRY_FEE_NEXT_CLOSE` sets the timestamp from which it applies again, until the next one. Its
+/// source is not verified; the events' meaning is inferred from 123 sampled blocks, at every one of
+/// which they predicted the fee the vault's `previewDeposit` charged.
+pub const ENTRY_FEE_VAULT: [u8; 20] = hex!("d166337499e176bbc38a1fbd113ab144e5bd2df7");
+/// Yield tokens of the SYs whose deposits pay that fee: sUSDat itself, and srUSDat, which reads
+/// the fee from it.
+pub const ENTRY_FEE_PAYER_YIELD_TOKENS: [[u8; 20]; 2] = [
+    hex!("d166337499e176bbc38a1fbd113ab144e5bd2df7"),
+    hex!("faa9a0e1db9e22ae3a20b2b58a68dc24d053d066"),
+];
+/// The vault's fee-setting event: one word, the fee in basis points.
+pub const ENTRY_FEE_SET: [u8; 32] =
+    hex!("206dd15151fcc83315419fbe53a71fcf9c09da803767d3dd05f7874e1b9bf645");
+/// The vault's market-open event: one word, the timestamp of the next close, from which the fee
+/// applies again.
+pub const ENTRY_FEE_NEXT_CLOSE: [u8; 32] =
+    hex!("542dda9ba5ea2e8acb6236921bf765f58edb87c0151e07bd8cf153d268488f82");
