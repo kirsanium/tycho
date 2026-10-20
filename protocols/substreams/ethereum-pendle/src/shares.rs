@@ -104,9 +104,14 @@ impl ShareRatio {
         shares.clone() * self.amount.clone() / self.shares.clone()
     }
 
-    /// The shares a balance of `amount` holds, rounded down.
+    /// The shares a balance of `amount` holds.
+    ///
+    /// Rounded up: the tokens value shares rounding down, so with more than one unit per share a
+    /// balance `b` comes from exactly one share count, the smallest whose value reaches `b`.
+    /// Rounding down lands a share short, and the balance a wei short ever after.
     pub fn to_shares(&self, amount: &BigInt) -> BigInt {
-        amount.clone() * self.shares.clone() / self.amount.clone()
+        (amount.clone() * self.shares.clone() + self.amount.clone() - BigInt::one()) /
+            self.amount.clone()
     }
 
     /// Whether `self` prices a share differently from `earlier` by more than one part in 1e6.
@@ -397,6 +402,21 @@ mod tests {
                 .to_amount(&BigInt::from(33_605_585u64)),
             BigInt::from(39_999_999u64)
         );
+    }
+
+    /// A balance converts to the share count whose value, rounded down as the token rounds it, is
+    /// that balance: stETH at about 1.22 per share values 323 shares at 394 and 324 at 395, so 395
+    /// is 324 shares, not the 323 a rounded-down conversion gives.
+    #[test]
+    fn a_balance_converts_to_the_shares_that_value_to_it() {
+        let ratio = ShareRatio {
+            amount: BigInt::from(1_220_000_000_000_000_000u64),
+            shares: BigInt::from(1_000_000_000_000_000_000u64),
+        };
+        for balance in [394u64, 395, 1, 1_000_000_007] {
+            let shares = ratio.to_shares(&BigInt::from(balance));
+            assert_eq!(ratio.to_amount(&shares), BigInt::from(balance), "{balance}");
+        }
     }
 
     #[test]
